@@ -831,11 +831,14 @@ pub(crate) fn probe_trae_jwt_alive(state: &AppState, user_id: &str) -> Result<()
         .timeout(std::time::Duration::from_secs(15))
         .build();
     let dev = resolve_device(state, user_id);
-    // 判死文案：name(user_id) 双标识——toast 面向用户用账号名可读，日志保留 uid 便于排查
+    // 判死文案：name(user_id) 双标识——toast 面向用户用账号名可读，日志保留 uid 便于排查。
+    // 注意：Err 仅在「判死」时产生（网络故障已在下方 fail-open 为 Ok），调用方据此放行切换
+    // 并把本条作为警示写入进度流——切回该账号重新登录正是恢复手段，硬拒绝会形成死结
+    //（签到 401 → SessionDead 的账号预检必判死 → 用户永远无法通过「切换」找回该账号）。
     let dead_msg = format!(
-        "账号 {}({}) 的 JWT 已被服务端吊销（常见原因：该账号在别处重新登录、在 IDE 内退出登录或触发风控），\
-         本地保存的登录态已失效，切换后必然未登录。请先在 TRAE 中重新登录该账号并「保存当前登录态」，\
-         或开启代理重新捕获 JWT 后再切换",
+        "账号 {}({}) 的登录已失效（JWT 被服务端吊销，常见原因：该账号在别处重新登录、在 IDE 内退出登录或触发风控）。\
+         将照常切换到该账号：请在 TRAE 启动后重新登录 → 点击「保存当前登录态」保留新登录，\
+         并开启代理点「续期 JWT」重新捕获凭证（新凭证捕获成功会自动解除失效标记），签到即可恢复",
         account.name, user_id
     );
     match ide_query_post(
@@ -1450,6 +1453,19 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
         account.name.clone()
     };
     crate::vault::save_accounts(&state, &mut accounts)?;
+
+    // 自动解冻（含 SessionDead）：新 JWT 刚从 ExchangeToken 换发、必然有效，
+    // 此前签到 401 打上的 SessionDead 永久冷却若不清除，调度会永远跳过该账号
+    //（自动解冻逻辑明确排除 SessionDead，见 refresh_remaining_credits）
+    let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    if let Some(entry) = cd.cooldowns.remove(user_id) {
+        cd.updated_at = Some(fs_utils::now_iso());
+        fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("JWT 刷新成功自动解冻 [{}]（原冷却类型={}）", log_name, entry.error_type),
+        );
+    }
 
     crate::fs_utils::app_log(
         &state.data_dir,

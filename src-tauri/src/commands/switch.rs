@@ -58,8 +58,20 @@ pub fn switch_account(
     } else if is_trae && !skip_jwt_probe.unwrap_or(false) {
         // TRAE（TraeWork/Trae）：切换前 JWT 服务端预检（issue #9）——目标账号 JWT 被服务端
         // 吊销时本地快照仍完好，切换恢复后 IDE 一联网即被登出，用户感知为「切换了但没反应」。
-        // 401 判死时提前中止并给出补救指引；网络故障 fail-open 不阻断（见函数内实现）。
-        crate::commands::accounts::probe_trae_jwt_alive(&state, &user_id)?;
+        // 预检 Err 仅在「判死」时产生（网络故障已在函数内 fail-open 为 Ok）。
+        // 此前判死会硬拒绝切换——但签到 401 SessionDead 的账号预检必判死，而「切回该账号
+        // 重新登录」正是唯一恢复手段，硬拒绝形成死结（用户反馈：签到失败的账号点切换无反应）。
+        // 现改为：放行切换，把失效警示 + 恢复指引写入切换进度流（fail-open，不阻断）。
+        if let Err(dead_msg) = crate::commands::accounts::probe_trae_jwt_alive(&state, &user_id) {
+            fs_utils::app_log(&state.data_dir, &format!("切换前 JWT 预检判死（已放行）: {dead_msg}"));
+            let warn_line = serde_json::json!({
+                "stage": "probe",
+                "status": "warn",
+                "message": dead_msg,
+            })
+            .to_string();
+            let _ = app.emit("switch-progress", &warn_line);
+        }
     }
 
     // 防误覆盖守卫：把关闭客户端前检测到的当前登录 uid 传给桥，桥仅在它与

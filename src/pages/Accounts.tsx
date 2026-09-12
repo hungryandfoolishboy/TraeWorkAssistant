@@ -105,6 +105,25 @@ export default function Accounts() {
   // 删除确认（禁 window.confirm，红线）：删除账号 / 删除快照
   const [deleteTarget, setDeleteTarget] = useState<AccountView | null>(null);
   const [deleteSlot, setDeleteSlot] = useState<string | null>(null);
+  // 切换/保存 90s 看门狗（对齐 BuddyAccounts）：switch-done / save-login-done 事件异常缺失
+  // （桥挂死/事件丢失）时 switchingTo/savingLogin 会永久非空——全部切换/保存/续期/重置按钮
+  // 被禁用、appMenu 不再弹出，用户感知为「点击切换账号无反应」。90s 后本地解除按钮互斥兜底
+  //（store 状态只读，此处仅页面级解锁；事件迟到仍会正常提示结果）。
+  const [lockTimedOut, setLockTimedOut] = useState(false);
+  const busy = (!!switchingTo || !!savingLogin) && !lockTimedOut;
+  useEffect(() => {
+    if (!switchingTo && !savingLogin) {
+      setLockTimedOut(false);
+      return;
+    }
+    setLockTimedOut(false);
+    const timer = setTimeout(() => {
+      setLockTimedOut(true);
+      toast('warn', '切换/保存超过 90 秒未收到完成事件，已解除按钮锁定；结果请以日志与列表状态为准');
+    }, 90_000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [switchingTo, savingLogin]);
 
   const runDiscover = async () => {
     setScanOpen(true);
@@ -460,7 +479,7 @@ export default function Accounts() {
                           <button
                             title={switchingTo || savingLogin ? '切换/保存进行中，暂不能续期' : '续期 JWT（启动代理并切换账号）'}
                             onClick={() => void renewJwt(a.user_id)}
-                            disabled={!!switchingTo || !!savingLogin}
+                            disabled={busy}
                             className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-amber-500/10"
                           >
                             <KeyRound size={14} />
@@ -482,7 +501,7 @@ export default function Accounts() {
                               const r = e.currentTarget.getBoundingClientRect();
                               setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'switch' ? null : { userId: a.user_id, kind: 'switch', x: r.right, y: r.bottom });
                             }}
-                            disabled={!!switchingTo || !!savingLogin}
+                            disabled={busy}
                             className={`btn-ghost !p-2 ${switchingTo === a.user_id ? 'text-amber-500' : ''} ${(switchingTo && switchingTo !== a.user_id) || savingLogin ? 'opacity-40 cursor-not-allowed' : ''}`}
                           >
                             {switchingTo === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
@@ -493,7 +512,7 @@ export default function Accounts() {
                               const r = e.currentTarget.getBoundingClientRect();
                               setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'save' ? null : { userId: a.user_id, kind: 'save', x: r.right, y: r.bottom });
                             }}
-                            disabled={!!switchingTo || !!savingLogin}
+                            disabled={busy}
                             className={`btn-ghost !p-2 ${savingLogin === a.user_id ? 'text-amber-500' : ''} ${(savingLogin && savingLogin !== a.user_id) || switchingTo ? 'opacity-40 cursor-not-allowed' : ''}`}
                           >
                             {savingLogin === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
@@ -502,7 +521,7 @@ export default function Accounts() {
                         <button
                           title={switchingTo || savingLogin ? '切换/保存进行中，暂不能重置' : '重置设备 ID'}
                           onClick={() => void resetDevice(a.user_id)}
-                          disabled={!!switchingTo || !!savingLogin}
+                          disabled={busy}
                           className="btn-ghost !p-2 disabled:cursor-not-allowed disabled:opacity-40"
                         >
                           <RotateCcw size={14} />
@@ -524,8 +543,7 @@ export default function Accounts() {
           issue #9 反馈：原来的窄下拉两项太小易点错，改为左右两块大按钮（带图标+描述），
           hover 用 amber 高亮让目标区域醒目不易误触 */}
       {appMenu &&
-        !switchingTo &&
-        !savingLogin &&
+        !busy &&
         createPortal(
           <div
             className="fixed z-50 w-[420px] overflow-hidden rounded-lg border border-slate-200 bg-white text-slate-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"

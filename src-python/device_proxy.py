@@ -606,6 +606,14 @@ def update_account_jwt(user_id, jwt_full):
             target["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
             log(f"  [JWT 自动更新] user={user_id} 账号={target.get('name', '?')} exp={new_exp_str}")
             save_accounts()
+            # 自动解冻（含 SessionDead）：新 JWT 来自 IDE 实时流量、必然有效。此前签到 401
+            # 打上的 SessionDead 永久冷却若不清除，调度会永远跳过该账号（用户反馈的死结：
+            # 切回账号重新登录捕获新凭证后，签到仍因冷却被跳过）
+            try:
+                clear_cooldown(user_id)
+                log(f"  [冷却解除] user={user_id}（新 JWT 捕获成功，自动解除登录失效标记）")
+            except Exception as e:
+                log(f"  [冷却解除失败] user={user_id}: {e}")
             return "updated"
         # 新账号
         new_acc = {
