@@ -185,6 +185,14 @@ export default function BuddyAccounts() {
           const m = new Map<string, WbCreditPackage[]>();
           for (const a of r.accounts) m.set(a.user_id, a.packages ?? []);
           setCredits(m);
+          // 套餐回填发生在积分拉取链路（payment-type → edition_type，仅补空）：
+          // 静默重取列表刷新会员套餐列（有新回填时才与原列表不同，无副作用）
+          if (accs.some((a) => !a.edition_type)) {
+            api.workbuddy
+              .accountsList()
+              .then((fresh) => setAccounts(fresh))
+              .catch(() => {});
+          }
         })
         .catch(() => pushToast('warn', '积分缓存查询失败，积分包列为空'));
       // 今日签到状态（失败静默，不阻断列表）
@@ -684,7 +692,7 @@ export default function BuddyAccounts() {
             <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
               <tr>
                 <th className="px-4 py-2 text-left">账号</th>
-                <th className="px-4 py-2 text-left">会员等级</th>
+                <th className="px-4 py-2 text-left">会员套餐</th>
                 <th className="px-4 py-2 text-right">可用积分</th>
                 <th className="px-4 py-2 text-left">token 到期</th>
                 <th className="px-4 py-2 text-left">积分包</th>
@@ -715,7 +723,12 @@ export default function BuddyAccounts() {
                     </td>
                     <td className="px-4 py-3">
                       {a.edition_type ? (
-                        <Badge tone={a.edition_type.toLowerCase() === 'pro' ? 'blue' : 'slate'}>{a.edition_type}</Badge>
+                        <Badge
+                          tone={a.edition_type.toLowerCase() === 'pro' ? 'blue' : a.is_current ? 'violet' : 'slate'}
+                          title={a.is_current ? `当前套餐：${a.edition_type}` : a.edition_type}
+                        >
+                          {a.edition_type}
+                        </Badge>
                       ) : (
                         <span className="text-xs text-slate-300 dark:text-zinc-600">—</span>
                       )}

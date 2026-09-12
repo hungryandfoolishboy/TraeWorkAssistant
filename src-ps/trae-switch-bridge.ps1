@@ -123,7 +123,13 @@ switch ($TargetApp) {
         $Script:TraeDataDir     = "$env:USERPROFILE\.workbuddy"
         $Script:ProfilesDir     = "$Script:AppDataDir\data\profiles_workbuddy"
         $Script:SettingsPathKey = 'workbuddy_path'
-        $Script:ProcNames       = @('WorkBuddy')
+        $Script:GracefulWaitSecs = 5
+        # auth 文件与 CodeBuddy 共用同一物理文件（CodeBuddyExtension 宿主目录，实测确认）。
+        # 两客户端同时运行时，在跑的一端会用内存中的旧登录回写 auth 文件，把刚恢复的
+        # 目标登录态覆盖掉（实测 2026-09-12：恢复后 3 秒 auth 被旧账号回写，切换"不生效"）。
+        # 因此 authfile 布局下切换/保存前必须同时关闭另一端（ProcNames 附带对端进程名；
+        # exe 缓存有 Test-ExeMatchesApp 校验，不会因此启动错应用）。
+        $Script:ProcNames       = @('WorkBuddy', 'CodeBuddy', 'CodeBuddy CN')
         $Script:ExeNames        = @('WorkBuddy.exe')
         $Script:LnkPatterns     = @('*WorkBuddy*')
         $Script:RegPatterns     = @('*WorkBuddy*')
@@ -144,7 +150,10 @@ switch ($TargetApp) {
         $Script:TraeDataDir     = "$env:USERPROFILE\.codebuddy"
         $Script:ProfilesDir     = "$Script:AppDataDir\data\profiles_codebuddy"
         $Script:SettingsPathKey = 'codebuddy_path'
-        $Script:ProcNames       = @('CodeBuddy', 'CodeBuddy CN')
+        $Script:GracefulWaitSecs = 5
+        # 与 WorkBuddy 共用 auth 文件（见 WorkBuddy 档案注释）：切换/保存前必须同时关闭
+        # 在跑的 WorkBuddy，否则恢复的目标登录态会被其用内存旧登录回写覆盖（实测确认）
+        $Script:ProcNames       = @('CodeBuddy', 'CodeBuddy CN', 'WorkBuddy')
         $Script:ExeNames        = @('CodeBuddy.exe', 'CodeBuddy CN.exe')
         $Script:LnkPatterns     = @('*CodeBuddy*')
         $Script:RegPatterns     = @('*CodeBuddy*')
@@ -907,6 +916,22 @@ function Restore-ChromiumProfile {
 $Script:WbAuthDir  = "$env:LOCALAPPDATA\CodeBuddyExtension\Data\Public\auth"
 $Script:WbAuthFile = "$Script:WbAuthDir\workbuddy-desktop.info"
 
+# 关闭客户端后 auth 文件可能仍被延迟回写（强杀后残留子进程退出落盘，实测恢复后 3 秒被
+# 旧账号回写）。备份/恢复前等待其静默：LastWriteTime 连续 2 秒不变（最长 10 秒），
+# 避免把"回写到一半"的旧登录备份进快照、或恢复后立即被覆盖。
+function Wait-AuthFileQuiet {
+    if (-not (Test-Path $Script:WbAuthFile)) { return }
+    $deadline = (Get-Date).AddSeconds(10)
+    $last = (Get-Item $Script:WbAuthFile).LastWriteTimeUtc
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 2
+        try { $cur = (Get-Item $Script:WbAuthFile).LastWriteTimeUtc } catch { return }
+        if ($cur -eq $last) { return }
+        $last = $cur
+    }
+    Write-Step -Stage 'backup' -Message 'auth 文件持续变动（疑似仍有客户端进程在回写），继续执行但请核实切换结果' -Status 'warn'
+}
+
 # 从 auth 文件 JSON 提取 uid（兼容 account.uid / uid / auth.account.uid 嵌套）
 function Get-AuthFileUid {
     param([string]$Path)
@@ -922,6 +947,8 @@ function Get-AuthFileUid {
 
 function Backup-AuthFileProfile {
     param([string]$Slot)
+    # 关闭客户端后先等 auth 文件静默（残留进程可能延迟回写旧登录，实测 3 秒后才落盘）
+    Wait-AuthFileQuiet
     $dest = Join-Path $Script:ProfilesDir $Slot
     if (-not (Test-Path $Script:WbAuthFile)) {
         Write-Step -Stage 'backup' -Message "auth 文件不存在（可能从未登录）：$($Script:WbAuthFile)" -Status 'warn'
@@ -1017,6 +1044,13 @@ function Restore-AuthFileProfile {
         Write-Step -Stage 'restore' -Message "auth 文件恢复失败: $_" -Status 'error'
         throw "auth 文件恢复失败"
     }
+    # 回写校验：确认落盘内容确为目标账号（防复制中途失败或复制后立即被其他进程回写）
+    $wantUid = Get-AuthFileUid -Path $authSrc
+    $gotUid = Get-AuthFileUid -Path $Script:WbAuthFile
+    if ($wantUid -and $gotUid -and ($gotUid -ne $wantUid)) {
+        Write-Step -Stage 'restore' -Message "auth 文件恢复后 uid 不一致（疑似被其他进程回写），已中止启动" -Status 'error'
+        throw "auth 文件恢复后校验失败（uid 不一致）"
+    }
     # L2 体验：storage\user-* 目录对称回写
     $slotStorage = Join-Path $src 'storage'
     if (Test-Path $slotStorage) {
@@ -1033,27 +1067,48 @@ function Restore-AuthFileProfile {
     Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态 ($restored 项)" -Status 'ok'
 }
 
-# 批次1：authfile 切换后轮询 account-snapshot.json.uid 确认（F-02 验收项，超时 30s）。
-# 客户端启动后首次联网刷新快照；uid 与目标槽 meta.json 一致 = 切换真正生效（fail-open：超时仅警告）。
-# 返回值：'ok' 已确认 / 'skip' 数据目录无快照跳过确认（如 CodeBuddy）/ 'timeout' 30 秒未确认
+# 批次1：authfile 切换后轮询确认（F-02 验收项，超时 30s）。双信号，命中任一即确认：
+#   ①数据目录 skeleton 登录快照 uid（仅 WorkBuddy 有，CodeBuddy 无）；
+#   ②共享 auth 文件 uid —— 客户端启动后若接受恢复的登录会保持/重写目标 uid；
+#     若被残留进程回写会退回旧 uid（实测切换"不生效"的形态），同样能被观测到。
+# auth 信号需连续两次轮询（间隔 2 秒）均命中才算确认，排除恢复刚落盘时的瞬时匹配。
+# 返回值：'ok' 已确认 / 'timeout' 30 秒未确认（fail-open：快照已恢复、客户端已启动，仅警告）。
 function Confirm-AuthFileSwitch {
     param([string]$Slot)
     $snapFile = Join-Path $Script:TraeDataDir 'storage\skeleton\account-snapshot.json'
-    # CodeBuddy 数据目录（~\.codebuddy）无 storage\skeleton 登录快照（实测）：直接跳过轮询，
-    # 不空耗 30 秒；WorkBuddy（~\.workbuddy）快照存在，行为不变
-    if (-not (Test-Path (Split-Path $snapFile -Parent))) {
-        Write-Step -Stage 'verify' -Message "$($Script:AppName) 数据目录无登录快照（storage\skeleton 不存在），跳过切换确认" -Status 'warn'
-        return 'skip'
-    }
     $metaFile = Join-Path (Join-Path $Script:ProfilesDir $Slot) 'meta.json'
     $expectUid = $null
     try { $expectUid = [string]((Get-Content $metaFile -Raw -Encoding UTF8 | ConvertFrom-Json).uid) } catch {}
     if (-not $expectUid) { $expectUid = $Slot }
-    Write-Step -Stage 'verify' -Message '等待客户端刷新登录快照（最长 30 秒）…' -Status 'running'
+    $hasSnapDir = Test-Path (Split-Path $snapFile -Parent)
+    if (-not $hasSnapDir) {
+        Write-Step -Stage 'verify' -Message "$($Script:AppName) 数据目录无登录快照（storage\skeleton 不存在），改以 auth 文件确认登录身份" -Status 'info'
+    } else {
+        Write-Step -Stage 'verify' -Message '等待客户端刷新登录快照（最长 30 秒）…' -Status 'running'
+    }
     $deadline = (Get-Date).AddSeconds(30)
+    $authHits = 0
+    $revertWarned = $false
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 2
-        if (Test-Path $snapFile) {
+        # 信号②：共享 auth 文件 uid（两个布局通用；连续两次命中才确认）
+        $authUid = $null
+        try { $authUid = Get-AuthFileUid -Path $Script:WbAuthFile } catch {}
+        if ($authUid -and $authUid -eq $expectUid) {
+            $authHits++
+            if ($authHits -ge 2) {
+                Write-Step -Stage 'verify' -Message '登录身份已确认为目标账号' -Status 'ok'
+                return 'ok'
+            }
+        } else {
+            $authHits = 0
+            if ($authUid -and -not $revertWarned) {
+                $revertWarned = $true
+                Write-Step -Stage 'verify' -Message "检测到 auth 文件 uid=$(($authUid -split '-')[0])… 与目标不一致（疑似被其他进程回写），持续观察中" -Status 'warn'
+            }
+        }
+        # 信号①：skeleton 登录快照（数据目录存在才检查）
+        if ($hasSnapDir -and (Test-Path $snapFile)) {
             try {
                 $j = Get-Content $snapFile -Raw -Encoding UTF8 | ConvertFrom-Json
                 $uid = $null

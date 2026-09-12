@@ -61,11 +61,83 @@ pub fn workbuddy_credits_fetch(app: AppHandle, state: State<AppState>, user_id: 
         }
         let _ = save_pool(&state, &pool);
     }
+    // 会员套餐回填（仅 edition_type 为空的账号，见 backfill_edition_from_payment_type）
+    backfill_edition_from_payment_type(&state);
     // 每日余额快照（F-27 数据源）：非缓存命中时追加，按日去重，cap 365 天
     if parsed.get("cached") != Some(&serde_json::json!(true)) {
         append_credits_snapshot(&state, &parsed);
     }
     Ok(parsed)
+}
+
+// ── 会员套餐回填（edition_type 数据源补齐）────────────────────────────────
+// edition_type 现仅两条写入路径：OAuth login/account（带 editionType）与备份导入；
+// auth 文件本身无该字段（实测顶层/ account 键均无），「导入本机账号」入池的账号套餐恒空，
+// 两个页面的会员套餐列全为「—」。此处用计费域的付费类型接口补齐（实测可用，域随凭证）。
+
+/// paymentType → 套餐展示名（对齐 CodeBuddy 套餐体系：free=体验版；未知值原样透传）
+fn payment_type_to_edition(pt: &str) -> String {
+    match pt {
+        "free" => "体验版".into(),
+        other => other.to_string(),
+    }
+}
+
+/// 套餐回填：池内 edition_type 为空且有凭证副本的账号，逐个调
+/// POST /v2/billing/meter/get-payment-type（域随凭证 domain 路由）→ 映射套餐名回写池。
+/// 仅补空，不覆盖 OAuth 已写入的 editionType；单账号失败静默跳过（纯展示增强，fail-open）。
+/// 回填一次后池内不再为空，后续调用零网络开销。
+fn backfill_edition_from_payment_type(state: &AppState) -> usize {
+    let mut pool = load_pool(state);
+    let need: Vec<String> = pool
+        .accounts
+        .iter()
+        .filter(|a| a.edition_type.is_empty())
+        .map(|a| a.id.clone())
+        .collect();
+    if need.is_empty() {
+        return 0;
+    }
+    let store: Value = fs_utils::read_json(&token_store_path(state));
+    let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
+    let mut filled = 0usize;
+    for id in need {
+        let Some(rec) = tokens.get(&id) else { continue };
+        let Some(token) = as_str(fs_utils::dig(rec, &["access_token"])).filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        let domain = as_str(fs_utils::dig(rec, &["domain"])).unwrap_or_default();
+        let base = if domain.contains("workbuddy.ai") {
+            "https://www.workbuddy.ai"
+        } else {
+            "https://www.workbuddy.cn"
+        };
+        let Ok(v) = billing_post_json(&agent, &format!("{base}/v2/billing/meter/get-payment-type"), &token) else {
+            continue;
+        };
+        let Some(pt) = as_str(fs_utils::dig(&v, &["data", "paymentType", "payment_type"]))
+            .filter(|s| !s.is_empty() && *s != "unknown")
+        else {
+            continue;
+        };
+        if let Some(a) = pool.accounts.iter_mut().find(|a| a.id == id) {
+            a.edition_type = payment_type_to_edition(&pt);
+            filled += 1;
+        }
+    }
+    if filled > 0 {
+        let _ = save_pool(state, &pool);
+        fs_utils::app_log(&state.data_dir, "workbuddy: 会员套餐已回填（payment-type → edition_type，仅补空）");
+    }
+    filled
+}
+
+/// 手动触发套餐回填（前端在列表存在空套餐账号时调用），返回本次回填的账号数。
+/// async：内含逐账号计费域网络请求（≤10s/账号），同步命令会冻结 UI。
+#[tauri::command(async)]
+pub fn workbuddy_editions_backfill(state: State<AppState>) -> Result<usize, String> {
+    Ok(backfill_edition_from_payment_type(&state))
 }
 
 /// 追加每日积分余额快照（F-27）：workbuddy_credits_history.json，同日覆盖最新

@@ -186,8 +186,13 @@ fn expand_env(p: &str) -> String {
 }
 
 fn version_of(path: &str) -> Option<String> {
+    // 优先 ProductVersion（用户认知的产品版本，如 Trae 3.3.100 / Trae Work 0.1.65 /
+    // CodeBuddy 4.12.0），缺失时回退 FileVersion（内部构建号）——实测 Electron 系客户端
+    // 两者差异巨大（TRAE SOLO CN.exe FileVersion=2.3.83557 而 ProductVersion=0.1.65，
+    // CodeBuddy CN.exe FileVersion=1.106.1.0 而 ProductVersion=4.12.0），旧版恒读
+    // FileVersion 导致顶栏版本显示为构建号而非产品版本
     let ps = format!(
-        "(Get-Item '{}').VersionInfo.FileVersion",
+        "$v=(Get-Item '{}').VersionInfo; if ($v.ProductVersion) {{ $v.ProductVersion }} else {{ $v.FileVersion }}",
         path.replace('\'', "''")
     );
     let out = Command::new("powershell")
@@ -197,10 +202,16 @@ fn version_of(path: &str) -> Option<String> {
         .ok()?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() {
-        None
-    } else {
-        Some(s)
+        return None;
     }
+    // 归一化：4 段式 ProductVersion 去掉末尾冗余 ".0"（WorkBuddy 5.4.7.0 → 5.4.7）；
+    // 3 段式保持原样（CodeBuddy 4.12.0 不能截成 4.12）
+    let s = if s.matches('.').count() == 3 && s.ends_with(".0") {
+        s[..s.len() - 2].to_string()
+    } else {
+        s
+    };
+    Some(s)
 }
 
 fn registry_trae_path() -> Option<String> {
@@ -573,7 +584,15 @@ pub fn app_locate(state: State<AppState>, target_app: Option<String>) -> AppLoca
 
 /// 命中后统一补齐版本号并组装结果
 fn finish_locate(profile: &AppProfile, exe: String, source: &str, version: Option<String>) -> AppLocate {
-    let version = version.or_else(|| version_of(&exe));
+    let mut version = version.or_else(|| version_of(&exe));
+    // 豆包客户端版本号官方形态带平台后缀（与安装包命名一致，如 2.28.13_win）
+    if profile.settings_key == Some("doubao_path") {
+        if let Some(v) = version.as_mut() {
+            if !v.ends_with("_win") {
+                *v = format!("{v}_win");
+            }
+        }
+    }
     AppLocate {
         app: profile.display.to_lowercase().replace(' ', "_"),
         exe: Some(exe),

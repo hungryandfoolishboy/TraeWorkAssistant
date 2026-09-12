@@ -308,6 +308,7 @@ export const api = {
     renewTaskUnregister: () => invoke('workbuddy_renew_task_unregister'),
     creditsFetch: (userId?: string, fresh?: boolean) =>
       invoke<WbCreditsResult>('workbuddy_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
+    editionsBackfill: () => invoke<number>('workbuddy_editions_backfill'),
     settingsGet: () => invoke<WorkBuddySettings>('workbuddy_settings_get'),
     settingsSet: (patch: WorkBuddySettings) => invoke('workbuddy_settings_set', { patch }),
     // 打开 auth 文件所在目录（资源管理器；人工覆盖路径优先）

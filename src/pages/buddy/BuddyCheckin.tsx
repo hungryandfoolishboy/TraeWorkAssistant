@@ -110,6 +110,17 @@ export default function BuddyCheckin() {
       ]);
       setAccounts(accs);
       setSettings(st);
+      // 会员套餐补空（payment-type 回填仅首次有网络开销）：存在空套餐且有凭证的账号时
+      // 静默回填后重取列表；已回填过则命令零网络直接返回 0
+      if (accs.some((a) => !a.edition_type && a.has_credential)) {
+        try {
+          if ((await api.workbuddy.editionsBackfill()) > 0) {
+            setAccounts(await api.workbuddy.accountsList().catch(() => accs));
+          }
+        } catch {
+          // 回填失败静默：套餐列维持「—」，不影响签到流程
+        }
+      }
       // 仅保留今天的记录（days=1 会含昨日）
       const today = new Date();
       const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
@@ -354,14 +365,14 @@ export default function BuddyCheckin() {
           )}
         </div>
 
-        {/* 参与签到的账号列表（账号 / 登录态 / 会员等级 / 签到状态 / 获取积分 / 可用总积分） */}
+        {/* 参与签到的账号列表（账号 / 登录态 / 会员套餐 / 签到状态 / 获取积分 / 可用总积分） */}
         <div className="rounded-lg border border-slate-200 dark:border-zinc-700">
           <table className="w-full text-sm">
             <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-zinc-900">
               <tr>
                 <th className="px-3 py-1.5 text-left">账号</th>
                 <th className="px-3 py-1.5 text-left">登录态</th>
-                <th className="px-3 py-1.5 text-left">会员等级</th>
+                <th className="px-3 py-1.5 text-left">会员套餐</th>
                 <th className="px-3 py-1.5 text-left">签到状态</th>
                 <th className="px-3 py-1.5 text-right">获取积分</th>
                 <th className="px-3 py-1.5 text-right">可用总积分</th>

@@ -52,13 +52,18 @@ pub(super) fn jwt_claims(token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// 系统浏览器打开 URL（Windows：cmd /c start，隐藏控制台；仅放行 http/https 且无引号空格）
+/// 系统浏览器打开 URL（Windows：cmd /c start，隐藏控制台；仅放行 http/https 且无引号空格）。
+/// URL 必须包一层引号再交给 cmd：裸 URL 里的 `&` 会被 cmd 解析成命令分隔符把链接截断
+/// （实测 `.../login?platform=CLI&state=xxx` 打开后浏览器停在裸登录页，state 丢失）。
+/// 注意必须用 raw_arg 直拼命令行：普通 .arg() 会把参数内嵌引号按 MSVC 规则转义成 `\"`，
+/// cmd 不识别 `\"`，整串会被 start 当成带反斜杠的文件路径（实测报「Windows 找不到文件」）。
 pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
         return Err(format!("拒绝打开非法 URL：{url}"));
     }
     Command::new("cmd")
-        .args(["/c", "start", "", url])
+        .arg("/c")
+        .raw_arg(format!("start \"\" \"{url}\""))
         .creation_flags(0x08000000)
         .spawn()
         .map(|_| ())
