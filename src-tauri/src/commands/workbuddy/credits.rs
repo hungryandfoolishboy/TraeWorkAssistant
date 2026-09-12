@@ -116,7 +116,9 @@ fn backfill_edition_from_payment_type(state: &AppState) -> usize {
         let Ok(v) = billing_post_json(&agent, &format!("{base}/v2/billing/meter/get-payment-type"), &token) else {
             continue;
         };
-        let Some(pt) = as_str(fs_utils::dig(&v, &["data", "paymentType", "payment_type"]))
+        // 注意：dig 是候选键语义（自动穿透 data 信封），候选里不能再写 "data"——
+        // 否则 "data" 抢先命中整个信封对象，as_str 恒为 None（曾致套餐回填全静默失败）
+        let Some(pt) = as_str(fs_utils::dig(&v, &["paymentType", "payment_type"]))
             .filter(|s| !s.is_empty() && *s != "unknown")
         else {
             continue;
@@ -625,7 +627,8 @@ pub fn workbuddy_activity_info(
 
     // 付费类型：POST /v2/billing/meter/get-payment-type → data.paymentType
     let payment_type = match billing_post_json(&agent, &format!("{base}/v2/billing/meter/get-payment-type"), &token) {
-        Ok(v) => as_str(fs_utils::dig(&v, &["data", "paymentType", "payment_type"]))
+        // dig 候选键语义：自动穿透 data 信封，候选里不写 "data"（同 backfill 处注释）
+        Ok(v) => as_str(fs_utils::dig(&v, &["paymentType", "payment_type"]))
             .filter(|s| !s.is_empty() && *s != "unknown")
             .map(|s| s.to_string()),
         Err(e) => {
@@ -665,10 +668,11 @@ fn fetch_activity_banners(agent: &ureq::Agent, base: &str) -> Vec<Value> {
         Ok(r) => r.into_json().unwrap_or_default(),
         Err(_) => return vec![],
     };
-    let arr = fs_utils::dig(&v, &["data", "banners"])
+    // dig 候选键语义：自动穿透 data 信封，候选里不写 "data"（否则命中整个信封对象，as_array 恒 None）
+    let arr = fs_utils::dig(&v, &["banners"])
         .and_then(|x| x.as_array().cloned())
-        .or_else(|| fs_utils::dig(&v, &["data", "banner"]).and_then(|x| x.as_array().cloned()))
-        .or_else(|| fs_utils::dig(&v, &["data", "list"]).and_then(|x| x.as_array().cloned()))
+        .or_else(|| fs_utils::dig(&v, &["banner"]).and_then(|x| x.as_array().cloned()))
+        .or_else(|| fs_utils::dig(&v, &["list"]).and_then(|x| x.as_array().cloned()))
         .or_else(|| v.as_array().cloned())
         .unwrap_or_default();
     // 只保留展示字段，剥离未知字段
