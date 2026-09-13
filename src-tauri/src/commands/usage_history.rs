@@ -1,9 +1,14 @@
-//! Trae Work 积分消耗历史（F-27+：`POST /trae/api/v1/pay/query_user_usage_group_by_session`）。
+//! Trae Work 积分消耗历史（`POST /trae/api/v1/pay/query_user_usage_group_by_session`）。
 //!
 //! 此前积分看板的「消耗」口径是 credits_daily 快照的余额差值推算（含签到获得等噪声）；
 //! 本模块改为直连接口拉取会话级用量（credits_float / model_name / token 明细），按本地
-//! 自然日聚合后落盘 data/usage_history.json（结果级 10 分钟 TTL + stale-on-error 沿用
-//! 缓存），供积分看板查询展示。
+//! 自然日聚合落盘 data/usage_history.json，供积分趋势图查询展示。
+//!
+//! 增量语义（避免重复计数）：
+//! - 首次拉取（无缓存）：全量拉取近一年（FULL_PULL_DAYS）；
+//! - 后续拉取（fresh=true）：从「上次拉取 end_time 所在本地日的 00:00」起重拉，
+//!   并**替换**缓存中该日期及之后的日聚合（当天多次拉取不叠加；更早的历史保持不动）；
+//! - fresh=false：纯缓存读取，零网络。
 //!
 //! 请求形态（2026-09-13 代理日志实测）：
 //! `{"start_time":<unix秒>,"end_time":<unix秒>,"page_size":N,"page_num":1,"usage_type":[7]}`
@@ -12,17 +17,16 @@
 //!
 //! 凭证红线：JWT 仅进请求头（复用 ide_query_post），不进日志/返回值。
 
+use chrono::TimeZone;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::sync::Mutex;
-use std::time::Instant;
 use tauri::State;
 
 use crate::state::AppState;
 
-/// 结果缓存 TTL（秒）：进程内结果缓存 + 落盘持久化（跨重启可查）
-const RESULT_TTL_SECS: u64 = 600;
+/// 首次全量拉取窗口（天）
+const FULL_PULL_DAYS: i64 = 365;
 /// 单账号分页安全上限（防 total 异常导致死循环；50 页 × 100 = 5000 会话）
 const MAX_PAGES: u32 = 50;
 /// 单页大小（服务端实测 20；取大值，实际以返回长度自适应）
@@ -49,9 +53,8 @@ pub struct UsageHistoryAccount {
     pub user_id: String,
     pub name: String,
     pub ok: bool,
+    /// 本次增量拉取失败但已沿用缓存时的说明；无缓存时为失败原因
     pub error: Option<String>,
-    pub sessions: u64,
-    pub credits: f64,
     /// 按日期升序
     pub daily: Vec<UsageDayStat>,
 }
@@ -59,24 +62,22 @@ pub struct UsageHistoryAccount {
 #[derive(Serialize, Clone)]
 pub struct UsageHistoryResult {
     pub fetched_at: i64,
-    pub days: u32,
-    /// true = 命中缓存（含 stale-on-error 沿用）
+    /// true = 纯缓存读取（未发起网络请求）
     pub cached: bool,
     pub accounts: Vec<UsageHistoryAccount>,
-    pub total_credits: f64,
-    pub total_sessions: u64,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Default)]
 struct CachedAccount {
     name: String,
+    /// 上次拉取的 end_time（Unix 秒）——增量起点 = 该时刻所在本地日的 00:00
+    last_fetch_end_ts: Option<i64>,
     daily: BTreeMap<String, UsageDayStat>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Default)]
 struct CacheFile {
     fetched_at: Option<i64>,
-    days: Option<u32>,
     accounts: BTreeMap<String, CachedAccount>,
 }
 
@@ -84,37 +85,44 @@ fn cache_path(state: &AppState) -> std::path::PathBuf {
     state.data_dir.join("data").join("usage_history.json")
 }
 
-static RESULT_CACHE: Mutex<Option<(Instant, UsageHistoryResult)>> = Mutex::new(None);
-
-fn daily_to_vec(daily: &BTreeMap<String, UsageDayStat>) -> Vec<UsageDayStat> {
-    daily.values().cloned().collect()
-}
-
 fn account_summary(name: String, uid: String, daily: &BTreeMap<String, UsageDayStat>) -> UsageHistoryAccount {
-    let credits = daily.values().map(|d| d.credits).sum();
-    let sessions = daily.values().map(|d| d.sessions).sum();
     UsageHistoryAccount {
         user_id: uid,
         name,
         ok: true,
         error: None,
-        sessions,
-        credits,
-        daily: daily_to_vec(daily),
+        daily: daily.values().cloned().collect(),
     }
 }
 
-/// 单账号分页拉取并按本地日聚合。start/end 为 Unix 秒；失败返回 Err（调用方沿用缓存）。
+/// Unix 秒 → 本地自然日（YYYY-MM-DD）
+fn local_date_of(ts: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+}
+
+/// 本地自然日 → 当日 00:00 的 Unix 秒（本地时区；无效日期回退 None）
+fn local_midnight_ts(date: &str) -> Option<i64> {
+    let d = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    match chrono::Local
+        .from_local_datetime(&d.and_hms_opt(0, 0, 0)?)
+    {
+        chrono::LocalResult::Single(dt) => Some(dt.timestamp()),
+        chrono::LocalResult::Ambiguous(dt, _) => Some(dt.timestamp()),
+        chrono::LocalResult::None => None,
+    }
+}
+
+/// 单账号分页拉取 [start_ts, end_ts] 区间并按本地日聚合。失败返回 Err（调用方沿用缓存）。
 fn fetch_account_usage(
     state: &AppState,
     uid: &str,
     jwt: &str,
-    days: u32,
+    start_ts: i64,
+    end_ts: i64,
 ) -> Result<BTreeMap<String, UsageDayStat>, String> {
     let agent = crate::commands::accounts::pay_status_agent();
     let dev = crate::commands::accounts::resolve_device(state, uid);
-    let end = chrono::Local::now().timestamp();
-    let start = end - (days as i64 - 1) * 86400;
 
     let mut agg: BTreeMap<String, UsageDayStat> = BTreeMap::new();
     let mut page: u32 = 1;
@@ -123,19 +131,14 @@ fn fetch_account_usage(
 
     loop {
         let body = json!({
-            "start_time": start,
-            "end_time": end,
+            "start_time": start_ts,
+            "end_time": end_ts,
             "page_size": PAGE_SIZE,
             "page_num": page,
             "usage_type": [USAGE_TYPE],
         });
-        let resp = crate::commands::accounts::ide_query_post(
-            &agent,
-            USAGE_URL,
-            jwt,
-            &dev,
-            body,
-        )?;
+        let resp =
+            crate::commands::accounts::ide_query_post(&agent, USAGE_URL, jwt, &dev, body)?;
         if total.is_none() {
             total = Some(resp.get("total").and_then(Value::as_u64).unwrap_or(0) as usize);
         }
@@ -153,10 +156,9 @@ fn fetch_account_usage(
                 continue;
             }
             // usage_time 为 Unix 秒（实测 1789009361），转本地自然日
-            let Some(dt) = chrono::DateTime::from_timestamp(ts, 0) else {
+            let Some(date) = local_date_of(ts) else {
                 continue;
             };
-            let date = dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string();
             let credits = s
                 .get("credits_float")
                 .and_then(Value::as_f64)
@@ -194,131 +196,121 @@ fn fetch_account_usage(
 }
 
 /// 拉取全部账号的积分消耗历史（按本地日聚合），落盘缓存供查询展示。
+/// fresh=false：纯缓存读取（零网络）；fresh=true：增量拉取（无缓存账号全量近一年，
+/// 已有账号从上次拉取日 00:00 起重拉并替换该日期及之后的聚合）。
 /// async 派发：逐账号串行分页网络请求（每请求最长 60s），同步命令会冻住 UI。
 #[tauri::command(async)]
 pub fn usage_history_fetch(
     state: State<AppState>,
-    days: Option<u32>,
     fresh: Option<bool>,
 ) -> Result<UsageHistoryResult, String> {
-    let days = days.unwrap_or(30).clamp(1, 90);
     let fresh = fresh.unwrap_or(false);
     let now_ts = chrono::Local::now().timestamp();
+    let accounts = crate::vault::load_accounts(&state);
+    let mut cache: CacheFile = crate::fs_utils::read_json(&cache_path(&state));
 
-    // ① 进程内结果缓存
+    // 纯缓存读取（零网络；尚未拉取过的账号如实提示）
     if !fresh {
-        if let Ok(guard) = RESULT_CACHE.lock() {
-            if let Some((at, v)) = guard.as_ref() {
-                if at.elapsed().as_secs() < RESULT_TTL_SECS && v.days == days {
-                    return Ok(v.clone());
-                }
-            }
-        }
-        // ② 落盘缓存（跨重启可查；窗口一致且未过期直接复用）
-        let cache: CacheFile = crate::fs_utils::read_json(&cache_path(&state));
-        if cache.days == Some(days)
-            && cache
-                .fetched_at
-                .map(|t| now_ts - t < RESULT_TTL_SECS as i64)
-                .unwrap_or(false)
-        {
-            let accounts = crate::vault::load_accounts(&state);
-            let mut out = Vec::new();
-            for a in &accounts.accounts {
-                let Some(uid) = a.user_id.clone().filter(|u| !u.is_empty()) else {
-                    continue;
-                };
-                if let Some(c) = cache.accounts.get(&uid) {
-                    out.push(account_summary(c.name.clone(), uid, &c.daily));
-                }
-            }
-            let total_credits = out.iter().map(|a| a.credits).sum();
-            let total_sessions = out.iter().map(|a| a.sessions).sum();
-            let result = UsageHistoryResult {
-                fetched_at: cache.fetched_at.unwrap_or(now_ts),
-                days,
-                cached: true,
-                accounts: out,
-                total_credits,
-                total_sessions,
+        let mut out = Vec::new();
+        for a in &accounts.accounts {
+            let Some(uid) = a.user_id.clone().filter(|u| !u.is_empty()) else {
+                continue;
             };
-            if let Ok(mut guard) = RESULT_CACHE.lock() {
-                *guard = Some((Instant::now(), result.clone()));
+            match cache.accounts.get(&uid) {
+                Some(c) => out.push(account_summary(c.name.clone(), uid, &c.daily)),
+                None => out.push(UsageHistoryAccount {
+                    user_id: uid,
+                    name: a.name.clone(),
+                    ok: false,
+                    error: Some("尚未拉取消耗明细，点击「更新消耗明细」拉取".into()),
+                    ..Default::default()
+                }),
             }
-            return Ok(result);
         }
+        return Ok(UsageHistoryResult {
+            fetched_at: cache.fetched_at.unwrap_or(0),
+            cached: true,
+            accounts: out,
+        });
     }
 
-    // ③ 逐账号拉取（无凭证/失败的账号沿用其缓存，stale-on-error）
-    let accounts = crate::vault::load_accounts(&state);
-    let old_cache: CacheFile = crate::fs_utils::read_json(&cache_path(&state));
-    let mut out = Vec::new();
-    let mut new_cache = CacheFile {
-        fetched_at: Some(now_ts),
-        days: Some(days),
-        accounts: BTreeMap::new(),
-    };
+    // 增量拉取：无缓存账号全量近一年；已有账号从上次拉取日 00:00 重拉并替换该日及之后
+    let full_start = now_ts - FULL_PULL_DAYS * 86400;
+    let mut errors: BTreeMap<String, String> = BTreeMap::new();
     for a in &accounts.accounts {
         let Some(uid) = a.user_id.clone().filter(|u| !u.is_empty()) else {
             continue;
         };
         let name = a.name.clone();
         if a.jwt.trim().is_empty() {
-            // 占位账号（无 JWT）：沿用缓存或如实标记
-            match old_cache.accounts.get(&uid) {
-                Some(c) => out.push(account_summary(name, uid, &c.daily)),
-                None => out.push(UsageHistoryAccount {
-                    user_id: uid,
-                    name,
-                    ok: false,
-                    error: Some("账号无 JWT 凭证，无法查询消耗明细".into()),
-                    ..Default::default()
-                }),
-            }
+            // 占位账号（无 JWT）：保留既有缓存，不发起请求
             continue;
         }
-        match fetch_account_usage(&state, &uid, &a.jwt, days) {
-            Ok(daily) => {
-                new_cache.accounts.insert(
-                    uid.clone(),
-                    CachedAccount {
-                        name: name.clone(),
-                        daily: daily.clone(),
-                    },
-                );
-                out.push(account_summary(name, uid, &daily));
-            }
-            Err(e) => match old_cache.accounts.get(&uid) {
-                // stale-on-error：沿用上一次成功数据并标记缓存来源
-                Some(c) => {
-                    let mut acc = account_summary(name, uid, &c.daily);
-                    acc.error = Some(format!("本次查询失败（展示上次缓存）：{e}"));
-                    out.push(acc);
+        let (start_ts, refetch_from) =
+            match cache.accounts.get(&uid).and_then(|c| c.last_fetch_end_ts) {
+                Some(last_end) => {
+                    let from_date = local_date_of(last_end)
+                        .or_else(|| local_date_of(now_ts))
+                        .unwrap_or_default();
+                    let midnight = local_midnight_ts(&from_date).unwrap_or(now_ts - 86400);
+                    (midnight, from_date)
                 }
-                None => out.push(UsageHistoryAccount {
-                    user_id: uid,
-                    name,
-                    ok: false,
-                    error: Some(e),
-                    ..Default::default()
-                }),
-            },
+                None => (full_start, String::new()),
+            };
+        match fetch_account_usage(&state, &uid, &a.jwt, start_ts, now_ts) {
+            Ok(new_agg) => {
+                let entry = cache.accounts.entry(uid.clone()).or_default();
+                entry.name = name;
+                if refetch_from.is_empty() {
+                    // 全量：整体替换
+                    entry.daily = new_agg;
+                } else {
+                    // 增量：替换 refetch_from 及之后的日聚合（当天多次拉取不叠加）
+                    entry
+                        .daily
+                        .retain(|d, _| d.as_str() < refetch_from.as_str());
+                    for (d, v) in new_agg {
+                        entry.daily.insert(d, v);
+                    }
+                }
+                entry.last_fetch_end_ts = Some(now_ts);
+            }
+            Err(e) => {
+                // 拉取失败：保留旧缓存，错误在结果中注明
+                errors.insert(uid, e);
+            }
         }
     }
 
-    let total_credits = out.iter().map(|a| a.credits).sum();
-    let total_sessions = out.iter().map(|a| a.sessions).sum();
-    let result = UsageHistoryResult {
+    cache.fetched_at = Some(now_ts);
+    let _ = crate::fs_utils::write_json(&cache_path(&state), &cache);
+
+    let mut out = Vec::new();
+    for a in &accounts.accounts {
+        let Some(uid) = a.user_id.clone().filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        let name = a.name.clone();
+        match cache.accounts.get(&uid) {
+            Some(c) => {
+                let mut acc = account_summary(c.name.clone(), uid.clone(), &c.daily);
+                if let Some(e) = errors.get(&uid) {
+                    acc.error = Some(format!("本次更新失败（展示已有缓存）：{e}"));
+                }
+                out.push(acc);
+            }
+            None => out.push(UsageHistoryAccount {
+                error: errors.get(&uid).cloned(),
+                user_id: uid,
+                name,
+                ok: false,
+                ..Default::default()
+            }),
+        }
+    }
+    Ok(UsageHistoryResult {
         fetched_at: now_ts,
-        days,
         cached: false,
         accounts: out,
-        total_credits,
-        total_sessions,
-    };
-    let _ = crate::fs_utils::write_json(&cache_path(&state), &new_cache);
-    if let Ok(mut guard) = RESULT_CACHE.lock() {
-        *guard = Some((Instant::now(), result.clone()));
-    }
-    Ok(result)
+    })
 }

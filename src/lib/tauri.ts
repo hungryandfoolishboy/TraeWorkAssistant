@@ -132,9 +132,9 @@ export const api = {
     getJwt: (userId: string) => invoke<string>('account_get_jwt', { userId }),
     // 会员/套餐信息
     refreshPayStatus: () => invoke<number>('refresh_pay_status'),
-    // 积分消耗历史（Trae Work query_user_usage_group_by_session，按本地日聚合 + 落盘缓存）
-    usageHistory: (days?: number, fresh?: boolean) =>
-      invoke<UsageHistoryResult>('usage_history_fetch', { days: days ?? null, fresh: fresh ?? null }),
+    // 积分消耗历史（Trae Work query_user_usage_group_by_session；fresh=true 增量拉取，false 纯缓存）
+    usageHistory: (fresh?: boolean) =>
+      invoke<UsageHistoryResult>('usage_history_fetch', { fresh: fresh ?? null }),
   },
   traeApps: {
     localEntitlement: () => invoke<LocalEntitlement>('apps_entitlement_read'),

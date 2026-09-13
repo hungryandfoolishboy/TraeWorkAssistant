@@ -75,7 +75,7 @@ export interface AccountView {
   membership_next_billing?: number | null;
 }
 
-// ---- 积分消耗历史（Trae Work query_user_usage_group_by_session，按本地日聚合） ----
+// ---- 积分消耗历史（Trae Work query_user_usage_group_by_session，按本地日聚合 + 增量拉取） ----
 export interface UsageDayStat {
   /** 本地自然日 YYYY-MM-DD */
   date: string;
@@ -92,22 +92,17 @@ export interface UsageHistoryAccount {
   user_id: string;
   name: string;
   ok: boolean;
-  /** 本次查询失败但已沿用缓存时的说明；ok=false 时为失败原因 */
+  /** 本次增量拉取失败但已沿用缓存时的说明；ok=false 时为失败/未拉取原因 */
   error: string | null;
-  sessions: number;
-  credits: number;
-  /** 按日期升序 */
+  /** 按日期升序（缓存中全部历史） */
   daily: UsageDayStat[];
 }
 
 export interface UsageHistoryResult {
   fetched_at: number;
-  days: number;
-  /** true = 命中缓存（含 stale-on-error 沿用） */
+  /** true = 纯缓存读取（未发起网络请求） */
   cached: boolean;
   accounts: UsageHistoryAccount[];
-  total_credits: number;
-  total_sessions: number;
 }
 
 // ---- F-08 双应用账号自动发现 ----

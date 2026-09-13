@@ -2,8 +2,6 @@
 import {
   LineChart,
   Line,
-  BarChart,
-  Bar,
   XAxis,
   YAxis,
   ResponsiveContainer,
@@ -27,6 +25,48 @@ function localDate(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
+// ---- 趋势时间区间 ----
+type RangeKey = 'today' | '7d' | '30d' | 'month' | 'year';
+const RANGES: { key: RangeKey; label: string }[] = [
+  { key: 'today', label: '今天' },
+  { key: '7d', label: '近7天' },
+  { key: '30d', label: '近30天' },
+  { key: 'month', label: '本月' },
+  { key: 'year', label: '近一年' },
+];
+
+/** 区间 → 本地自然日序列（升序） */
+function rangeDates(range: RangeKey): string[] {
+  const today = new Date();
+  const dates: string[] = [];
+  const push = (d: Date) => dates.push(localDate(d));
+  switch (range) {
+    case 'today':
+      push(today);
+      break;
+    case '7d':
+      for (let i = 6; i >= 0; i--) push(new Date(Date.now() - i * 86400000));
+      break;
+    case '30d':
+      for (let i = 29; i >= 0; i--) push(new Date(Date.now() - i * 86400000));
+      break;
+    case 'month': {
+      for (
+        let d = new Date(today.getFullYear(), today.getMonth(), 1);
+        d <= today;
+        d = new Date(d.getTime() + 86400000)
+      ) {
+        push(new Date(d));
+      }
+      break;
+    }
+    case 'year':
+      for (let i = 364; i >= 0; i--) push(new Date(Date.now() - i * 86400000));
+      break;
+  }
+  return dates;
+}
+
 export default function Credits() {
   const accounts = useAppStore((s) => s.accounts);
   const groups = useAppStore((s) => s.groups);
@@ -41,58 +81,28 @@ export default function Credits() {
   const pushToast = useAppStore((s) => s.pushToast);
   const [refreshing, setRefreshing] = useState(false);
 
-  // ---- 积分消耗统计（Trae Work 接口明细，按本地日聚合） ----
+  // ---- 消耗明细（Trae Work 接口，按本地日聚合落盘；fresh=true 增量拉取） ----
   const [usage, setUsage] = useState<UsageHistoryResult | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
-  const USAGE_DAYS = 30;
+  const [range, setRange] = useState<RangeKey>('7d');
 
-  const loadUsage = useCallback(async (fresh: boolean) => {
-    setUsageLoading(true);
-    try {
-      const r = await api.accounts.usageHistory(USAGE_DAYS, fresh);
-      setUsage(r);
-    } catch (err) {
-      pushToast('error', `消耗统计查询失败：${String(err)}`);
-    } finally {
-      setUsageLoading(false);
-    }
-  }, [pushToast]);
+  const loadUsage = useCallback(
+    async (fresh: boolean) => {
+      setUsageLoading(true);
+      try {
+        setUsage(await api.accounts.usageHistory(fresh));
+      } catch (err) {
+        pushToast('error', `消耗明细查询失败：${String(err)}`);
+      } finally {
+        setUsageLoading(false);
+      }
+    },
+    [pushToast],
+  );
 
   useEffect(() => {
     void loadUsage(false);
   }, [loadUsage]);
-
-  // 日粒度数据（升序，接口已按日期升序）
-  const usageDaily = useMemo(
-    () => (usage?.accounts ?? []).flatMap((a) => a.daily).reduce((map, d) => {
-      const e = map.get(d.date) ?? { label: `${+d.date.slice(5, 7)}/${+d.date.slice(8, 10)}`, credits: 0, sessions: 0 };
-      e.credits += d.credits;
-      e.sessions += d.sessions;
-      map.set(d.date, e);
-      return map;
-    }, new Map<string, { label: string; credits: number; sessions: number }>()),
-    [usage],
-  );
-  const usageChart = useMemo(
-    () => [...usageDaily.values()].sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true })),
-    [usageDaily],
-  );
-  // 模型消耗 Top（窗口内合计，降序取前 5）
-  const usageModels = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const a of usage?.accounts ?? []) {
-      for (const d of a.daily) {
-        for (const [model, credits] of Object.entries(d.models)) {
-          m.set(model, (m.get(model) ?? 0) + credits);
-        }
-      }
-    }
-    return [...m.entries()].sort((x, y) => y[1] - x[1]).slice(0, 5);
-  }, [usage]);
-  const usageErrors = useMemo(
-    () => (usage?.accounts ?? []).filter((a) => a.error),
-    [usage],
-  );
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -134,9 +144,10 @@ export default function Credits() {
     ? `通用 ${fmtCredits(generalTotal)} 积分 · Work ${fmtCredits(workTotal)} 积分`
     : '总剩余可用积分';
 
+  const today = localDate(new Date());
+
   // 今日新增积分：优先使用 daily snapshot 的 earned 字段（含签到+购买）
   // 回退：仅签到 history delta
-  const today = localDate(new Date());
   const todayNew = useMemo(() => {
     // 1. 优先从每日快照获取 earned（包含签到 + 非签到获得）
     const snap = creditsDaily.find((s) => s.date === today);
@@ -150,37 +161,68 @@ export default function Credits() {
     return 0;
   }, [creditsDaily, creditsHistory, today]);
 
+  // 消耗明细按日合计（跨账号）
+  const usageMap = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const a of usage?.accounts ?? []) {
+      for (const d of a.daily) {
+        m.set(d.date, (m.get(d.date) ?? 0) + d.credits);
+      }
+    }
+    return m;
+  }, [usage]);
+
+  // 今日消耗积分：优先接口明细（credits_float 实际口径），回退余额差值快照
   const todayConsumed = useMemo(() => {
+    const usageVal = usage?.accounts.reduce(
+      (s, a) => s + (a.daily.find((d) => d.date === today)?.credits ?? 0),
+      0,
+    );
+    if (usage != null && usageVal != null && usageVal > 0) return usageVal;
     const snap = creditsDaily.find((s) => s.date === today);
-    return snap ? Math.round(snap.consumed) : 0;
-  }, [creditsDaily, today]);
+    return snap ? snap.consumed : 0;
+  }, [usage, creditsDaily, today]);
 
-  // 近 7 日趋势：从 creditsDaily 快照取数据，补齐无数据的日期
+  // 模型消耗 Top（已拉取范围内合计，降序取前 5）
+  const usageModels = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const a of usage?.accounts ?? []) {
+      for (const d of a.daily) {
+        for (const [model, credits] of Object.entries(d.models)) {
+          m.set(model, (m.get(model) ?? 0) + credits);
+        }
+      }
+    }
+    return [...m.entries()].sort((x, y) => y[1] - x[1]).slice(0, 5);
+  }, [usage]);
+  const usageErrors = useMemo(
+    () => (usage?.accounts ?? []).filter((a) => a.error),
+    [usage],
+  );
+
+  // 趋势数据：消耗线取接口明细（credits_float 实际口径）；总数/获得线取余额快照
+  //（快照缺失的日期为 null，recharts 跳点不画，避免误导性 0 值）
   const trend = useMemo(() => {
-    const map = new Map<string, { total: number; earned: number; consumed: number }>();
-    for (const s of creditsDaily) {
-      map.set(s.date, { total: s.total, earned: s.earned, consumed: s.consumed });
-    }
-    const days: { label: string; total: number; earned: number; consumed: number }[] = [];
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(Date.now() - i * 86400000);
-      const key = localDate(d);
-      const snap = map.get(key);
-      days.push({
-        label: `${d.getMonth() + 1}/${d.getDate()}`,
-        total: snap?.total ?? 0,
-        earned: snap?.earned ?? 0,
-        consumed: snap?.consumed ?? 0,
-      });
-    }
-    // 如果今天没有快照，用当前 total 填充
-    if (days.length > 0 && days[days.length - 1].total === 0 && total > 0) {
-      days[days.length - 1].total = Math.round(total);
-    }
-    return days;
-  }, [creditsDaily, total]);
+    const snapMap = new Map(creditsDaily.map((s) => [s.date, s]));
+    return rangeDates(range).map((date) => {
+      const snap = snapMap.get(date);
+      return {
+        label:
+          range === 'year'
+            ? `${date.slice(0, 4)}/${+date.slice(5, 7)}/${+date.slice(8, 10)}`
+            : `${+date.slice(5, 7)}/${+date.slice(8, 10)}`,
+        total: snap?.total ?? null,
+        earned: snap?.earned ?? null,
+        consumed: usageMap.get(date) ?? null,
+      };
+    });
+  }, [range, creditsDaily, usageMap]);
 
-  const hasTrend = trend.some((d) => d.total > 0 || d.earned > 0 || d.consumed > 0);
+  const hasTrend = trend.some(
+    (d) => d.total != null || d.earned != null || d.consumed != null,
+  );
+  const hasUsage = (usage?.accounts ?? []).some((a) => a.daily.length > 0);
+  const showDots = range === 'today' || range === '7d';
 
   // 到期日历（F-13 批次 2 补挂 Trae 侧）：token（JWT）+ 积分包 + 会员三类，均 Unix 秒
   const expiryItems = useMemo<ExpiryItem[]>(
@@ -230,62 +272,78 @@ export default function Credits() {
         <StatCard label="账号数" value={rows.length} tone="brand" />
         <StatCard label="平均可用积分" value={normZero(avg).toLocaleString()} tone="blue" />
         <StatCard label="今日新增积分" value={normZero(todayNew).toLocaleString()} tone="green" hint={today} />
-        <StatCard label="今日消耗积分" value={normZero(todayConsumed).toLocaleString()} tone="amber" hint={today} />
+        <StatCard
+          label="今日消耗积分"
+          value={normZero(todayConsumed).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}
+          tone="amber"
+          hint={today}
+        />
       </div>
 
-      {/* 积分消耗统计（Trae Work 接口明细；与下方余额差值推算的 7 日趋势口径独立） */}
       <div className="card p-5">
-        <div className="mb-4 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <h3 className="font-medium">近 30 日积分消耗</h3>
-            <Badge tone={usage?.cached ? 'slate' : 'green'}>
-              {usage?.cached ? '缓存' : '接口'}
-            </Badge>
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="font-medium">积分趋势</h3>
+            <div className="flex items-center gap-1">
+              {RANGES.map((r) => (
+                <button
+                  key={r.key}
+                  onClick={() => setRange(r.key)}
+                  className={`chip border ${
+                    range === r.key
+                      ? 'border-brand-500 text-brand-600 dark:text-brand-400'
+                      : 'border-slate-200 text-slate-500 dark:border-zinc-700 dark:text-zinc-400'
+                  }`}
+                >
+                  {r.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
             {usage && (
-              <span className="text-xs text-slate-400">
-                {new Date(usage.fetched_at * 1000).toLocaleString('zh-CN', { hour12: false })}
+              <span className="text-xs text-slate-400" title="消耗明细最近更新时间（接口口径）">
+                明细更新于 {new Date(usage.fetched_at * 1000).toLocaleString('zh-CN', { hour12: false })}
               </span>
             )}
+            <button
+              className="btn-ghost flex items-center gap-1.5 text-sm"
+              onClick={() => void loadUsage(true)}
+              disabled={usageLoading}
+              title="从 Trae Work 接口增量拉取消耗明细（历史已拉取部分不重复拉取）"
+            >
+              <RefreshCw size={14} className={usageLoading ? 'animate-spin' : ''} />
+              {usageLoading ? '拉取中' : '更新消耗明细'}
+            </button>
           </div>
-          <button
-            className="btn-ghost flex items-center gap-1.5 text-sm"
-            onClick={() => void loadUsage(true)}
-            disabled={usageLoading}
-            title="重新从接口拉取全部账号消耗明细（分页拉取，稍耗时）"
-          >
-            <RefreshCw size={14} className={usageLoading ? 'animate-spin' : ''} />
-            {usageLoading ? '拉取中' : '拉取明细'}
-          </button>
         </div>
-        {usageLoading && !usage ? (
-          <div className="flex h-40 items-center justify-center text-sm text-slate-400">
-            正在从 Trae Work 接口拉取消耗明细…
-          </div>
-        ) : !usage || usage.total_sessions === 0 ? (
+        <div className="mb-3 flex items-center gap-3 text-xs text-slate-400">
+          <span className="flex items-center gap-1">
+            <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#6366f1' }} />
+            积分总数
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#22c55e' }} />
+            获得积分
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#f59e0b' }} />
+            消耗积分（接口）
+          </span>
+        </div>
+        {accounts.length === 0 ? (
+          <EmptyState icon={<Coins size={28} />} title="尚无账号数据" hint="添加账号后这里会展示积分趋势。" />
+        ) : !hasTrend ? (
           <EmptyState
             icon={<Coins size={28} />}
-            title="暂无消耗数据"
-            hint="账号已录入 JWT 且有会话消耗时，这里展示每日消耗明细（含模型分布）。"
+            title="暂无趋势数据"
+            hint="执行签到或刷新积分后展示余额趋势；点击右上角「更新消耗明细」可从接口拉取历史消耗。"
           />
         ) : (
           <>
-            <div className="mb-4 grid grid-cols-3 gap-3">
-              <StatCard label="消耗总积分" value={fmtCredits(usage.total_credits)} tone="amber" hint={`近 ${usage.days} 天 · ${usage.total_sessions} 个会话`} />
-              <StatCard label="日均消耗" value={fmtCredits(usage.total_credits / Math.max(usage.days, 1))} tone="blue" />
-              <StatCard label="会话均耗" value={fmtCredits(usage.total_sessions > 0 ? usage.total_credits / usage.total_sessions : 0)} tone="violet" />
-            </div>
-            {usageModels.length > 0 && (
-              <div className="mb-4 flex flex-wrap gap-2">
-                {usageModels.map(([model, credits]) => (
-                  <Badge key={model} tone="slate" title={`${model} 窗口内共消耗 ${fmtCredits(credits)} 积分`}>
-                    {model} · {fmtCredits(credits)}
-                  </Badge>
-                ))}
-              </div>
-            )}
-            <div className="h-56">
+            <div className={showDots ? 'h-56' : 'h-56'}>
               <ResponsiveContainer>
-                <BarChart data={usageChart} margin={{ top: 24, right: 16, left: 0, bottom: 4 }} barCategoryGap="24%">
+                <LineChart data={trend} margin={{ top: 24, right: 16, left: 0, bottom: 4 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
                   <XAxis
                     dataKey="label"
@@ -295,7 +353,7 @@ export default function Credits() {
                   />
                   <YAxis tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={56} />
                   <Tooltip
-                    cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
+                    cursor={{ stroke: isDark ? '#52525b' : '#cbd5e1', strokeWidth: 1, strokeDasharray: '3 3' }}
                     contentStyle={{
                       fontSize: 12,
                       borderRadius: 10,
@@ -305,89 +363,37 @@ export default function Credits() {
                       boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
                       padding: '8px 12px',
                     }}
-                    formatter={(v: number, name: string) => [
-                      normZero(v).toLocaleString('zh-CN', { maximumFractionDigits: 2 }),
-                      name === 'credits' ? '消耗积分' : '会话数',
-                    ]}
+                    formatter={(v: number, name: string) => {
+                      const labels: Record<string, string> = { total: '积分总数', earned: '获得积分', consumed: '消耗积分（接口）' };
+                      return [normZero(v).toLocaleString('zh-CN', { maximumFractionDigits: 2 }), labels[name] ?? name];
+                    }}
                   />
-                  <Bar dataKey="credits" fill="#f59e0b" radius={[4, 4, 0, 0]} maxBarSize={28} />
-                </BarChart>
+                  <Line type="monotone" dataKey="total" stroke="#6366f1" strokeWidth={2.5} dot={showDots ? { r: 3, fill: '#6366f1', strokeWidth: 0 } : false} activeDot={{ r: 5 }} connectNulls />
+                  <Line type="monotone" dataKey="earned" stroke="#22c55e" strokeWidth={2} dot={showDots ? { r: 3, fill: '#22c55e', strokeWidth: 0 } : false} activeDot={{ r: 5 }} connectNulls />
+                  <Line type="monotone" dataKey="consumed" stroke="#f59e0b" strokeWidth={2.5} dot={showDots ? { r: 3, fill: '#f59e0b', strokeWidth: 0 } : false} activeDot={{ r: 5 }} connectNulls />
+                </LineChart>
               </ResponsiveContainer>
             </div>
+            {usageModels.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {usageModels.map(([model, credits]) => (
+                  <Badge key={model} tone="slate" title={`${model} 已拉取范围内共消耗 ${fmtCredits(credits)} 积分`}>
+                    {model} · {fmtCredits(credits)}
+                  </Badge>
+                ))}
+              </div>
+            )}
             {usageErrors.length > 0 && (
               <div className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">
-                {usageErrors.map((a) => a.error).join('；')}
+                {usageErrors.map((a) => `${a.name}：${a.error}`).join('；')}
+              </div>
+            )}
+            {!hasUsage && (
+              <div className="mt-3 text-xs text-slate-400">
+                消耗线暂无数据：首次点击「更新消耗明细」将全量拉取近一年历史，之后每次仅增量拉取。
               </div>
             )}
           </>
-        )}
-      </div>
-
-      <div className="card p-5">
-        <div className="mb-4 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <h3 className="font-medium">近 7 日积分趋势</h3>
-            <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
-              7 Days
-            </span>
-          </div>
-          <div className="flex items-center gap-3 text-xs text-slate-400">
-            <span className="flex items-center gap-1">
-              <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#6366f1' }} />
-              积分总数
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#22c55e' }} />
-              获得积分
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#f59e0b' }} />
-              消耗积分
-            </span>
-          </div>
-        </div>
-        {accounts.length === 0 ? (
-          <EmptyState icon={<Coins size={28} />} title="尚无账号数据" hint="添加账号后这里会展示积分趋势。" />
-        ) : !hasTrend ? (
-          <EmptyState
-            icon={<Coins size={28} />}
-            title="暂无趋势数据"
-            hint="执行签到或刷新积分后，这里会展示每日积分变化趋势。"
-          />
-        ) : (
-          <div className="h-56">
-            <ResponsiveContainer>
-              <LineChart data={trend} margin={{ top: 24, right: 16, left: 0, bottom: 4 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
-                <XAxis
-                  dataKey="label"
-                  tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
-                  axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
-                  tickLine={false}
-                />
-                <YAxis tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={56} />
-                <Tooltip
-                  cursor={{ stroke: isDark ? '#52525b' : '#cbd5e1', strokeWidth: 1, strokeDasharray: '3 3' }}
-                  contentStyle={{
-                    fontSize: 12,
-                    borderRadius: 10,
-                    border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
-                    background: isDark ? '#18181b' : '#fff',
-                    color: isDark ? '#e4e4e7' : '#1e293b',
-                    boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
-                    padding: '8px 12px',
-                  }}
-                  formatter={(v: number, name: string) => {
-                    const labels: Record<string, string> = { total: '积分总数', earned: '获得积分', consumed: '消耗积分' };
-                    return [normZero(v).toLocaleString('zh-CN', { maximumFractionDigits: 2 }), labels[name] ?? name];
-                  }}
-                />
-                <Line type="monotone" dataKey="total" stroke="#6366f1" strokeWidth={2.5} dot={{ r: 3, fill: '#6366f1', strokeWidth: 0 }} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="earned" stroke="#22c55e" strokeWidth={2} dot={{ r: 3, fill: '#22c55e', strokeWidth: 0 }} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="consumed" stroke="#f59e0b" strokeWidth={2} dot={{ r: 3, fill: '#f59e0b', strokeWidth: 0 }} activeDot={{ r: 5 }} />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
         )}
       </div>
 
