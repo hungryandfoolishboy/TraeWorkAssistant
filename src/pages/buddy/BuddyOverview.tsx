@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { RefreshCw, ExternalLink, CheckCircle2, Circle, ChevronRight } from 'lucide-react';
+import { RefreshCw, CheckCircle2, Circle, ChevronRight } from 'lucide-react';
 import {
   BarChart,
   Bar,
@@ -12,7 +12,6 @@ import {
   LabelList,
   Legend,
 } from 'recharts';
-import { open } from '@tauri-apps/plugin-shell';
 import PageHeader from '../../components/PageHeader';
 import { Spinner, StatCard, Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
@@ -24,7 +23,6 @@ import type {
   WorkBuddyEnvCheck,
   WorkBuddyAccountView,
   WbCreditsResult,
-  WbActivityInfo,
   WbCheckinRecord,
 } from '../../types';
 
@@ -80,7 +78,6 @@ export default function BuddyOverview() {
   const [codebuddyEnv, setCodebuddyEnv] = useState<CodeBuddyEnvCheck | null>(null);
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [credits, setCredits] = useState<WbCreditsResult | null>(null);
-  const [activity, setActivity] = useState<WbActivityInfo | null>(null);
   const [records, setRecords] = useState<WbCheckinRecord[]>([]);
   const [cliBridged, setCliBridged] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -99,11 +96,7 @@ export default function BuddyOverview() {
       setAccounts(accs);
       setCredits(cr);
       setRecords(recs);
-      // 活动信息与 CLI 桥状态（低频附加展示，失败静默）
-      api.workbuddy
-        .activityInfo()
-        .then(setActivity)
-        .catch(() => setActivity(null));
+      // CLI 桥状态（低频附加展示，失败静默）
       api.env
         .codebuddyEnvCheck()
         .then(setCodebuddyEnv)
@@ -168,15 +161,6 @@ export default function BuddyOverview() {
         .map((a) => ({ name: a.name || a.user_id, credits: a.balance as number })),
     [credits],
   );
-
-  // 用量提醒人类可读文案（dosageNotifyCode=0 且无文案 = 无提醒，不展示原始键值）
-  const dosageMsg = (() => {
-    const dn = activity?.dosage_notify;
-    if (!dn) return '';
-    const zh = typeof dn.dosageNotifyZh === 'string' ? dn.dosageNotifyZh.trim() : '';
-    const en = typeof dn.dosageNotifyEn === 'string' ? dn.dosageNotifyEn.trim() : '';
-    return zh || en;
-  })();
 
   // 配置导航（步骤完成态实时判定；结合双客户端审计——主功能在 WorkBuddy，CodeBuddy 仅 CLI 桥接可选）
   const steps: Step[] = [
@@ -285,47 +269,6 @@ export default function BuddyOverview() {
           tone={alertCount > 0 ? 'red' : 'slate'}
         />
       </div>
-
-      {/* 活动信息卡（低频附加展示；用量提醒仅在有文案时展示） */}
-      {activity && (activity.banners.length > 0 || activity.payment_type || dosageMsg) && (
-        <div className="mt-4 card p-4">
-          <div className="mb-2 flex items-center justify-between">
-            <span className="text-sm font-medium">活动信息</span>
-            <div className="flex items-center gap-2">
-              {activity.payment_type && <Badge tone="violet">{activity.payment_type}</Badge>}
-              {activity.errors.length > 0 && (
-                <span className="text-xs text-slate-400">部分数据源不可用</span>
-              )}
-            </div>
-          </div>
-          {activity.banners.length > 0 && (
-            <div className="flex gap-2 overflow-x-auto pb-1">
-              {activity.banners.map((b, i) => (
-                <div
-                  key={`${b.title}-${i}`}
-                  className="min-w-56 max-w-80 shrink-0 rounded-lg border border-slate-100 p-3 text-xs dark:border-zinc-800"
-                >
-                  <div className="font-medium text-slate-700 dark:text-zinc-200">{b.title || '活动'}</div>
-                  {b.content && <div className="mt-1 line-clamp-2 text-slate-500 dark:text-zinc-400">{b.content}</div>}
-                  {b.url && (
-                    <button
-                      className="mt-1 flex items-center gap-1 text-brand-600 hover:underline dark:text-brand-400"
-                      onClick={() => void open(b.url).catch(() => pushToast('warn', '链接无法打开'))}
-                    >
-                      查看详情 <ExternalLink size={11} />
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-          {dosageMsg && (
-            <div className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">
-              用量提醒：{dosageMsg}
-            </div>
-          )}
-        </div>
-      )}
 
       {/* 近 30 天签到结果（从签到页移入，无数据显示空态） */}
       <div className="mt-5 card p-5">
