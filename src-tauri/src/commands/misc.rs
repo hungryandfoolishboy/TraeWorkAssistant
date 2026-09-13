@@ -279,6 +279,16 @@ pub fn proxy_log_detail(state: State<AppState>, id: String) -> Result<String, St
     }
     let file_name = parts[0];
     let index: usize = parts[1].parse().map_err(|_| "无效的索引")?;
+    // 审查修复（任意文件读取/路径遍历）：文件名与列表接口（proxy_logs_list :200）同一
+    // 白名单，并拒绝路径分隔符——"..\..\x:0" 类输入此前可直接 join 读任意文件
+    if !file_name.starts_with("proxy_req_")
+        || !file_name.ends_with(".log")
+        || file_name.contains('\\')
+        || file_name.contains('/')
+        || file_name.contains("..")
+    {
+        return Err("无效的日志文件名".into());
+    }
 
     let log_dir = proxy_log_dir(&state);
     let path = log_dir.join(file_name);
@@ -597,6 +607,24 @@ pub const DOUBAO_QUOTA_TASK_NAME: &str = "AIWorkAssistant_DoubaoQuotaCheck";
 // 以 GBK 字节输出；若直接 from_utf8_lossy 会读成 ϵͳ... 乱码，导致 "找不到" 永远匹配不上、
 // 错误文案变成乱码。前置 `chcp 65001` 让 schtasks 以 UTF-8 输出，从而能正确匹配与展示。
 // 返回 (成功?, stdout, stderr)，三者均为 UTF-8 字符串。
+/// 严格校验 HH:MM 时间格式（schtasks /ST 参数）。
+/// 审查修复（命令注入）：time 经 `cmd /c … && schtasks /ST <time>` 执行，cmd 对不含
+/// 空格/引号的参数不做引号包裹，`12:00&calc` 类输入会把 `&` 解释为命令分隔符实现
+/// 任意命令执行。白名单校验在 sink 入口统一拦死，调用方（misc/doubao/workbuddy）共用。
+pub(crate) fn validate_hhmm(time: &str) -> Result<(), String> {
+    let t = time.trim();
+    let valid = t.len() == 5
+        && t.as_bytes()[2] == b':'
+        && t.as_bytes()[..2].iter().all(u8::is_ascii_digit)
+        && t.as_bytes()[3..].iter().all(u8::is_ascii_digit)
+        && t[..2].parse::<u8>().map(|h| h < 24).unwrap_or(false)
+        && t[3..].parse::<u8>().map(|m| m < 60).unwrap_or(false);
+    if !valid {
+        return Err(format!("时间格式无效: {time}（应为 HH:MM）"));
+    }
+    Ok(())
+}
+
 pub(crate) fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     let mut full: Vec<String> = vec![
         "/c".to_string(),
@@ -698,6 +726,7 @@ fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
 // 计划任务命令含 schtasks 子进程调用（可达数秒），标记 async 派发到线程池执行，避免阻塞 UI
 #[tauri::command(async)]
 pub fn task_register(state: State<AppState>, time: String) -> Result<(), String> {
+    validate_hhmm(&time)?;
     register_daily_task(&state, &time)?;
     // 注册成功后清理旧版计划任务（品牌迁移），失败不影响本次注册
     let _ = run_schtasks(&["/Delete", "/TN", LEGACY_TASK_NAME, "/F"]);

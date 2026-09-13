@@ -690,10 +690,26 @@ pub async fn wb_aggregate_chat(
                 .body(Body::from(body.to_string()))
                 .unwrap_or_else(|_| internal_error_response())
         }
-        Ok(Err(msg)) => match proto {
-            Protocol::Anthropic => anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &msg),
-            _ => openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", &msg),
-        },
+        Ok(Err(msg)) => {
+            // 审查修复：Fatal 错误透传上游状态码（对齐 SOLO 聚合路径 AggregateFail::Upstream）。
+            // 上游 400/404/413 等请求级错误此前被统一降级 503 no_healthy_account，
+            // 严格客户端（Codex/Claude Code）会按「可重试临时故障」无意义重试；
+            // 401/403/429 属账号/池问题，维持 503 语义（换号重试仍由池层决策）。
+            let upstream_status = msg
+                .strip_prefix("upstream ")
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|s| s.parse::<u16>().ok());
+            let status = match upstream_status {
+                Some(s) if (400..500).contains(&s) && !matches!(s, 401 | 403 | 429) => {
+                    StatusCode::from_u16(s).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+                }
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            match proto {
+                Protocol::Anthropic => anthropic_error(status, "api_error", &msg),
+                _ => openai_error(status, "upstream_error", &msg),
+            }
+        }
         Err(e) => openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",

@@ -19,6 +19,9 @@ pub fn switch_account(
     // 跳过 TRAE 切换前 JWT 预检，否则预检 401 会把续期链路拦死
     skip_jwt_probe: Option<bool>,
 ) -> Result<(), String> {
+    // 审查修复（入参校验/路径遍历）：user_id 会拼进豆包探测槽路径（probe_slot_session_alive）
+    // 与桥的快照槽路径，与其余 uid 入口（profile.rs/doubao.rs 等）统一过白名单
+    fs_utils::ensure_uid_safe(user_id.trim())?;
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
     fs_utils::app_log(
@@ -218,6 +221,8 @@ pub fn save_current_login(
     user_id: String,
     target_app: Option<String>,
 ) -> Result<(), String> {
+    // 审查修复（入参校验）：同 switch_account，uid 白名单校验与其余入口对齐
+    fs_utils::ensure_uid_safe(user_id.trim())?;
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
     fs_utils::app_log(

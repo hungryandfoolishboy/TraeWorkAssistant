@@ -299,7 +299,8 @@ fn get_user_info(access_token: &str) -> Result<(String, String), String> {
 }
 
 /// OAuth 登录闭环：解析回调 → 换取 accessToken → 获取用户信息 → 保存账号
-#[tauri::command]
+// async：内含最多两次 120s 超时的串行网络请求（exchange_token/get_user_info），同步命令会冻结 UI（审查修复）
+#[tauri::command(async)]
 pub fn oauth_login(
     state: State<AppState>,
     callback_url: String,

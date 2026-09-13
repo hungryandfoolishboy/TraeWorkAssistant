@@ -577,7 +577,8 @@ fn uuidless_key(date: &str, model: &str, credit: &f64) -> String {
 /// 活动信息三端点聚合（F-51，§7.1）：活动 banner（公开 GET）+ 付费类型 +
 /// 用量提醒（billing POST）。低频附加展示：10min 缓存；端点失败不致命，
 /// 逐项容错并记入 errors（宽容解析，字段缺失返回 null）。
-#[tauri::command]
+// async：内含 3 次串行网络请求（各 10s 超时），同步命令会冻结 UI（审查修复）
+#[tauri::command(async)]
 pub fn workbuddy_activity_info(
     state: State<AppState>,
     user_id: Option<String>,

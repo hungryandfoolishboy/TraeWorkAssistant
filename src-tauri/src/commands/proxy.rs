@@ -103,7 +103,9 @@ fn sync_tray_proxy_text(app: &tauri::AppHandle, running: bool) {
     }
 }
 
-#[tauri::command]
+// async：内含 PowerShell 孤儿进程扫描（Get-CimInstance 可达数秒）、sleep 与注册表操作，
+// 同步命令会冻结 UI（项目约定：阻塞型命令一律 #[tauri::command(async)]，审查修复）
+#[tauri::command(async)]
 pub fn proxy_start(
     app: AppHandle,
     state: State<AppState>,

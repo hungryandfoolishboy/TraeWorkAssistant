@@ -190,6 +190,28 @@ def _mask_header_value(name, value):
     return value
 
 
+# 体级脱敏（审查修复 P0）：请求/响应体明文落盘前，把凭证类键值对整体擦除。
+# 背景：ExchangeToken/oauth 响应体即含 access_token/refresh_token（账号池回写的数据源），
+# 头级掩码覆盖不到体。键名匹配带引号（JSON）与不带引号（query/表单）两种形态，
+# 命中键名即替换其值为 ***。
+_BODY_TOKEN_RE = re.compile(
+    r'(?i)((?:"(?:access_token|refresh_token|id_token|session_token|sessionid|sid_guard|'
+    r'ttwid|jwt|api_key|apikey|secret|password|pass_token)"'
+    r'|\b(?:access_token|refresh_token|id_token|session_token|sessionid|sid_guard|'
+    r'ttwid|jwt|api_key|apikey|password|pass_token)\b)'
+    r'\s*[=:]\s*)'
+    r'("[^"]*"|\'[^\']*\'|[^,;&\s}]+)'
+)
+
+
+def _mask_body(text):
+    """体级凭证键值脱敏：值替换为 "***"；任何异常时整段返回占位（fail-closed）。"""
+    try:
+        return _BODY_TOKEN_RE.sub(r'\1"***"', text)
+    except Exception:
+        return "***"
+
+
 class ProxyRequestLogger:
     """将代理抓取到的完整请求/响应记录到明文文件。
     按日命名（proxy_req_%Y-%m-%d.log，同日追加），单日超 100MB 时换 .log.N 序号文件继续追加。
@@ -242,20 +264,22 @@ class ProxyRequestLogger:
                 # 脱敏红线：凭证头掩码后落盘，禁止明文（见类注释）
                 lines.append(f"  {k}: {_mask_header_value(k, v)}")
             if req_body:
+                # 脱敏红线（审查修复 P0）：体级凭证键值擦除后落盘
                 body_preview = req_body[:4096].decode("utf-8", "replace") if isinstance(req_body, bytes) else str(req_body)[:4096]
                 lines.append(f"--- Request Body ({len(req_body)} bytes) ---")
-                lines.append(body_preview)
+                lines.append(_mask_body(body_preview))
             lines.append(f"--- Response: {resp_status} {resp_reason} ---")
             if resp_headers:
                 for k, v in resp_headers:
                     # 脱敏红线：Set-Cookie 等凭证头掩码后落盘
                     lines.append(f"  {k}: {_mask_header_value(k, v)}")
             if resp_body:
-                # 先解压再展示，避免 gzip/deflate/br 压缩导致的乱码
+                # 先解压再展示，避免 gzip/deflate/br 压缩导致的乱码；
+                # 脱敏红线（审查修复 P0）：体级凭证键值擦除后落盘（ExchangeToken 响应体含 refresh_token）
                 decompressed = decompress_body(resp_body, resp_headers)
                 body_preview = decompressed[:8192].decode("utf-8", "replace") if isinstance(decompressed, bytes) else str(decompressed)[:8192]
                 lines.append(f"--- Response Body ({len(resp_body)} bytes, decompressed {len(decompressed)} bytes) ---")
-                lines.append(body_preview)
+                lines.append(_mask_body(body_preview))
             # SSE 流摘要：对 llm_utils_chat 请求解析 SSE 事件
             sse_summary = extract_sse_summary(resp_headers, resp_body)
             if sse_summary:

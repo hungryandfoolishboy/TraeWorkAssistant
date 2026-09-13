@@ -271,9 +271,12 @@ fn read_body_limited(resp: ureq::Response) -> Result<String, String> {
 fn web_search(query: &str) -> Result<String, String> {
     let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
     url_allowed(&url)?;
+    // 审查修复（SSRF 补强）：与 open_url 同款 redirects(0)——DDG 的 302 可被引导至内网
+    // 地址（盲探测面）；html 端点正常直返 200，若 302 则 fail-closed 明示失败
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(8))
         .timeout(std::time::Duration::from_secs(15))
+        .redirects(0)
         .build();
     let resp = agent
         .get(&url)
@@ -405,16 +408,61 @@ fn strip_tags(html: &str) -> String {
 
 /// 页面抓取 → 可读文本（SSRF host 校验 + script/style 剔除 + 剥标签 + 截断）
 fn open_url(url: &str) -> Result<String, String> {
-    url_allowed(url)?;
+    // 审查修复（SSRF 补强）：此前仅校验首跳 host，ureq 默认跟随 5 次重定向——
+    // 302 跳 127.0.0.1 等内网地址可绕过白名单。改为 redirects(0) + 逐跳校验
+    //（最多 3 跳）：每一跳都重新过 url_allowed，Location 指向受限地址即中止。
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(8))
         .timeout(std::time::Duration::from_secs(20))
+        .redirects(0)
         .build();
-    let resp = agent
-        .get(url)
-        .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .call()
-        .map_err(|e| format!("页面请求失败: {e}"))?;
+    let mut current = url.trim().to_string();
+    for _hop in 0..3 {
+        url_allowed(&current)?;
+        let _ = match agent
+            .get(&current)
+            .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .call()
+        {
+            Ok(resp) => return finish_open_url(resp),
+            Err(ureq::Error::Status(code, resp)) if (300..400).contains(&code) => {
+                let loc = resp
+                    .header("location")
+                    .ok_or_else(|| format!("重定向响应缺少 Location（HTTP {code}）"))?
+                    .to_string();
+                current = resolve_redirect_target(&current, &loc)?;
+            }
+            Err(e) => return Err(format!("页面请求失败: {e}")),
+        };
+    }
+    Err("重定向次数超过上限（3 跳），已中止".into())
+}
+
+/// 重定向目标解析：绝对 URL 直接采用；相对路径以当前 URL 的 scheme+host 为基拼接；
+/// 其余形态拒绝（fail-closed，下一跳仍有 url_allowed 白名单兜底）
+fn resolve_redirect_target(current: &str, location: &str) -> Result<String, String> {
+    let loc = location.trim();
+    if loc.starts_with("http://") || loc.starts_with("https://") {
+        return Ok(loc.to_string());
+    }
+    // 协议相对（//host/x）：沿用当前 scheme 换 authority（复审补充）
+    if let Some(rest_loc) = loc.strip_prefix("//") {
+        let scheme = &current[..current.find("://").unwrap_or(0)];
+        return Ok(format!("{scheme}://{rest_loc}"));
+    }
+    if let Some(rest) = current.strip_prefix("http://").or_else(|| current.strip_prefix("https://")) {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if !authority.is_empty() {
+            if loc.starts_with('/') {
+                let scheme = &current[..current.find("://").unwrap_or(0)];
+                return Ok(format!("{scheme}://{authority}{loc}"));
+            }
+        }
+    }
+    Err(format!("不支持的重定向 Location 形态: {}", &loc.chars().take(80).collect::<String>()))
+}
+
+fn finish_open_url(resp: ureq::Response) -> Result<String, String> {
     let html = read_body_limited(resp)?;
     // script/style 块整体剔除（审查修复：删除死变量 cleaned——整页 to_lowercase 白耗分配）
     let body = remove_blocks(&html, "<script", "</script>");

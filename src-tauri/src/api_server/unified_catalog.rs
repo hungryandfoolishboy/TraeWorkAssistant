@@ -622,7 +622,9 @@ mod tests {
                 .collect();
             std::fs::write(
                 dir.join("data").join("wb_model_catalog.json"),
-                json!({"models": list}).to_string(),
+                // 模拟「人工维护」目录：必须携带当前 builtin_rev 才退出内置表重建
+                //（wb_catalog::load 对旧版本自动落盘的目录按新快照重建，见该文件 BUILTIN_REV 注释）
+                json!({"models": list, "builtin_rev": crate::api_server::wb_catalog::BUILTIN_REV}).to_string(),
             )
             .unwrap();
         }

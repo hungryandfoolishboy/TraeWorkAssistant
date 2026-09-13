@@ -154,6 +154,8 @@ interface AppState {
 let toastSeq = 0;
 // 已注册的事件监听取消函数；StrictMode 下 init 会执行两次，靠它先注销旧监听避免重复注册
 let unsubs: Array<() => void> = [];
+/** init 幂等锁：StrictMode 双跑（dev）时第二次调用直接返回，防并发双注册监听 */
+let initStarted = false;
 
 function defaultSettings(): Settings {
   return {
@@ -225,9 +227,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   showApiManager: false,
 
   init: async () => {
-    // StrictMode 下 effect 会执行两次：先注销旧监听，避免重复注册导致事件触发两次（如 captured 重复 +1、toast 双发）
-    unsubs.forEach((u) => u());
-    unsubs = [];
+    // StrictMode 下 effect 会执行两次（dev）：两次 init 同步并发启动，旧的「先注销旧监听」
+    // 防护在 setupListeners resolve 前执行时注销不到任何东西，两组监听都会注册成功，
+    // 且后者覆盖 unsubs → 第一组永久泄漏、事件双发（proxy-log 重复、captured +2）。
+    // 幂等锁：仅首次执行注册，后续调用直接复用（审查修复 P1-16）
+    if (initStarted) return;
+    initStarted = true;
     unsubs = await setupListeners({
       onProxyLog: (line) =>
         set((s) => ({ proxyLog: [line, ...s.proxyLog.slice(0, 199)] })),

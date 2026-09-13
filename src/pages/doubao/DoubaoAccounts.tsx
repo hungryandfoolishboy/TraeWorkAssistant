@@ -160,24 +160,36 @@ export default function DoubaoAccounts() {
 
   useEffect(() => {
     void reload(true);
-    // 切换/保存/快照操作完成（store 负责 toast），这里负责刷新列表
+    // 切换/保存/快照操作完成（store 负责 toast），这里负责刷新列表。
+    // 审查修复（P1-17）：卸载早于 listen promise resolve 时，push 进已丢弃的数组会导致
+    // 监听器泄漏 + 已卸载组件 setState——disposed 标记保证晚到的 unlisten 立即执行。
     const cleanups: Array<() => void> = [];
-    void listen('switch-done', () => void reload()).then((u) => cleanups.push(u));
-    void listen('save-login-done', () => void reload()).then((u) => cleanups.push(u));
+    let disposed = false;
+    const track = (p: Promise<() => void>) =>
+      void p.then((u) => (disposed ? u() : cleanups.push(u)));
+    track(listen('switch-done', () => void reload()));
+    track(listen('save-login-done', () => void reload()));
     // 保活进度
-    void listen('keepalive-progress', (e) =>
-      setKeepaliveProgress((prev) => [...prev.slice(-49), e.payload as string]),
-    ).then((u) => cleanups.push(u));
-    void listen('keepalive-done', (e) => {
-      const ok = (e.payload as { success: boolean }).success;
-      setKeepaliveRunning(false);
-      pushToast(
-        ok ? 'success' : 'error',
-        ok ? '保活完成：豆包会话已滑动续期' : '保活未完成，请查看日志',
-      );
-      void reload();
-    }).then((u) => cleanups.push(u));
-    return () => cleanups.forEach((u) => u());
+    track(
+      listen('keepalive-progress', (e) =>
+        setKeepaliveProgress((prev) => [...prev.slice(-49), e.payload as string]),
+      ),
+    );
+    track(
+      listen('keepalive-done', (e) => {
+        const ok = (e.payload as { success: boolean }).success;
+        setKeepaliveRunning(false);
+        pushToast(
+          ok ? 'success' : 'error',
+          ok ? '保活完成：豆包会话已滑动续期' : '保活未完成，请查看日志',
+        );
+        void reload();
+      }),
+    );
+    return () => {
+      disposed = true;
+      cleanups.forEach((u) => u());
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

@@ -215,8 +215,13 @@ function ProxyLogsTab() {
   const [detail, setDetail] = useState<string | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const detailReqId = useRef(0);
+  // 代理日志列表请求序号（审查修复 P1-18：搜索翻页并发请求乱序覆盖）
+  const listReqId = useRef(0);
 
   const fetchList = useCallback(async () => {
+    // 审查修复（P1-18）：搜索时 setPage(0) 与旧 page 闭包会并发发出两个请求且无序号
+    // 守卫，旧页响应后到会用旧数据覆盖新页——加请求序号（对齐同文件 detailReqId 模式）
+    const reqId = ++listReqId.current;
     setLoading(true);
     try {
       const r = await api.misc.proxyLogsList({
@@ -226,12 +231,14 @@ function ProxyLogsTab() {
         offset: page * PAGE_SIZE,
         limit: PAGE_SIZE,
       });
+      if (listReqId.current !== reqId) return; // 已被更新的请求取代
       setEntries(r.entries);
       setTotal(r.total);
     } catch (e) {
+      if (listReqId.current !== reqId) return;
       toast('error', `查询代理日志失败：${String(e)}`);
     } finally {
-      setLoading(false);
+      if (listReqId.current === reqId) setLoading(false);
     }
   }, [kw, startDate, endDate, page, toast]);
 

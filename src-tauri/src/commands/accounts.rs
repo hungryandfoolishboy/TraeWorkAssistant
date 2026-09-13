@@ -1360,7 +1360,8 @@ pub fn cooldown_clear_all(
 
 /// 使用 refresh_token 刷新 JWT（ExchangeToken）
 /// 成功后原子写回新 accessToken + refresh_token，返回新 JWT
-#[tauri::command]
+// async：内含 ExchangeToken 网络请求（最长 120s），同步命令会冻结 UI（审查修复）
+#[tauri::command(async)]
 pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, String> {
     refresh_jwt_impl(&state, &user_id)
 }

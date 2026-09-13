@@ -1462,9 +1462,8 @@ fn schtasks_create_failure(state: &State<AppState>, task: &str, stderr: &str) ->
 /// 注册豆包会话续期每日计划任务（schtasks 调 PS 桥 KeepAlive：启动豆包 8s 联网滑动续期后关闭）
 #[tauri::command(async)]
 pub fn doubao_renew_task_register(state: State<AppState>, time: String) -> Result<(), String> {
-    if !time.contains(':') || time.len() < 4 {
-        return Err(format!("时间格式无效: {time}（应为 HH:MM）"));
-    }
+    // 审查修复（命令注入）：原 contains(':')/len 弱校验可被 "12:3&calc" 绕过，改严格白名单
+    crate::commands::misc::validate_hhmm(&time)?;
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
     if !bridge.exists() {
@@ -1533,9 +1532,8 @@ pub fn doubao_renew_task_unregister(state: State<AppState>) -> Result<(), String
 /// 注册豆包额度巡检每日计划任务（schtasks 直接调 python + doubao_quota.py --all）
 #[tauri::command(async)]
 pub fn doubao_quota_task_register(state: State<AppState>, time: String) -> Result<(), String> {
-    if !time.contains(':') || time.len() < 4 {
-        return Err(format!("时间格式无效: {time}（应为 HH:MM）"));
-    }
+    // 审查修复（命令注入）：同上，弱校验改严格白名单
+    crate::commands::misc::validate_hhmm(&time)?;
     let script = state.python_dir.join("doubao_quota.py");
     if !script.exists() {
         return Err(format!("找不到额度脚本: {}", script.display()));

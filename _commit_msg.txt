@@ -1,0 +1,12 @@
+fix(security): 黑盒审查 P0/P1 修复——命令注入/路径遍历/凭证明文落盘/SSRF/主线程阻塞/前端竞态
+
+P0: 代理日志体级脱敏（req/resp body 凭证键值擦除，JSON+裸键值双形态，fail-closed）
+P1 注入: misc::validate_hhmm 严格 HH:MM 白名单统一接入 task_register / WB 签到(times) / WB 续期(day 白名单) / 豆包双任务（原弱校验可被 12:3&calc 绕过，cmd /c schtasks sink）
+P1 遍历: proxy_log_detail 文件名白名单（对齐列表接口）阻断任意文件读；switch_account/save_current_login 补 ensure_uid_safe
+P1 SSRF: open_url 改 redirects(0)+逐跳白名单（原仅校验首跳，302 可绕过）；web_search 同款 fail-closed
+P1 业务: WB 非流式 Fatal 错误透传上游 4xx 状态码（原统一降级 503 触发客户端重试风暴）；PS 桥 BackupCurrent 关客户端后备份防撕裂快照；icube 快照补 .bak 单代回滚；machineid/storage.json 改无 BOM 写入；doubao_quota 账号池原子写
+P1 阻塞: proxy_start/refresh_jwt/oauth_login/workbuddy_activity_info 四命令标 async（内含子进程/最长 240s 网络请求冻结 UI）
+P1 前端: store.init 幂等锁（StrictMode 双跑监听泄漏/事件双发）；DoubaoAccounts 监听 disposed 守卫；Logs 列表请求序号守卫（乱序覆盖）
+附带: unified_catalog fixture 补 builtin_rev 模拟人工维护目录语义
+
+验证: cargo check 零警告 / 251 测试全过 / tsc / py_compile / PS 语法 0 错误 / 黑盒复审 11 项通过

@@ -167,6 +167,10 @@ pub fn workbuddy_checkin_task_register(state: State<AppState>, times: Vec<String
     if times.is_empty() {
         return Err("至少需要一个触发时间（如 09:00 / 21:00）".into());
     }
+    // 审查修复（命令注入）：times 逐项严格校验后再进 schtasks（与 misc::task_register 同 sink）
+    for t in &times {
+        crate::commands::misc::validate_hhmm(t)?;
+    }
     let tr = build_wb_task_tr(&state, &["--json-stream", "--skip-checked"]);
     // 先清理旧实例（按任务名前缀枚举，兼容历史任意 HHMM 后缀），保证重注册幂等
     for name in wb_checkin_task_names() {
@@ -205,8 +209,12 @@ pub fn workbuddy_checkin_task_unregister() -> Result<(), String> {
 /// token 每周兜底续期任务（F-09；python --renew-only 惰性刷新）
 #[tauri::command(async)]
 pub fn workbuddy_renew_task_register(state: State<AppState>, day: String) -> Result<(), String> {
-    // day: MON..SUN（schtasks /SC WEEKLY /D）；默认 SUN
+    // day: MON..SUN（schtasks /SC WEEKLY /D）；默认 SUN。
+    // 审查修复（命令注入）：白名单校验（此前仅大写化，"mon&calc" → "MON&CALC" 仍可注入）
     let d = if day.is_empty() { "SUN".to_string() } else { day.to_uppercase() };
+    if !["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"].contains(&d.as_str()) {
+        return Err(format!("星期无效: {day}（应为 MON..SUN）"));
+    }
     let tr = build_wb_task_tr(&state, &["--renew-only"]);
     let (ok, _, stderr) = run_schtasks(&[
         "/Create", "/TN", WB_RENEW_TASK_NAME, "/TR", &tr, "/SC", "WEEKLY", "/D", &d, "/ST", "10:30", "/F",

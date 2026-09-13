@@ -26,6 +26,7 @@
 import argparse
 import datetime as _dt
 import json
+import os
 import sys
 
 # 中文 Windows 管道默认 GBK：强制 stdout/stderr UTF-8，供桌面端按 UTF-8 解码
@@ -391,7 +392,12 @@ def run_batch(data_dir: Path, url: str) -> dict:
             append_history(data_dir, {"ts": now, "kind": "quota", "uid": uid, "ok": False,
                                       "summary": r["error"], "source": "task"})
     if changed:
-        pool_path.write_text(json.dumps(pool, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 审查修复（P1）：账号池含全部账号会话凭证（等同密码），直写中断会产生截断 JSON
+        # 且无备份——改 tmp + os.replace 原子写（对齐 wb_common.write_json_atomic 语义）
+        tmp = f"{pool_path}.tmp{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(pool, ensure_ascii=False, indent=2))
+        os.replace(tmp, pool_path)
     return {"ok": True, "mode": "all", "url": url, "total": ok_n + fail_n,
             "success": ok_n, "failed": fail_n, "exhausted": exhausted, "errors": errors,
             "finished_at": now_str()}

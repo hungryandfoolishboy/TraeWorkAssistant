@@ -522,7 +522,9 @@ function Reset-DeviceIdsOnly {
     $machineIdFile = Join-Path $traeDir 'machineid'
     if (Test-Path $machineIdFile) {
         try {
-            Set-Content -Path $machineIdFile -Value $newMachineId -NoNewline -Encoding UTF8
+            # 审查修复：PS 5.1 Set-Content -Encoding UTF8 带 BOM，machineid 值会被客户端
+            # 连 BOM 一起读入——改无 BOM 写入（对齐 Repair-LocalStateActiveProfile 的写法）
+            [System.IO.File]::WriteAllText($machineIdFile, $newMachineId, (New-Object System.Text.UTF8Encoding($false)))
             Write-Step -Stage 'device' -Message "[1/6] machineid 已重置" -Status 'ok'
             $resetCount++
         } catch {
@@ -559,7 +561,10 @@ function Reset-DeviceIdsOnly {
                 $changed = $true
             }
             if ($changed) {
-                $storage | ConvertTo-Json -Depth 20 | Set-Content -Path $storageFile -Encoding UTF8
+                # 审查修复：PS 5.1 Set-Content -Encoding UTF8 带 BOM，storage.json 被
+                # Node/Electron 侧 JSON.parse 读取（不剥 BOM）会解析失败——改无 BOM 写入
+                $storageJson = $storage | ConvertTo-Json -Depth 20
+                [System.IO.File]::WriteAllText($storageFile, $storageJson, (New-Object System.Text.UTF8Encoding($false)))
                 Write-Step -Stage 'device' -Message "[2/3] storage.json 设备标识已重置" -Status 'ok'
                 $resetCount++
             } else {
@@ -1256,6 +1261,18 @@ function Backup-CurrentProfile {
         Write-Step -Stage 'backup' -Message '当前数据目录不存在，跳过备份' -Status 'skip'
         return
     }
+    # 审查修复：与 chromium/authfile 布局对齐——覆盖槽位前把旧快照挪到 .bak（单代回滚
+    # 保护），防止拷贝中断（断电/杀进程）永久丢失上一份快照
+    if (Test-Path $dest) {
+        $bakDir = "$dest.bak"
+        try {
+            if (Test-Path $bakDir) { Remove-Item $bakDir -Recurse -Force -ErrorAction SilentlyContinue }
+            Move-Item $dest $bakDir -Force -ErrorAction Stop
+            Write-Step -Stage 'backup' -Message "原 $Slot 快照已备份到 $Slot.bak（可回滚一代）" -Status 'info'
+        } catch {
+            Write-Step -Stage 'backup' -Message "旧快照挪移失败（将直接覆盖）: $_" -Status 'warn'
+        }
+    }
     if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
     $src = $Script:TraeDataDir
     $copied = 0
@@ -1472,8 +1489,12 @@ try {
             Write-Step -Stage 'done' -Message '6 层设备标识重置完成' -Status 'ok'
         }
         'BackupCurrent' {
+            # 审查修复：与 SaveCurrentLogin 对齐——先关客户端再读 auth/leveldb/vscdb，
+            # 防止文件锁下 Copy-Item 静默缺文件生成"看似成功"的坏快照；备份完成后拉回
+            Stop-Trae
             Backup-CurrentProfile -Slot $UserId
             Set-CurrentAccount -AccountId $UserId
+            Start-Trae
             Write-Step -Stage 'done' -Message '备份完成' -Status 'ok'
         }
         'RestoreOnly' {
