@@ -11,7 +11,6 @@ use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -317,9 +316,16 @@ impl DayTotals {
     }
 }
 
+/// 解析器行为版本：解析逻辑变更（如兼容性容错修复）时 +1。
+/// 增量缓存条目 rev 不匹配时强制重解析，避免旧版本误计数的 parse_errors 滞留展示。
+const PARSE_REV: u32 = 2;
+
 /// 单文件增量缓存条目
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct FileCacheEntry {
+    /// 解析器行为版本（PARSE_REV），不匹配则重解析
+    #[serde(default)]
+    rev: u32,
     mtime_ms: i64,
     size: u64,
     /// date → 聚合（该文件全部记录；cutoff 在合并阶段按日期过滤）
@@ -331,19 +337,31 @@ struct FileCacheEntry {
     parse_errors: u64,
 }
 
-/// 解析单个 jsonl 文件为按日聚合（不做 cutoff 过滤，窗口过滤在合并阶段）
+/// 解析单个 jsonl 文件为按日聚合（不做 cutoff 过滤，窗口过滤在合并阶段）。
+/// 兼容性容错（不计入 parse_errors）：
+///   ①空白行（JSONL 尾部双换行常见）；②UTF-8 BOM；③非法 UTF-8 字节（lossy 解码）；
+///   ④客户端写入中的半行——文件未以换行结尾且坏行恰为末行（客户端写完后
+///   mtime/size 变化自然触发重扫）。其余真正损坏的行仍计数，保留告警价值。
 fn parse_file(path: &Path, fallback_project: &str) -> FileCacheEntry {
     let mut entry = FileCacheEntry::default();
-    let Ok(file) = std::fs::File::open(path) else {
+    entry.rev = PARSE_REV;
+    let Ok(raw) = std::fs::read(path) else {
         entry.parse_errors = 1;
         return entry;
     };
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            entry.parse_errors += 1;
+    let ends_with_newline = raw.last() == Some(&b'\n');
+    let text = String::from_utf8_lossy(&raw);
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let is_last = lines.peek().is_none();
+        let s = line.trim().trim_start_matches('\u{feff}').trim();
+        if s.is_empty() {
             continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        }
+        let Ok(value) = serde_json::from_str::<Value>(s) else {
+            if is_last && !ends_with_newline {
+                continue;
+            }
             entry.parse_errors += 1;
             continue;
         };
@@ -446,7 +464,10 @@ fn scan_root(
         seen.insert(key.clone());
         let meta = file_meta_ms(path);
         let hit = match (&cache.get(&key), meta) {
-            (Some(e), Some((mtime, size))) => e.mtime_ms == mtime && e.size == size,
+            // rev 不匹配（旧版本解析逻辑的缓存）→ 强制重解析，清除历史误计数
+            (Some(e), Some((mtime, size))) => {
+                e.mtime_ms == mtime && e.size == size && e.rev == PARSE_REV
+            }
             _ => false,
         };
         let entry = if hit {
@@ -738,5 +759,38 @@ mod tests {
     fn usage_requires_input_anchor() {
         let value = json!({ "usage": { "output_tokens": 3 } });
         assert_eq!(usage(&value), None);
+    }
+
+    #[test]
+    fn parse_file_tolerates_bom_blank_lines_and_partial_tail() {
+        let dir = std::env::temp_dir().join(format!("wb_stats_p1_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let good = json!({
+            "timestamp": 1_757_000_000_000i64,
+            "usage": { "input_tokens": 5, "output_tokens": 1 }
+        });
+        // BOM 头 + 双换行空行 + 末行无换行（完整 JSON）
+        let mut content = String::from("\u{feff}");
+        content.push_str(&good.to_string());
+        content.push_str("\n\n");
+        content.push_str(&good.to_string());
+        std::fs::write(&path, &content).unwrap();
+        let e = parse_file(&path, "p");
+        assert_eq!(e.parse_errors, 0);
+        assert_eq!(e.days.values().map(|d| d.calls).sum::<u64>(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_file_counts_corrupt_line_but_skips_partial_tail() {
+        let dir = std::env::temp_dir().join(format!("wb_stats_p2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        // 中间坏行（换行结尾）→ 计数；末行半截 JSON（无换行）→ 视为写入中，忽略
+        std::fs::write(&path, "{broken}\n{\"timestamp\":1,\"usage\":{\"in").unwrap();
+        let e = parse_file(&path, "p");
+        assert_eq!(e.parse_errors, 1);
+        let _ = std::fs::remove_file(&path);
     }
 }
