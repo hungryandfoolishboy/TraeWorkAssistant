@@ -390,7 +390,8 @@ mod tests {
     #[test]
     fn cheapest_model_is_lowest_rate() {
         let c = cheapest_catalog_model(&catalog()).unwrap();
-        assert_eq!(c, "hy3"); // rate 0.00（官网免费，2026-09 快照）
+        // hy4-preview 与 hy3 均限时免费（0.00），min_by 取目录首个命中 hy4-preview
+        assert_eq!(c, "hy4-preview");
     }
 
     #[test]
