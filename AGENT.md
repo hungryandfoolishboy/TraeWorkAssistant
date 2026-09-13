@@ -380,3 +380,17 @@ ai-work-assistant/
 - **老安装包升级**：升级兼容按**安装时产品名**判定（非版本号）。NSIS 通过 `build-assets/installer-hooks.nsh` 静默卸载清理旧品牌「Trae Work 助手」安装（已发布的 v2.4.4 及更早均属旧品牌，UTF-8 with BOM）；「AI Work 助手」品牌（v3.0.0 起）走 NSIS 原生原地升级；老 MSI 因 UpgradeCode 随 identifier 变化无法原地升级，需先卸载或改用 NSIS 包升级。打包产物统一输出到 `release/`，使用中文产品名命名 `AI Work 助手_<版本>_x64*`（`scripts/rename_release.py`）。
 - **版本线与数据迁移**：新版本自 v3.0.0 起，**之前所有 2.x 版本升级到 3.x 均需数据迁移（安装/首次启动自动完成）**；原「Trae Work 助手」产品线在 `trae_work_main` 分支维护（仅 Trae Work 单应用，2.x.x，仅必要修复），仅使用 Trae Work 的用户可不升级，用该分支的 v2.x.x 最新版本即可。
 - **NSIS 安装器**：使用自定义模板 `build-assets/installer.nsi`（基于 tauri v2.11.4 上游模板，配置于 tauri.conf.json `bundle.windows.nsis.template`）——升级安装时跳过「卸载旧版/不卸载」选择页，**默认直接覆盖安装**（同版本重装/降级仍显示选择页）。升级 Tauri CLI 后如构建报错，需从对应版本 tag 的 `crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi` 重新同步模板并重做定制。
+
+## 15. Git 引用静默丢失坑（2026-09-13 事故复盘，每次提交必守）
+
+> 环境：WorkBuddy 便携版 Git。**嵌套分支 ref**（如 `refs/heads/feature/buddy`）若仅存于 `packed-refs`（loose 文件已被收编、`.git/refs/heads/feature/` 目录不存在），则 `git commit` 会**报成功但分支指针静默回滚**到 packed-refs 旧值——提交对象与 reflog 均正常入库，唯 ref 落盘丢失。后果：下一次提交挂在旧父节点上，本次提交沦为孤儿，历史链断裂（实例：e14ee2d 孤儿 + 6c1fdca 错父）。顶层 ref（`refs/heads/master`）写入正常，仅嵌套 ref 触发。
+
+**规避规范（红线，逐条必守）**：
+
+1. **提交后必校验**：每次 `git commit` 后立刻比对 `git rev-parse HEAD` 与 `git rev-parse <当前分支>`（或 `git reflog -1` vs 分支 ref），两者不一致 = 指针回滚，立即按第 4 条修复后再继续。
+2. **提交前查 loose 状态**：目标分支若在 packed-refs 中且对应 loose 文件不存在（`.git/refs/heads/<路径>` 缺目录），提交风险最高；可用 `git for-each-ref` / Python 检查。条件允许时优先在顶层分支（master）或确保 loose ref 存在的分支上操作。
+3. **整树提交，不用 pathspec 部分提交**：统一 `git add <paths>` + `git commit`（不带 `-- <paths>` 后缀）。部分提交在本环境下让 ref 回滚的破坏面更难诊断。
+4. **修复只走 packed-refs 原位替换**：`git update-ref` 与直写 loose 文件在本环境均会被 git 进程静默丢弃，**唯一可靠手段**是用 Python 原位替换 `packed-refs` 中该分支行（读入→按行尾匹配 `refs/heads/<path>` 替换哈希→整体回写，保持排序）。每次替换后用 `git rev-parse` 读回验证。
+5. **孤儿提交勿清理**：`git gc` / `git prune` 一律不跑，dangling 提交（如 6c1fdca）是无害保险，误删不可逆。
+6. **慎用 `git pack-refs --all`**：它会把 loose ref 收编进 packed-refs，正是制造本坑的前提条件；本仓库避免执行。
+7. **关联环境故障**：同日 bash `rm` shim 损坏曾误删 docs/（已恢复）。删除文件一律用 Python `os.remove`，禁用裸 `rm`；修复类操作前先 `git status` 快照留证。
