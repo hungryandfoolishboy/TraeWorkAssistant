@@ -231,7 +231,7 @@ export default function Credits() {
       accCount: usage?.accounts.length ?? 0,
       dayCount: all.length,
       first: sorted[0] ?? '—',
-      last: sorted.at(-1) ?? '—',
+      last: sorted[sorted.length - 1] ?? '—',
       hits: trend.filter((d) => d.consumed != null).length,
     };
   }, [usage, trend]);
