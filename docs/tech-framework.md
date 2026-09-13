@@ -35,8 +35,10 @@ Bridge        Tauri Commands（src-tauri/src/commands/）
  ├─ doubao                    豆包账号池 / 凭证 / 保活 / 额度 / 对话备份导出
  ├─ trae_apps                 双应用账号自动发现（dc id 与 Cloud-IDE id 双体系）
  ├─ vault                     Stronghold 加解密（load_accounts / save_accounts）
- └─ api_server                axum 网关（routes/pool/payload/sse/auth/models_sync/usage/api_logger）
-Python Core   auto_checkin.py / device_proxy.py / doubao_*.py（renew/quota/chats）
+ └─ api_server                axum 网关：Trae 池（routes/pool/payload/sse/auth/models_sync/usage/api_logger）
+                              + WB 池（wb_route/wb_payload/wb_sse/wb_upstream/wb_responses/wb_images/wb_sticky/wb_toolexec/wb_catalog/wb_model_route）
+                              + 三池调度（dispatch/unified_catalog/custom_models/custom_route/retry/api_keys/gateway_settings）
+Python Core   auto_checkin.py / device_proxy.py / doubao_*.py（renew/quota/chats）/ workbuddy_*.py（checkin/credits/common/ui_click）
 PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy + SnapshotLayout）
 ```
 
@@ -141,9 +143,17 @@ PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy
 | `POST /v1/completions` | legacy text completion（prompt 转 user message 复用链路） |
 | `/v1/embeddings` | 明确 501（上游无对应能力，不做假实现） |
 
-- 鉴权：API Keys 列表（T2/T15），`Authorization: Bearer` + `x-api-key` 双风格；未配置启用 Key 时不鉴权；超日配额 429。
-- 请求侧统一转 OpenAI 内部格式复用池调度；响应侧按协议分别输出；reasoning_content 暂不输出（thinking 块需签名）。
+- 鉴权：API Keys 列表（T2/T15），`Authorization: Bearer` + `x-api-key` 双风格；未配置启用 Key 时不鉴权；超日配额 429；`ck_` 子 Key 支持 `allowed_accounts` 上游白名单 + `schedule_mode`（expire_first/dedicated）+ 按日统计。
+- 请求侧统一转 OpenAI 内部格式复用池调度；响应侧按协议分别输出；WB 上游 reasoning_content 已透传（Anthropic 侧映射 thinking block）。
 - 账号池 app 无关：Trae / Trae Work 账号入池即被同一网关服务（通用积分 208）。
+
+### 5.5 三池调度与统一模型目录（v3.3.x）
+
+- **资源池**：`trae`（SOLO `llm_utils_chat`，积分 208）/ `buddy`（copilot.tencent.com 或 www.workbuddy.ai `/v2/chat/completions`）/ `custom`（自定义 OpenAI 兼容上游，`data/custom_models.json`，命中即直达不参与池间策略）。
+- **池间策略（`dispatch.rs` → `data/dispatch_policy.json`）**：`smart`（默认：池内最早积分到期优先 → 模型倍率小者优先 → 健康账号积分总和多优先，并列回退固定序）/ `priority`（严格按 priority 数组取首个可用池）；`per_model` 模型级覆盖优先于智能重排；`fallback` 开关控制双源模型是否跨池回退。优先级缺失回退 `["buddy","trae"]`。
+- **统一模型目录（`unified_catalog.rs`）**：`api_unified_models` 命令与 `GET /v1/models` 共用三源合并视图（Trae 官网同步 + WB 目录 + 自定义模型），canonical_id 归并（trim+lowercase）；模型元数据四层兜底（L1 人工覆盖 `trae_model_meta.json` → L2 官网同步 → L3 默认 128K/倍率参考 → L4 系列/思考档位/图片支持推断）。
+- **自定义模型（`custom_models.rs`）**：upsert 校验（name/base_url 必填、canonical 不重复、id `cm-<12hex>` 自动生成）；`chat_url` 归一（base 含 `/v1` 与否两种形态）；`custom_model_test` 连通性测试与保存同口径预检。
+- **WB 池细节**：headers 三铁律 / 请求体改写 / 五态机 / 分级重试 / 会话粘性 / ck_ 子 Key 等，完整契约见 `AGENT.md` §5.2（权威）。
 
 ## 6. 附录 A：Trae API 协议参考（抓包实证）
 
@@ -237,3 +247,88 @@ python scripts/package_portable.py  # 便携版 zip
 | 凭证明文泄露 | 中 | vault + DPAPI；UI 掩码；账号池文件 .gitignore；导出提醒备份 vault |
 | UAC 拒绝 | 低 | 明确提示 + 手动步骤 |
 | Python 运行时残缺 | 低 | 自举验证 + 系统解释器回退 |
+
+## 9. 附录 B：WorkBuddy / CodeBuddy 协议参考（原 workbuddy-product-design.md 精华归并）
+
+> 实施蓝本原文见 git 历史（2026-09-13 归档删除）；批次 1~4 已全部落地，本节保留开发排错必需的协议事实。
+
+### B.1 已验证端点速查
+
+| 用途 | 端点 | 要点 |
+|---|---|---|
+| token 续期 | `POST www.codebuddy.cn/v2/plugin/auth/token/refresh` | `X-Refresh-Token` 头，空体 `{}`；**该头仅允许出现在此端点** |
+| Keycloak 备选 | `POST {iss}/protocol/openid-connect/token` | `grant_type=refresh_token&client_id=console` |
+| OAuth 扫码 | `POST /v2/plugin/auth/state?platform=CLI` → `GET /v2/plugin/auth/token?state=` → `GET /v2/plugin/login/account?state=` | 独立 cookie jar；无 PKCE |
+| 签到 | `POST /v2/billing/meter/daily-checkin`（状态回退 `/checkin-activity-status`） | 空体 `{}`；`code:10001`=已签容错 |
+| 积分三件套 | `POST <domain>/billing/meter/get-user-resource-{summary,paid-packages,free-packages}` | 需 `X-Client-Platform: web` |
+| 积分旧接口 | `POST /v2/billing/meter/get-user-resource` | `ProductCode: p_tcaca`，`Status:[0,3]` |
+| 官方用量 | `POST /billing/meter/get-user-request-usage` | 日/周/月，分页 requestId 去重 |
+| 对话上游 | `POST copilot.tencent.com/v2/chat/completions`（CN）/ `www.workbuddy.ai`（Global） | **只回 SSE**，非流式本地聚合 |
+| 模型目录 | `GET {chatBase}/console/enterprises/personal/models` | 倍率/徽章/思考档位动态替换 |
+| 成长中心 | `/v2/activity/growth/buddy/travel|lottery|tasks|energy|streak` | 全部实测 |
+| 本地 quota 兜底 | `GET 127.0.0.1:<port>/api/v1/quota` | 扫 `~/.workbuddy/*.port` + 端口段探测 |
+
+### B.2 域名路由与请求头铁律
+
+| 区域 | 判定 | chat 上游 | billing/积分 |
+|---|---|---|---|
+| CN | domain 不含 `.workbuddy.ai` | `copilot.tencent.com` | `www.codebuddy.cn` |
+| Global | domain 含 `.workbuddy.ai` | `www.workbuddy.ai` | `www.workbuddy.ai` |
+
+- **令牌域与请求域不一致会被网关拒绝**；plugin 网关（token refresh）固定 codebuddy.cn 不随区域。
+- 三铁律：① Origin/Referer 必带（按区域）；② 缺省字段显式 `X-No-User-Id / X-No-Enterprise-Id / X-No-Department-Info: 1` 占位；③ **chat 请求绝不携带 `X-Refresh-Token`**。UA 伪装 `CLI/2.63.2 CodeBuddy/2.63.2`。
+- 签到/活动接口可用极简头（`User-Agent: WorkBuddy` + Bearer + X-User-Id）。
+
+### B.3 联调避坑清单（实测实证）
+
+| # | 坑 | 对策 |
+|---|---|---|
+| 1 | 上游拒绝非流式（code 11101） | 强制 `stream:true`，非流式本地聚合（tool_calls delta 按 index 合并） |
+| 2 | `tool_choice` 对象报 400 | 归一化为 string |
+| 3 | effort 档位上游忽略 | 按 `supportedEfforts` 降级；**hy3 系列仅 `high` 真正生效**（effort_override 修正层） |
+| 4 | Claude Code 指纹触发审核 | 指纹清洗（cc_xxx 键值 / x-anthropic-* 引用剥离）+ **两句固定 system 模板逐字入黑名单**（`You are Claude Code…` / `Main branch…`），映射表最小改写（外置 `wb_template_map.json` 热更新） |
+| 5 | chat 带 X-Refresh-Token 触发安全拦截 | 红线：仅 refresh 端点 |
+| 6 | SSE 长流被中间层回收 | 15s keep-alive 注释行 |
+| 7 | 客户端断连丢 usage | `_drain_upstream` 读完上游 |
+| 8 | **prompt cache 对代理流量恒不命中**（按冷启动全价计费） | 成本模型按无缓存估算；缓存命中率指标仅基于本地 token 统计并标注口径 |
+| 9 | 连续同角色消息 | 自动合并（antigravity-tools 实证） |
+| 10 | 凭证双源冲突（auth 文件被客户端启动重写） | 桌面文件只读 + 工具侧 token store 副本「谁新用谁」（`expiresAtMs` 晚者胜出）+ 原子写/文件锁 |
+
+### B.4 会话数据三件套
+
+`projects/{ws}/{cid}.jsonl` 正文 + `workbuddy.db` sessions 表 + `edge-sync-mapping-v2.db` 云端映射（`convmsg:{uid}` 决定云端归属）——备份/复制缺一不可；复制 = jsonl 逐行 sessionId 换新 UUID + sessions 克隆 + edge 映射替换。
+
+## 10. 附录 C：豆包对话协议情报（原 doubao-api-feasibility.md 精华归并）
+
+> E-01/E-02/E-03 的需求与实现路径见 [product-optimization-backlog.md](product-optimization-backlog.md)；本节保留协议层事实。
+
+- **对话端点**：`POST www.doubao.com/samantha/chat/completion`（SSE）；三模式 `doubao` / `doubao-think` / `doubao-expert` → `completion_option` 参数组。
+- **风控形态**：验证码墙而非拒绝服务——错误码 `710012001`（sessionid 吊销）/ `710022004`（需验证码，人工过后恢复）/ `712010702`（Cookie/设备指纹缺失或编码错误）；HTTP 200 无数据流 = 连续失败退避信号。
+- **签名体系**：`msToken`（URL query + Cookie 双处）+ `a_bogus`（192 字符 = SM3 双哈希 + RC4 固定 keystream + s4 自定义 base64，**绑定单次请求的 query+UA+时间戳，必须纯算法生成**，嗅探只能短窗重放）。
+- **设备指纹**：`ttwid` / `passport_csrf_token` / `device_id` / `web_id` / `tea_uuid`（19 位）；**必须与账号绑定且保持一致**——频繁更换 device_id 是风控高危信号；MITM 嗅探按账号落库（E-02）。
+- **多模态**：生图 SSE `block_type=2074`（`creations[]`，`image.status==2` 完成，URL 优先级 `image_ori > image_raw > thumb`，漏图轮询 `/message_node_info` 兜底）；生视频 `content_type=2020` 下发 → `fin_reason.async_task.id` → `/samantha/chat/async/stream` 等 `2021`（1~3 分钟，需任务桥 + event_id 游标重连）；文件中转站 TOS 上传 ≤1GB 得永久 URI；多模态 bot_id `7338286299411103781`。
+- **反封号组合拳**：限速 + 随机延迟 + 指数退避，UA 保持真实采样值；设备指纹静态化。
+
+## 11. 附录 D：开源参考仓库映射（learn-the-design, write-our-own-code）
+
+> 原 oss-ecosystem-value-analysis.md（28+5 仓库调研快照）与 workbuddy-product-design.md §7.2 归并；克隆件在 `%TEMP%\oss-research\<repo>`。实施前拉最新源码核对。
+
+| 仓库 | 价值落点 |
+|---|---|
+| Sliverkiss/workbuddy2api（Go） | WB 上游适配/调度/请求改写/粘性会话 |
+| lovingfish/workbuddy-cliproxy | 审核模板黑名单最小改写 / hy3 强制 effort / prompt cache 陷阱 / 11101 拒非流式（避坑金矿） |
+| hailinzhao/antigravity-tools（Rust+Tauri 2，同栈同类） | 会话粘性指纹 / P2C / 五态机 / 分级重试表 / 四段模型路由 |
+| changexbc/workbuddy-switch（Rust/Tauri） | 账号管理/CLI 轮换五重防护/统计页 UI 基准 |
+| corrinehu/dsh-workbuddy-connect（TS） | 双源凭证 / 模型目录 / DSH provider |
+| tonny0812/workbuddy2api · muskke/trae-api-proxy（Go） | `/v1/responses` 投影 / 工具代执行（web_search 代理侧代执行回喂） |
+| Tom6814/WorkBuddy2API | reasoning_content 透传 / 生图双端点 / 反封号组合拳 |
+| xiaolizi0v0/CliProxy | 多 CLI 账号环境隔离 + 严格账号模式 + 接口脱敏（F-66） |
+| wangchuxiaoji-oss/doubao2api · lzA6/doubao-2api | 豆包端点/SSE/风控错误码权威参考；多账号 Cookie 轮换与指纹静态化 |
+| Evil0ctal/Douyin_TikTok_Download_API | `crawlers/douyin/web/abogus.py`——a_bogus 纯算法移植母本（注意 GPL/Apache 许可差异） |
+| Jackchaos2025/Doubao-Image-Proxy | 生图 SSE 解析 + message_node_info 兜底 + image_ori 优先级 |
+| laojichao/trae-local-api · laojichao/trae-api | tc 加密格式确认 + 四版本（cn/solo/sg/solo-sg）端点路由表；3 级回退 + 5 档竞速调度（F-72） |
+| BlueChonk/trae-credential-reverse-engineering | tc 解密（AES-128-CBC+SHA-512）+ ECDSA P-256 刷新签名 + 98 API 清单（F-70） |
+| xhrxgr/trae-work-cn-account-manager（Tauri 2 同栈） | `--user-data-dir` 多实例并行 + 插件共享实例隔离（F-67/W-01 底座） |
+| Ttungx/trae-solo-local-api · Sliverkiss/traework2api | `llm_utils_chat + function=solo_work_lite` 通道双实现交叉验证（W-01 可抄实现） |
+| wicm84266964/Buddy2api · mtfly/trae-switch | 多通道网关统一接入方向验证；hosts 劫持 + 本地 443 反代（F-73） |
+| jlcodes99/cockpit-tools · dingminhua/dsh-connect-trae | TRAE 多实例思路（F-67）；DSH 桥装即用（F-38 主参照） |

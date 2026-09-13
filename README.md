@@ -10,13 +10,13 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 
 </div>
 
-> 当前深度支持 **Trae Work 与 Trae（Trae CN IDE）双应用**（多账号签到、登录态切换、积分看板、OpenAI / Anthropic 兼容 API 网关、6 层设备标识重置等，两应用同一账号体系可分别切换）；后续规划扩展 **WorkBuddy / CodeBuddy / 豆包** 等更多 AI 应用的账号管理与自动化能力。
+> 深度支持 **Trae Work / Trae（Trae CN IDE）/ WorkBuddy / CodeBuddy / 豆包** 五应用：多账号签到、登录态切换、积分看板、成长中心自动化、OpenAI / Anthropic / Codex 三协议兼容 API 网关（Trae + WorkBuddy + 自定义模型三池调度）、6 层设备标识重置等；Trae 双应用同一账号体系可分别切换，WorkBuddy 与 CodeBuddy 共享账号体系，豆包支持快照切换 / 保活 / 额度巡检 / 对话备份。后续规划扩展更多 AI 应用。
 >
 > ⚠️ 本工具与 Trae Work / WorkBuddy / 豆包等官方均无任何关联，仅供学习研究。使用本工具可能违反相关服务条款，风险自担。请仅管理本人合法持有的账号。
 
 ## 版本与分支
 
-- **v3.x 新版本线（默认分支）**：产品为「AI Work 助手」，支持 Trae Work / Trae（Trae CN）双应用，并规划扩展 WorkBuddy、CodeBuddy、豆包等更多 AI 应用；新版本自 **3.0.0** 起开始维护。
+- **v3.x 新版本线（默认分支）**：产品为「AI Work 助手」，支持 Trae Work / Trae（Trae CN）/ WorkBuddy / CodeBuddy / 豆包多应用；新版本自 **3.0.0** 起开始维护。
 - **原「Trae Work 助手」产品**：通过 **`trae_work_main`** 分支维护，仅支持 Trae Work 单应用，版本停留在 **2.x.x**，仅做必要修复、不再新增功能。
 - **升级与数据迁移**：新版本从 3.0.0 开始，**之前所有版本（2.x 全系）升级到 3.x 都需要迁移数据**——数据目录、界面偏好、签到计划任务会在安装 / 首次启动时**自动完成迁移**，无需手动操作（详见下方「从老版本升级」）。
 
@@ -35,16 +35,16 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 
 ## 功能
 
-- **账号管理**：多账号 JWT 录入/编辑/查看、OAuth 登录、分组管理、设备 ID 隔离、**本机双应用（Trae Work / Trae）账号自动发现**
-- **登录态切换**：按目标应用（Trae Work / Trae）独立切换——保存当前登录态 → 恢复目标账号 → 启动，精准备份 9 类核心文件；同一账号可分别为两应用创建快照
-- **一键签到**：批量签到、按分组/手动勾选、跳过已签/过期、实时进度
-- **积分看板**：排行、三线趋势图（总数/获得/消耗）、今日新增统计
-- **本地代理**：MITM 代理自动捕获 JWT、注入独立设备 ID；**自动串联已有系统代理（VPN）作为上游**，开启代理后外网访问不受影响，停止时原样还原系统代理
-- **API 网关**：内嵌 OpenAI / Anthropic 兼容 API 服务，账号池智能调度（积分过期感知 + 冷却状态机）
-- **定时任务**：Windows 计划任务，后台自动签到
+- **账号管理**：多账号录入/编辑/OAuth 登录（含 WorkBuddy 扫码）、分组管理、设备 ID 隔离、**本机双应用（Trae Work / Trae）账号自动发现**、WorkBuddy/CodeBuddy auth 文件扫描入池、豆包抓包凭证回写
+- **登录态切换**：按目标应用独立切换——保存当前登录态 → 恢复目标账号 → 启动；Trae 系精准备份 9 类核心文件，豆包 chromium 布局含快照版本校验 + 单代回滚 + 防误覆盖守卫，WorkBuddy/CodeBuddy authfile 布局；支持「一键以账号打开」
+- **一键签到**：批量签到、按分组/手动勾选、跳过已签/过期、实时进度；WorkBuddy 成长中心自动化（旅行/盲盒/任务领奖）；豆包/WorkBuddy 定时保活与续期
+- **积分看板**：排行、三线趋势图、今日新增统计；WorkBuddy 积分三件套 + 官方用量 + 本地 Token 统计（缓存命中率/热力图）+ 到期日历
+- **本地代理**：MITM 代理自动捕获 JWT / 豆包凭证、注入独立设备 ID；**自动串联已有系统代理（VPN）作为上游**，停止时原样还原系统代理
+- **API 网关**：内嵌 OpenAI / Anthropic / Codex Responses 三协议兼容 API 服务——Trae 账号池 + WorkBuddy 池 + 自定义 OpenAI 兼容模型三池调度（smart 智能策略/优先级/模型级覆盖）、会话粘性、ck_ 子 Key、四段模型路由、审核指纹清洗、生图双端点、web_search 工具代执行
+- **定时任务**：Windows 计划任务，后台自动签到 / 保活 / 续期 / 额度巡检
 - **6 层设备标识重置**：machineid / storage.json 遥测 / aha.device / 注册表 MachineGuid / webview 追踪数据 / aha TinyStorage
-- **快照管理**：查看/备份/恢复/删除账号登录态快照（Trae Work / Trae 双应用独立管理）
-- **暗色模式**：全界面暗色主题支持，图表动态适配
+- **快照管理**：查看/备份/恢复/删除账号登录态快照（各应用独立管理）；豆包/WorkBuddy 对话数据独立备份恢复与导出
+- **暗色模式**：6 套主题，图表动态适配
 - **数据全部本地存储**，不上传任何服务器
 
 ## 开发
@@ -99,9 +99,8 @@ python scripts/package_portable.py # 便携版 zip（AI Work 助手_<版本>_x64
 - [更新日志](CHANGELOG.md) — 各版本变更记录
 - [用户手册](docs/user-manual.md) — 功能说明与使用指南
 - [产品设计](docs/product-design.md) — 需求与产品设计基线（v1.0/v2.0）
-- [WorkBuddy 接入设计](docs/workbuddy-product-design.md) — WorkBuddy/CodeBuddy 全量接入蓝图
-- [产品优化需求清单](docs/product-optimization-backlog.md) — 未排期优化项待办
-- [技术架构设计](docs/tech-framework.md) — 架构/数据模型/协议参考/开发运维（含原 API 文档与运行手册）
+- [产品优化需求清单](docs/product-optimization-backlog.md) — 全项目唯一待办依据（需求概述/实现路径/参考开源项目）
+- [技术架构设计](docs/tech-framework.md) — 架构/数据模型/协议参考（含 WorkBuddy、豆包协议附录与开源仓库映射）/开发运维
 
 ## 赞赏
 
