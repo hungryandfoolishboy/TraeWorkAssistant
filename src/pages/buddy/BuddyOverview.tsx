@@ -251,7 +251,7 @@ export default function BuddyOverview() {
       />
 
       {/* 顶部统计卡（对齐 Trae 概述：数值一眼掌握） */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatCard
           label="账号总数"
           value={total}
@@ -283,12 +283,6 @@ export default function BuddyOverview() {
           value={alertCount}
           hint={`Token 24h 内过期 ${tokenSoon} · 积分包 7 日内过期 ${pkgSoon}`}
           tone={alertCount > 0 ? 'red' : 'slate'}
-        />
-        <StatCard
-          label="今日签到"
-          value={checkedToday > 0 ? '已完成' : '未完成'}
-          hint={checkedToday > 0 ? `今日 ${checkedToday} 个账号已签` : '可到签到页立即执行'}
-          tone={checkedToday > 0 ? 'green' : 'slate'}
         />
       </div>
 
