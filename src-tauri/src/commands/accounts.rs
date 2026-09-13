@@ -1252,26 +1252,20 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
     Ok(ok_count)
 }
 
-/// 记录每日积分快照（每天计算一次）：
+/// 记录每日积分快照（每次刷新剩余积分时计算）：
 /// - total = 所有账号剩余积分之和
-/// - earned = 签到获得积分（credits_history.json delta 之和）+ 购买获得积分（API 查询 charge_amount > 0）
-/// - consumed = |total - earned - 昨日total|（取绝对值）
+/// - consumed 优先取 Trae Work 用量接口今日合计（usage_history.json 的 credits_float，
+///   实际消耗口径，见 commands/usage_history.rs）；无接口数据时回退旧公式
+/// - earned 由恒等式「total = 昨日total + earned - consumed」反推：
+///   earned = total - 昨日total + consumed。
+///   此前 earned 依赖 credits_history.json 的签到 delta 求和，delta 漏记（如今日已签
+///   但 delta=0）时 earned 恒为 0、消耗反被虚增——恒等式口径下数据自愈。
 fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non_checkin_earned: f64) {
     let today = fs_utils::today_prefix(); // "YYYY-MM-DD"
     let total: f64 = rc.credits.values().sum();
     let total = (total * 100.0).round() / 100.0;
 
     let mut file: CreditsDailyFile = fs_utils::read_json(&state.path("credits_daily.json"));
-
-    // earned = 签到获得积分（从 credits_history.json 汇总 delta）+ 非签到获得积分（API 查询）
-    let credits_file: CreditsFile = fs_utils::read_json(&state.path("credits_history.json"));
-    let checkin_earned: f64 = credits_file
-        .records
-        .iter()
-        .filter(|r| r.date == today && r.user_id != "_daily_total")
-        .map(|r| r.delta as f64)
-        .sum();
-    let earned = ((checkin_earned + non_checkin_earned) * 100.0).round() / 100.0;
 
     // 昨日积分总数：取 today 之前最近一条快照
     let yesterday_total = file
@@ -1282,9 +1276,53 @@ fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non
         .map(|s| s.total)
         .unwrap_or(0.0);
 
-    // consumed = |total - earned - yesterday_total|
-    let consumed = (total - earned - yesterday_total).abs();
-    let consumed = (consumed * 100.0).round() / 100.0;
+    // 优先口径：consumed = 用量接口今日合计；earned = total - 昨日total + consumed
+    let usage_cache: serde_json::Value =
+        fs_utils::read_json(&state.data_dir.join("data").join("usage_history.json"));
+    let mut usage_consumed: Option<f64> = None;
+    if let Some(accs) = usage_cache.get("accounts").and_then(|v| v.as_object()) {
+        let mut sum = 0.0;
+        let mut has = false;
+        for (_, acc) in accs {
+            if let Some(c) = acc
+                .get("daily")
+                .and_then(|d| d.get(&today))
+                .and_then(|d| d.get("credits"))
+                .and_then(|v| v.as_f64())
+            {
+                sum += c;
+                has = true;
+            }
+        }
+        if has {
+            usage_consumed = Some((sum * 100.0).round() / 100.0);
+        }
+    }
+
+    let (earned, consumed) = match usage_consumed {
+        Some(consumed) => {
+            let earned = ((total - yesterday_total + consumed) * 100.0).round() / 100.0;
+            // 恒等式在「消耗 > 全部新增」时为负，earned 语义为「获得」，钳制为 0
+            let earned = if earned < 0.0 { 0.0 } else { earned };
+            (earned, consumed)
+        }
+        None => {
+            // 回退口径（用量接口无今日数据时）：
+            // earned = 签到获得积分（credits_history.json delta 之和）+ 非签到获得积分（API 查询）
+            let credits_file: CreditsFile = fs_utils::read_json(&state.path("credits_history.json"));
+            let checkin_earned: f64 = credits_file
+                .records
+                .iter()
+                .filter(|r| r.date == today && r.user_id != "_daily_total")
+                .map(|r| r.delta as f64)
+                .sum();
+            let earned = ((checkin_earned + non_checkin_earned) * 100.0).round() / 100.0;
+            // consumed = |total - earned - yesterday_total|
+            let consumed = (total - earned - yesterday_total).abs();
+            let consumed = (consumed * 100.0).round() / 100.0;
+            (earned, consumed)
+        }
+    };
 
     // 如果今天已有快照，更新全部字段（非首次记录也需刷新 earned/consumed）
     if let Some(existing) = file.snapshots.iter_mut().find(|s| s.date == today) {
