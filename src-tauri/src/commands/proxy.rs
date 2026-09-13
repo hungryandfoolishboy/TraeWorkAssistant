@@ -99,7 +99,7 @@ fn sync_tray_proxy_text(app: &tauri::AppHandle, running: bool) {
     if let Some(tray) = app.try_state::<crate::TrayMenu>() {
         let _ = tray
             .proxy_item
-            .set_text(if running { "停止 代理" } else { "启动 代理" });
+            .set_text(if running { "停止代理" } else { "启动代理" });
     }
 }
 

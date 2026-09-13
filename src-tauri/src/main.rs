@@ -290,9 +290,9 @@ fn main() {
                     let checkin_item =
                         MenuItem::with_id(app, "checkin", "一键签到", true, None::<&str>)?;
                     let api_item =
-                        MenuItem::with_id(app, "api-toggle", "启动 API 网关", true, None::<&str>)?;
+                        MenuItem::with_id(app, "api-toggle", "启动API网关", true, None::<&str>)?;
                     let proxy_item =
-                        MenuItem::with_id(app, "proxy-toggle", "启动 代理", true, None::<&str>)?;
+                        MenuItem::with_id(app, "proxy-toggle", "启动代理", true, None::<&str>)?;
                     let sep = PredefinedMenuItem::separator(app)?;
                     let quit_item =
                         MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
