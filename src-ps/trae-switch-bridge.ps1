@@ -753,7 +753,10 @@ function Backup-ChromiumProfile {
             profileCount     = @($profiles).Count
             createdAt        = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         }
-        $meta | ConvertTo-Json -Compress | Set-Content -Path (Join-Path $dest 'snapshot_meta.json') -Encoding UTF8
+        # 审查修复：PS 5.1 Set-Content -Encoding UTF8 带 BOM——Rust 端 doubao.rs 用
+        # serde_json 读此文件，BOM 导致解析失败静默降级 schema_version=0，改无 BOM 写入
+        $metaJson = $meta | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText((Join-Path $dest 'snapshot_meta.json'), $metaJson, (New-Object System.Text.UTF8Encoding($false)))
     } catch {
         Write-Step -Stage 'backup' -Message "快照元数据写入失败（不影响快照本身）: $_" -Status 'warn'
     }
