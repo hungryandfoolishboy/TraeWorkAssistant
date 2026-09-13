@@ -1,7 +1,8 @@
 # 产品优化需求清单（全应用统一待办）
 
-> **文档版本**: v2.1 · 2026-09-13
+> **文档版本**: v2.2 · 2026-09-13
 > **定位**: 全项目**唯一待办依据**——所有未实施的优化与需求项均在此登记，每条含需求概述 / 实现路径 / 参考开源项目。
+> **v2.2 变更**: 新增 F-75（macOS 平台支持）——Windows 依赖全景盘点结论：迁移策略为「分层归位」而非整体重写，系统/文件/进程层迁 Rust 原生（切换桥 Rust 化为主工程），网络协议层 Python 已天然跨平台仅路径中立化；最大不确定性是各目标应用 macOS 版数据布局，侦察先行。
 > **v2.1 变更**: 新增 F-74（Buddy 切换时自动迁移会话到目标账号）——可行性分析结论：WorkBuddy 侧核心能力（F-44/F-45）已落地，仅缺切换编排与 CodeBuddy 会话域扩展；Trae 侧真迁移维持 §四已排除结论不变。
 > **v2.0 变更**: ① 合并删除五份分析文档——`docs/tmp/`（trae-account-switch-data-migration-analysis / doubao-api-feasibility / oss-ecosystem-value-analysis）、`work-credit-pool-design.md`（完整并入 §W-01）、`unified-api-gateway-design.md`（已实施，要点并入 tech-framework.md）；② WorkBuddy 蓝本（原 workbuddy-product-design.md）批次 1~5 已全部完成，其机会项 F-41/F-42/F-52/F-66 转入本文；③ 新增 F-67~F-73、E-01~E-03 共 10 项（源自上述分析文档中的未实现价值点）；④ 原 F-44（TRAE 多实例并行）改号 **F-67**，消除与 WorkBuddy 蓝本 F-44（会话备份，已完成）的编号冲突。
 > **原则**: 接口层独立模块 + 失败明示 + 不硬编码奖励数额；仅管理本人合法持有的账号；借鉴开源遵循 learn-the-design, write-our-own-code。
@@ -27,6 +28,7 @@
 | F-41 | trae2codex 转换器 | Trae 生态 | P3 | 3 天 | 待开发（机会项） |
 | F-42 | workbuddy-mcp 模式 | Buddy 生态 | P3 | 2~3 天 | 机会项（按需评估） |
 | F-66 | CLI 多账号环境隔离 | Buddy 生态 | P3 | 评估先行 | 机会项（按需评估） |
+| F-75 | macOS 平台支持（依赖盘点 + 分层迁移） | 全应用 | P3 | 6~8 周（侦察先行） | 待侦察（目标应用 mac 布局未证实） |
 | F-52 | WorkBuddyProxy 模式（驾驶舱 + Codex 执行器） | Buddy 生态 | P3 | — | 远期（与 F-40 方向相反） |
 | F-71 | Trae SG 版（国际版）支持 | Trae 生态 | P3 | — | 远期（前置情报已有） |
 | F-72 | 网关上游多级回退 + 分档竞速调度 | 网关 | P3 | — | 远期（调度增强方向） |
@@ -155,6 +157,33 @@
 - **实现路径**：先做评估（目标 CLI 的配置目录读取优先级、与现有 `workbuddy_cli_bridge_set` 写 token 模式的冲突调和），通过后作为 CLI 桥的第二种隔离模式并存。
 - **参考开源项目**：`xiaolizi0v0/CliProxy`（多 CLI 账号环境隔离 + 严格账号模式 + 接口脱敏完整范式）。
 
+### F-75 macOS 平台支持（P3，侦察先行，分层迁移）
+
+- **需求概述**：让助手与四应用（Trae Work / Trae CN / WorkBuddy+CodeBuddy / 豆包）的账号管理、切换、签到、网关能力在 macOS 可用。**迁移策略为「分层归位」而非整体重写**：系统/文件/进程层迁 Rust 原生，网络协议层 Python 已天然跨平台仅做路径中立化。
+- **Windows 依赖全景**（2026-09-13 盘点）：
+
+| 层 | Windows 依赖 | 迁移目标（Rust/Python） | 可行性 |
+|---|---|---|---|
+| Tauri 壳 | msi/nsis 打包、WebView2 数据目录、`CommandExt`+`CREATE_NO_WINDOW`（10+ 处）、Job Object（python.rs 子进程跟随退出） | Rust：`app`/`dmg` target + tauri plugin updater（macOS 官方支持）；命令封装 helper 按 `cfg` 去 flags；进程组替代 Job Object | 高 |
+| 凭证保险库 | `vault.rs` DPAPI（windows-sys CryptProtectData） | Rust：`keyring` crate（macOS Keychain / Windows DPAPI / Linux libsecret 统一抽象），接口不变仅换实现 | 高（一行级替换） |
+| 进程管理 | `process.rs` taskkill/tasklist 三级关闭（WM_CLOSE→/T /F→人工） | Rust：`pgrep`/`kill -TERM`（Electron 收 SIGTERM 同样优雅落盘），逻辑等价重写 ~100 行 | 高 |
+| **切换桥（主工程）** | `trae-switch-bridge.ps1` 1534 行：注册表（Uninstall 枚举 / HKLM MachineGuid）、WMI `Win32_Process`、WScript.Shell COM（lnk 解析）、schtasks 保活 | **Rust 原生化**（PS 桥的职责本就是文件快照/进程/JSONL/SQLite，Rust 已有同构实现可复用：`chatdata` 的 copy_dir_recursive、`workbuddy_stats` 的 rusqlite、`process.rs`）；进度事件从 stdout NDJSON 转发直通 Tauri emit；ps1 保留为 Windows 兼容回退直至 Rust 版验证完毕 | 高（工作量最大） |
+| 应用档案 | 各应用数据目录硬编码 Windows 路径（`%APPDATA%\TRAE SOLO CN` / `%APPDATA%\Trae CN` / `~/.workbuddy`+`%APPDATA%\WorkBuddy` / `~/.codebuddy`+`%APPDATA%\CodeBuddy CN` / `%LOCALAPPDATA%\CodeBuddyExtension\...` 共享 auth / `%LOCALAPPDATA%\Doubao\User Data`） | Rust：档案表加 `os` 维度（F-48 表驱动结构已预留该扩展点）；`~/.workbuddy`、`~/.codebuddy` 为 CLI 工具惯例跨平台同路径大概率不变；VS Code fork 类（Trae/CodeBuddy）macOS 落 `~/Library/Application Support/<app>`；**全部需 mac 实测** | 中（依赖侦察） |
+| Python 网络层 | 签到/积分/续期/导出脚本**零 Windows 依赖**（纯 requests+JSON），仅 `wb_common.py` auth 文件路径与数据目录取 `LOCALAPPDATA/APPDATA` | Python：路径中立化 helper（按平台取 `~/Library/Application Support` 或环境变量），~半天 | 高（开箱即用级） |
+| Python 豆包脚本 | `doubao_renew.py`/`doubao_chats.py` 的 Chromium cookie 解密走 DPAPI（ctypes.windll）；CA 信任 certutil/注册表 | Python/混合：macOS Chromium 用 Keychain `Safe Storage`（security CLI 取 key + AES-128-CBC）；CA 信任 `security add-trusted-cert`；且续期主路径将随桥 Rust 化（PS KeepAlive），豆包 mac 解密可降优先级 | 中（豆包 mac 布局未知） |
+| 计划任务 | schtasks（自动签到注册） | Rust：launchd plist（LaunchAgent）写入 `~/Library/LaunchAgents` | 高 |
+| 更新分发 | NSIS 安装器 + updater | dmg + Apple 签名公证（Developer ID）+ tauri updater | 高（需开发者账号 $99/年） |
+
+- **实现路径**（阶段化）：
+  - **M-1 侦察（先决，3~5 天）**：①确认 WorkBuddy / CodeBuddy 是否有 macOS 版及其数据布局（`~/.workbuddy`、`~/.codebuddy`、共享 auth 文件、`~/Library/Application Support/<app>` 的 vscdb secret storage 形态——macOS 上 VS Code fork 的 secret 走 Keychain，同机快照复制不受影响，但需实测）；②Trae mac 版数据目录与 machineid/aha 位置；③豆包 mac 版布局与 cookie 加密形态；
+  - **M0 平台抽象底座（3~5 天）**：`paths` 模块（`dirs` crate 统一数据目录）、命令创建 helper（按 cfg 抹平 CREATE_NO_WINDOW）、`keyring` 换 DPAPI、进程管理 trait（taskkill/pgrep 双实现）、档案表加 os 维度、计划任务 trait（schtasks/launchd）；
+  - **M1 切换桥 Rust 化（2~3 周，分批）**：authfile（WorkBuddy/CodeBuddy）→ icube（Trae 双应用，含设备重置 6 层）→ chromium（豆包，含 C4 IndexedDB 开关）；每批带快照/恢复往返单测；防误覆盖守卫、Wait-AuthFileQuiet 等关键防护语义逐条对照移植；
+  - **M2 Python 路径中立化（1~2 天）**：`src-python/` 公共路径 helper + CI 双平台冒烟；
+  - **M3 打包分发（3~5 天）**：dmg + 公证 + updater 配置。
+- **参考开源项目**：`tauri-apps/tauri`（v2 多平台打包与 updater 官方范式）；`hwchen/keyring-rs`（三平台 secret store 统一抽象）；本项目既有 Rust 模块（chatdata/workbuddy_stats/process.rs 为桥 Rust 化的同构实现库）。
+- **边界与风险**：①各目标应用 macOS 版布局是最大不确定性，M-1 侦察不通过的应用域先不支持（档案表按应用×平台灰度）；②Apple 签名公证需要 Developer ID 账号；③MITM 抓包在 macOS 需 Keychain 信任授权交互；④ PS 桥双轨期日志格式对齐（前端 switch-progress 解析不变）。
+- **验收**：macOS 上完成 Trae Work 双账号切换 + WorkBuddy 切换 + 自动签到 + 网关代理全链路；Windows 行为零变化（回归：现有 247 个 Rust 测试 + 前端 tsc）。
+
 ### F-52 WorkBuddyProxy 模式（P3，远期）
 
 - **需求概述**：WorkBuddy 驾驶舱 + Codex 执行器——与 F-40（Codex 协议投影进 Buddy 网关）方向相反：以 WorkBuddy 客户端为主控、Codex 作为执行后端。
@@ -248,4 +277,4 @@
 6. **F-74 Buddy 切换自动迁移会话** —— 核心算法已上线（F-45），编排 + CodeBuddy 域扩展 2~3 天
 7. **F-70 tc 凭证直读** —— 情报核对 0.5 天先行，解密落地 2~3 天
 8. F-69 / E-03 / F-41 / F-42 / F-66 —— 按需启动
-9. F-52 / F-71 / F-72 / F-73 —— 远期留档，随生态演进评估
+9. F-52 / F-71 / F-72 / F-73 / F-75 —— 远期留档，随生态演进评估（F-75 侦察可随时低成本启动）
