@@ -27,10 +27,12 @@ use crate::state::AppState;
 
 /// 首次全量拉取窗口（天）
 const FULL_PULL_DAYS: i64 = 365;
-/// 单账号分页安全上限（防 total 异常导致死循环；50 页 × 100 = 5000 会话）
+/// 拉取分块窗口（天）：对齐官方控制台请求粒度，过大区间会被参数校验拒绝（400/9004）
+const CHUNK_DAYS: i64 = 30;
+/// 单账号单块分页安全上限（防 total 异常导致死循环；50 页 × 20 = 1000 会话/块）
 const MAX_PAGES: u32 = 50;
-/// 单页大小（服务端实测 20；取大值，实际以返回长度自适应）
-const PAGE_SIZE: u32 = 100;
+/// 单页大小（对齐官方控制台实测值 20）
+const PAGE_SIZE: u32 = 20;
 /// 用量类型 7 = Cloud-IDE 会话积分消耗（实测口径）
 const USAGE_TYPE: i64 = 7;
 
@@ -113,18 +115,71 @@ fn local_midnight_ts(date: &str) -> Option<i64> {
     }
 }
 
-/// 单账号分页拉取 [start_ts, end_ts] 区间并按本地日聚合。失败返回 Err（调用方沿用缓存）。
+/// 官网控制台（Web 端）形态请求：对齐 2026-09-13 代理抓包的成功请求——
+/// 浏览器 UA + origin/referer www.trae.cn + sec-fetch cors/same-site，
+/// **不带** IDE 客户端指纹头（x-market-*/x-device-id 等；该接口按 Web 路由校验，
+/// 客户端头 + 大分页/大区间组合返回 400 code=9004 参数错误）。
+fn web_usage_post(agent: &ureq::Agent, jwt: &str, body: serde_json::Value) -> Result<Value, String> {
+    let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
+        jwt.to_string()
+    } else {
+        format!("Cloud-IDE-JWT {}", jwt.trim())
+    };
+    let resp = agent
+        .post(USAGE_URL)
+        .set("accept", "application/json, text/plain, */*")
+        .set("accept-language", "zh-CN,zh;q=0.9")
+        .set("authorization", &auth)
+        .set("content-type", "application/json")
+        .set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
+        .set("origin", "https://www.trae.cn")
+        .set("referer", "https://www.trae.cn/")
+        .set("sec-fetch-dest", "empty")
+        .set("sec-fetch-mode", "cors")
+        .set("sec-fetch-site", "same-site")
+        .send_json(body)
+        .map_err(|e| match e {
+            ureq::Error::Status(code, resp) => {
+                let body = resp.into_string().unwrap_or_default();
+                let snippet: String = body.chars().take(200).collect();
+                format!("API 请求失败: status code {code}，响应: {snippet}")
+            }
+            other => format!("API 请求失败: {other}"),
+        })?;
+    resp.into_json().map_err(|e| format!("解析响应失败: {e}"))
+}
+
+/// 单账号拉取 [start_ts, end_ts] 区间并按本地日聚合。
+/// 大区间按 30 天分块（对齐官方控制台请求窗口；chunk 间边界无缝不重叠）。
+/// 失败返回 Err（调用方沿用缓存）。
 fn fetch_account_usage(
-    state: &AppState,
-    uid: &str,
     jwt: &str,
     start_ts: i64,
     end_ts: i64,
 ) -> Result<BTreeMap<String, UsageDayStat>, String> {
     let agent = crate::commands::accounts::pay_status_agent();
-    let dev = crate::commands::accounts::resolve_device(state, uid);
 
     let mut agg: BTreeMap<String, UsageDayStat> = BTreeMap::new();
+    let mut chunk_end = end_ts;
+    loop {
+        let chunk_start = (chunk_end - CHUNK_DAYS * 86400 + 1).max(start_ts);
+        fetch_chunk(&agent, jwt, chunk_start, chunk_end, &mut agg)?;
+        if chunk_start <= start_ts {
+            break;
+        }
+        chunk_end = chunk_start - 1;
+    }
+    Ok(agg)
+}
+
+/// 单分块（≤30 天）分页拉取并聚合进 agg
+fn fetch_chunk(
+    agent: &ureq::Agent,
+    jwt: &str,
+    start_ts: i64,
+    end_ts: i64,
+    agg: &mut BTreeMap<String, UsageDayStat>,
+) -> Result<(), String> {
     let mut page: u32 = 1;
     let mut got: usize = 0;
     let mut total: Option<usize> = None;
@@ -137,8 +192,7 @@ fn fetch_account_usage(
             "page_num": page,
             "usage_type": [USAGE_TYPE],
         });
-        let resp =
-            crate::commands::accounts::ide_query_post(&agent, USAGE_URL, jwt, &dev, body)?;
+        let resp = web_usage_post(agent, jwt, body)?;
         if total.is_none() {
             total = Some(resp.get("total").and_then(Value::as_u64).unwrap_or(0) as usize);
         }
@@ -192,7 +246,7 @@ fn fetch_account_usage(
         }
         page += 1;
     }
-    Ok(agg)
+    Ok(())
 }
 
 /// 拉取全部账号的积分消耗历史（按本地日聚合），落盘缓存供查询展示。
@@ -257,7 +311,7 @@ pub fn usage_history_fetch(
                 }
                 None => (full_start, String::new()),
             };
-        match fetch_account_usage(&state, &uid, &a.jwt, start_ts, now_ts) {
+        match fetch_account_usage(&a.jwt, start_ts, now_ts) {
             Ok(new_agg) => {
                 let entry = cache.accounts.entry(uid.clone()).or_default();
                 entry.name = name;
