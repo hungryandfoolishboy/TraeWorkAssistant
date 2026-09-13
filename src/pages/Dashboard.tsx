@@ -75,9 +75,44 @@ export default function Dashboard() {
         .filter((a) => a.remaining_credits != null && a.remaining_credits > 0)
         .sort((a, b) => (b.remaining_credits ?? 0) - (a.remaining_credits ?? 0))
         .slice(0, 10)
-        .map((a) => ({ name: a.name, credits: a.remaining_credits as number })),
+        .map((a) => ({
+          name: a.name,
+          credits: a.remaining_credits as number,
+          general: a.general_credits,
+          work: a.work_credits,
+        })),
     [accounts],
   );
+
+  // Top 榜悬浮提示：展示通用/Work 积分明细（账号名作标题）
+  const TopTooltip = ({
+    active,
+    payload,
+  }: {
+    active?: boolean;
+    payload?: { payload: (typeof top)[number] }[];
+  }) => {
+    if (!active || !payload?.length) return null;
+    const p = payload[0].payload;
+    const fmt = (v: number) => v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+    return (
+      <div
+        style={{
+          fontSize: 12,
+          borderRadius: 10,
+          border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+          background: isDark ? '#18181b' : '#fff',
+          color: isDark ? '#e4e4e7' : '#1e293b',
+          boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
+          padding: '8px 12px',
+        }}
+      >
+        <div className="font-medium">{p.name}</div>
+        <div>通用积分：{fmt(p.general ?? 0)}</div>
+        <div>Work积分：{fmt(p.work ?? 0)}</div>
+      </div>
+    );
+  };
 
   const refresh = async () => {
     toast('info', '刷新中…');
@@ -294,16 +329,7 @@ export default function Dashboard() {
                 <YAxis tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={48} />
                 <Tooltip
                   cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
-                  contentStyle={{
-                    fontSize: 12,
-                    borderRadius: 10,
-                    border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
-                    background: isDark ? '#18181b' : '#fff',
-                    color: isDark ? '#e4e4e7' : '#1e293b',
-                    boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
-                    padding: '8px 12px',
-                  }}
-                  formatter={(v: number) => [v.toLocaleString('zh-CN', { maximumFractionDigits: 2 }), '可用积分']}
+                  content={<TopTooltip />}
                 />
                 <Bar dataKey="credits" radius={[8, 8, 0, 0]} maxBarSize={44}>
                   {top.map((_, i) => {

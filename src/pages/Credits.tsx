@@ -13,7 +13,7 @@ import {
 } from 'recharts';
 import { Coins, RefreshCw } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
-import { StatCard, Badge, EmptyState } from '../components/ui';
+import { StatCard, EmptyState } from '../components/ui';
 import ExpiryCalendar, { type ExpiryItem } from '../components/ExpiryCalendar';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
@@ -72,7 +72,6 @@ function rangeDates(range: RangeKey): string[] {
 
 export default function Credits() {
   const accounts = useAppStore((s) => s.accounts);
-  const groups = useAppStore((s) => s.groups);
   const creditsHistory = useAppStore((s) => s.creditsHistory);
 
   const creditsDaily = useAppStore((s) => s.creditsDaily);
@@ -438,54 +437,6 @@ export default function Credits() {
             )}
           </>
         )}
-      </div>
-
-      <div className="mt-5 card overflow-hidden">
-        <div className="border-b border-slate-100 px-5 py-3 dark:border-zinc-800">
-          <h3 className="font-medium">账号积分明细</h3>
-        </div>
-        <table className="w-full text-sm">
-          <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
-            <tr>
-              <th className="px-4 py-2 text-left">排名</th>
-              <th className="px-4 py-2 text-left">账号</th>
-              <th className="px-4 py-2 text-left">分组</th>
-              <th className="px-4 py-2 text-right">可用积分</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((a, i) => {
-              const g = groups.find((x) => x.id === a.group_id);
-              return (
-                <tr key={a.user_id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
-                  <td className="px-4 py-2">#{i + 1}</td>
-                  <td className="px-4 py-2">
-                    <div className="font-medium">{a.name}</div>
-                    <div className="text-xs text-slate-400">{a.user_id}</div>
-                  </td>
-                  <td className="px-4 py-2">
-                    {g ? (
-                      <Badge tone="slate">
-                        <span className="inline-block h-2 w-2 rounded-full" style={{ background: g.color }} />
-                        {g.name}
-                      </Badge>
-                    ) : (
-                      <span className="text-xs text-slate-400">未分组</span>
-                    )}
-                  </td>
-                  <td className="px-4 py-2 text-right tabular-nums">
-                    {fmtCredits(a.remaining_credits ?? 0)}
-                    {(a.general_credits != null || a.work_credits != null) && (
-                      <div className="text-[11px] text-slate-400">
-                        通用 {fmtCredits(a.general_credits ?? 0)} · Work {fmtCredits(a.work_credits ?? 0)}
-                      </div>
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
       </div>
 
       {/* 到期日历（F-13） */}
