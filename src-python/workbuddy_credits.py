@@ -11,7 +11,7 @@
     end_time("YYYY-MM-DD HH:MM:SS" 统一形态，由 expire_ts 归一生成),
     expire_ts(Unix 秒),expire_soon}],"source"}
   全池：{"accounts":[...],"total_balance":N}
-缓存：data/workbuddy_credits_cache.json（≥5 分钟；--fresh 强制刷新）。
+缓存：data/workbuddy_credits_cache.json（≥10 分钟；--fresh 强制刷新）。
 
 取数三层降级（§3.6）：云端三件套 → （本地 quota API 兜底属客户端运行时，批次2）→ 无凭证明示。
 解析宽容：dig() 6 种嵌套 + 容量字段链 CycleCapacitySizePrecise→CycleTotalCapacity→CapacitySize。
@@ -30,7 +30,7 @@ CN_BILLING = "https://www.codebuddy.cn"
 OLD_BODY = {"ProductCode": "p_tcaca", "Status": [0, 3],
             "PackageEndTimeRange": {"StartTime": "2000-01-01T00:00:00Z",
                                     "EndTime": "2099-12-31T23:59:59Z"}}
-CACHE_TTL = 5 * 60  # ≥5min 缓存（频控红线）
+CACHE_TTL = 10 * 60  # ≥10min 缓存（频控红线；对齐积分看板缓存诉求，原 5min）
 
 
 def _num(v):
@@ -316,11 +316,24 @@ def main():
                             "ok": False, "message": "异常: %s" % e, "balance": None,
                             "packages": [], "source": "error"})
 
+    # stale-on-error（F-59）：刷新失败（全部账号 ok=false）且存在历史缓存 →
+    # 回退输出过期缓存并标注 stale=true，不让看板空屏。
+    # 同时不把全失败结果写回缓存（否则摧毁下次回退的数据源）。
+    if results and all(not r.get("ok") for r in results) and cache_ok and cache.get("accounts"):
+        accounts_cached = cache.get("accounts", [])
+        if args.uid:
+            accounts_cached = [a for a in accounts_cached if a.get("user_id") == args.uid]
+        if accounts_cached:
+            sys.stdout.write(json.dumps({"ok": True, "cached": True, "stale": True,
+                                         "accounts": accounts_cached}, ensure_ascii=False) + "\n")
+            return
+
     out = {"ok": True, "cached": False, "accounts": results,
            "total_balance": sum(r["balance"] or 0 for r in results if r.get("ok"))}
-    # 缓存回写（池级）
-    wb.write_json_atomic(wb.credits_cache_path(), {
-        "fetched_ts": time.time(), "fetched_at": wb.now_ts(), "accounts": results})
+    # 缓存回写（池级）：至少一个账号成功才回写，全失败保留旧缓存作回退数据源
+    if any(r.get("ok") for r in results) or not results:
+        wb.write_json_atomic(wb.credits_cache_path(), {
+            "fetched_ts": time.time(), "fetched_at": wb.now_ts(), "accounts": results})
     sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
 
 

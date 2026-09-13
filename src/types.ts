@@ -913,6 +913,9 @@ export interface WbUsageOfficial {
   range_end: string;
   fetched_at_ms: number;
   request_count_total: number;
+  /** F-59 stale-on-error：拉取失败回退的过期缓存标记 */
+  stale?: boolean;
+  stale_reason?: string;
   summary: { usage_today: number; usage_7days: number; usage_this_month: number };
   daily: { date: string; usage: number; models: WbUsageModelPoint[] }[];
   models: WbUsageModelPoint[];
@@ -963,6 +966,8 @@ export interface WbCreditAccount {
 export interface WbCreditsResult {
   ok: boolean;
   cached?: boolean;
+  /** F-59 stale-on-error：全部账号刷新失败时回退的历史缓存 */
+  stale?: boolean;
   accounts: WbCreditAccount[];
   total_balance?: number;
 }

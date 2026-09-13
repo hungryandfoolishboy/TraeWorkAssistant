@@ -37,7 +37,11 @@ export default function BuddyCredits() {
       try {
         const r = await withMinDelay(api.workbuddy.creditsFetch(undefined, fresh), 1000);
         setResult(r);
-        if (fresh) pushToast('success', '积分已刷新');
+        if (fresh && r.stale) {
+          pushToast('warn', '积分刷新失败，已回退展示历史缓存数据');
+        } else if (fresh) {
+          pushToast('success', '积分已刷新');
+        }
       } catch (err) {
         pushToast('error', `积分查询失败：${String(err)}`);
       } finally {
@@ -112,7 +116,7 @@ export default function BuddyCredits() {
             <StatCard
               label="可用积分总数"
               value={total.toFixed(2)}
-              hint={result?.cached ? '缓存数据（≥5 分钟）' : '实时数据'}
+              hint={result?.stale ? '历史缓存回退（本次查询失败）' : result?.cached ? '缓存数据（≥10 分钟）' : '实时数据'}
               tone="violet"
             />
             <StatCard label="账号数" value={accounts.length} hint={`${okCount} 个查询成功`} tone="brand" />

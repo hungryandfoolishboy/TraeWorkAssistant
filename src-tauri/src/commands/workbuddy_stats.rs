@@ -7,10 +7,17 @@
 //!
 //! ⚠ serde 命名约定：输出字段全部 snake_case；响应只含聚合数字，不返回消息正文/凭证。
 
+use chrono::TimeZone;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Instant;
+
+use crate::state::AppState;
+use tauri::State;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Usage {
@@ -33,6 +40,16 @@ impl Totals {
         self.usage.read = self.usage.read.saturating_add(usage.read);
         self.usage.write = self.usage.write.saturating_add(usage.write);
         self.calls = self.calls.saturating_add(1);
+    }
+
+    /// 增量缓存路径：按日聚合（含调用次数）累加
+    fn add_day(&mut self, d: &DayTotals) {
+        let t = d.to_totals();
+        self.usage.input = self.usage.input.saturating_add(t.usage.input);
+        self.usage.output = self.usage.output.saturating_add(t.usage.output);
+        self.usage.read = self.usage.read.saturating_add(t.usage.read);
+        self.usage.write = self.usage.write.saturating_add(t.usage.write);
+        self.calls = self.calls.saturating_add(t.calls);
     }
 
     /// input 已含缓存读取（供应商语义），total 不重复计 read。
@@ -255,8 +272,169 @@ fn group_vec(groups: HashMap<String, Totals>) -> Vec<Value> {
     values.into_iter().map(|(_, v)| v).collect()
 }
 
-/// 扫描单个根目录（~/.workbuddy/projects 或 ~/.codebuddy/projects），返回聚合视图
-fn scan_root(root: &Path, name: &str, cutoff_ms: i64) -> Value {
+// ── 增量缓存层（F-59 性能优化：积分看板 Token 统计提速）────────────────────
+//
+// 三级优化（对应用户诉求「先优化获取逻辑 → 10min 缓存 → 过滤再获取」）：
+// ① 获取逻辑：按文件增量缓存——mtime+size 未变的文件直接复用按日聚合，不重解析。
+//    全量重扫的瓶颈是逐行 serde 解析（会话文件多且大），增量后仅解析新增/变更文件。
+// ② 结果缓存：进程内 10 分钟 TTL（RESULT_CACHE），前端挂载默认走缓存，
+//    「重扫」按钮传 fresh=true 强制刷新。
+// ③ 过滤再获取：365 天窗口在合并阶段按日期过滤（缓存条目存全量日期，
+//    窗口滑动无需失效缓存），cutoff 之外的日期零解析零聚合。
+//
+// 缓存粒度说明：会话 JSONL 每条记录必带时间戳（缺时间戳记录本就不计入统计），
+// 故按「日期 (+模型/项目)」缓存聚合是无损的；个别 ts 合法但日期转换失败的极端
+// 记录会从全口径中一并排除（原实现仅 daily 口径排除，差异可忽略）。
+
+/// 结果级缓存 TTL（秒）
+const RESULT_TTL_SECS: u64 = 600;
+/// 统计窗口（天），与原实现一致
+const WINDOW_DAYS: i64 = 365;
+
+static RESULT_CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
+
+/// 按日聚合（可序列化缓存单元）
+#[derive(Serialize, Deserialize, Clone, Copy, Default)]
+struct DayTotals {
+    input: u64,
+    output: u64,
+    read: u64,
+    write: u64,
+    calls: u64,
+}
+
+impl DayTotals {
+    fn add(&mut self, other: &Self) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.read = self.read.saturating_add(other.read);
+        self.write = self.write.saturating_add(other.write);
+        self.calls = self.calls.saturating_add(other.calls);
+    }
+
+    fn to_totals(self) -> Totals {
+        Totals {
+            usage: Usage {
+                input: self.input,
+                output: self.output,
+                read: self.read,
+                write: self.write,
+            },
+            calls: self.calls,
+        }
+    }
+}
+
+/// 单文件增量缓存条目
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct FileCacheEntry {
+    mtime_ms: i64,
+    size: u64,
+    /// date → 聚合（该文件全部记录；cutoff 在合并阶段按日期过滤）
+    days: HashMap<String, DayTotals>,
+    /// model → date → 聚合
+    by_model: HashMap<String, HashMap<String, DayTotals>>,
+    /// project → date → 聚合
+    by_project: HashMap<String, HashMap<String, DayTotals>>,
+    parse_errors: u64,
+}
+
+/// 解析单个 jsonl 文件为按日聚合（不做 cutoff 过滤，窗口过滤在合并阶段）
+fn parse_file(path: &Path, fallback_project: &str) -> FileCacheEntry {
+    let mut entry = FileCacheEntry::default();
+    let Ok(file) = std::fs::File::open(path) else {
+        entry.parse_errors = 1;
+        return entry;
+    };
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            entry.parse_errors += 1;
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            entry.parse_errors += 1;
+            continue;
+        };
+        if record_ts(&value).is_none() {
+            continue;
+        }
+        let Some(u) = usage(&value) else {
+            continue;
+        };
+        let Some(day) = record_date(&value) else {
+            continue;
+        };
+        let d = DayTotals {
+            input: u.input,
+            output: u.output,
+            read: u.read,
+            write: u.write,
+            calls: 1,
+        };
+        entry.days.entry(day.clone()).or_default().add(&d);
+        let model = record_model(&value);
+        entry
+            .by_model
+            .entry(model)
+            .or_default()
+            .entry(day.clone())
+            .or_default()
+            .add(&d);
+        let project = project_of(&value, fallback_project);
+        entry
+            .by_project
+            .entry(project)
+            .or_default()
+            .entry(day)
+            .or_default()
+            .add(&d);
+    }
+    entry
+}
+
+fn file_meta_ms(path: &Path) -> Option<(i64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime_ms = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some((mtime_ms, meta.len()))
+}
+
+/// cutoff 日期（今天回看 WINDOW_DAYS 天，本地时区自然日）
+fn cutoff_date_str() -> String {
+    (chrono::Local::now() - chrono::Duration::days(WINDOW_DAYS))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// 本地日期 → 当日 0 点毫秒（coverage 近似值，仅展示用途）
+fn day_to_ms(date: &str, end_of_day: bool) -> Option<i64> {
+    let d = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    let naive = if end_of_day {
+        d.and_hms_micro_opt(23, 59, 59, 999_999)?
+    } else {
+        d.and_hms_opt(0, 0, 0)?
+    };
+    match chrono::Local.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(dt) => Some(dt.timestamp_millis()),
+        chrono::LocalResult::Ambiguous(dt, _) => Some(dt.timestamp_millis()),
+        chrono::LocalResult::None => None,
+    }
+}
+
+/// 扫描单个根目录（~/.workbuddy/projects 或 ~/.codebuddy/projects）。
+/// 命中增量缓存的文件零解析；返回聚合视图，同时把扫到的文件键记入 `seen`
+/// （调用方据此清理已删除文件的缓存条目）。
+fn scan_root(
+    root: &Path,
+    name: &str,
+    cutoff: &str,
+    cache: &mut HashMap<String, FileCacheEntry>,
+    seen: &mut HashSet<String>,
+) -> Value {
     let mut paths = Vec::new();
     collect_jsonl(root, &mut paths);
     paths.sort();
@@ -272,46 +450,61 @@ fn scan_root(root: &Path, name: &str, cutoff_ms: i64) -> Value {
     let mut coverage_end: Option<i64> = None;
 
     for path in &paths {
-        let Ok(file) = std::fs::File::open(path) else {
-            parse_errors = parse_errors.saturating_add(1);
-            continue;
+        let key = path.to_string_lossy().to_string();
+        seen.insert(key.clone());
+        let meta = file_meta_ms(path);
+        let hit = match (&cache.get(&key), meta) {
+            (Some(e), Some((mtime, size))) => e.mtime_ms == mtime && e.size == size,
+            _ => false,
         };
-        let fallback_project = dir_project_name(root, path);
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else {
-                parse_errors += 1;
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                parse_errors += 1;
-                continue;
-            };
-            // 缺时间戳或早于 cutoff 的记录排除（不按 mtime 猜测）
-            let Some(ts) = record_ts(&value) else {
-                continue;
-            };
-            if ts < cutoff_ms {
+        let entry = if hit {
+            cache.get(&key).cloned().unwrap_or_default()
+        } else {
+            let fallback_project = dir_project_name(root, path);
+            let mut e = parse_file(path, &fallback_project);
+            if let Some((mtime, size)) = meta {
+                e.mtime_ms = mtime;
+                e.size = size;
+            }
+            cache.insert(key, e.clone());
+            e
+        };
+
+        parse_errors = parse_errors.saturating_add(entry.parse_errors);
+        for (date, d) in &entry.days {
+            if date.as_str() < cutoff {
                 continue;
             }
-            let Some(u) = usage(&value) else {
-                continue;
-            };
-            let project = project_of(&value, &fallback_project);
-            let model_name = record_model(&value);
-            total.add(u);
-            models.entry(model_name.clone()).or_default().add(u);
-            projects.entry(project).or_default().add(u);
-            if let Some(day) = record_date(&value) {
-                daily.entry(day.clone()).or_default().add(u);
+            total.add_day(d);
+            daily.entry(date.clone()).or_default().add_day(d);
+            if let Some(lo) = day_to_ms(date, false) {
+                coverage_start = Some(coverage_start.map_or(lo, |c| c.min(lo)));
+            }
+            if let Some(hi) = day_to_ms(date, true) {
+                coverage_end = Some(coverage_end.map_or(hi, |c| c.max(hi)));
+            }
+        }
+        for (model, days) in &entry.by_model {
+            for (date, d) in days {
+                if date.as_str() < cutoff {
+                    continue;
+                }
+                models.entry(model.clone()).or_default().add_day(d);
                 daily_by_model
-                    .entry(model_name)
+                    .entry(model.clone())
                     .or_default()
-                    .entry(day)
+                    .entry(date.clone())
                     .or_default()
-                    .add(u);
+                    .add_day(d);
             }
-            coverage_start = Some(coverage_start.map_or(ts, |c| c.min(ts)));
-            coverage_end = Some(coverage_end.map_or(ts, |c| c.max(ts)));
+        }
+        for (project, days) in &entry.by_project {
+            for (date, d) in days {
+                if date.as_str() < cutoff {
+                    continue;
+                }
+                projects.entry(project.clone()).or_default().add_day(d);
+            }
         }
     }
 
@@ -353,16 +546,52 @@ fn scan_root(root: &Path, name: &str, cutoff_ms: i64) -> Value {
     })
 }
 
+fn cache_path(state: &AppState) -> PathBuf {
+    state.data_dir.join("data").join("token_stats_files.json")
+}
+
 /// 本地 Token 统计（F-26/F-57）：合并 ~/.workbuddy/projects 与 ~/.codebuddy/projects，
 /// 固定回看 365 天（热力图数据源）；时间/模型/范围筛选由前端从 daily_by_model 派生。
+/// 性能（F-59）：按文件增量缓存（mtime+size 不变零解析）+ 结果级 10 分钟缓存；
+/// fresh=true（前端「重扫」按钮）跳过结果缓存强制重扫（仍享受增量缓存）。
 #[tauri::command(async)]
-pub fn workbuddy_token_stats() -> Value {
+pub fn workbuddy_token_stats(state: State<AppState>, fresh: Option<bool>) -> Value {
+    if !fresh.unwrap_or(false) {
+        if let Ok(guard) = RESULT_CACHE.lock() {
+            if let Some((at, v)) = guard.as_ref() {
+                if at.elapsed().as_secs() < RESULT_TTL_SECS {
+                    return v.clone();
+                }
+            }
+        }
+    }
+
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let cutoff = now_ms - 365 * 86_400_000;
+    let cutoff = cutoff_date_str();
 
-    let mut merged = scan_root(&Path::new(&home).join(".workbuddy").join("projects"), "workbuddy", cutoff);
-    let second = scan_root(&Path::new(&home).join(".codebuddy").join("projects"), "codebuddy-cli", cutoff);
+    let mut cache: HashMap<String, FileCacheEntry> =
+        crate::fs_utils::read_json(&cache_path(&state));
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let mut merged = scan_root(
+        &Path::new(&home).join(".workbuddy").join("projects"),
+        "workbuddy",
+        &cutoff,
+        &mut cache,
+        &mut seen,
+    );
+    let second = scan_root(
+        &Path::new(&home).join(".codebuddy").join("projects"),
+        "codebuddy-cli",
+        &cutoff,
+        &mut cache,
+        &mut seen,
+    );
+
+    // 已删除文件的缓存条目清理
+    cache.retain(|k, _| seen.contains(k));
+    let _ = crate::fs_utils::write_json(&cache_path(&state), &cache);
 
     // 合并双源：summary/daily/models/projects/daily_by_model 累加
     merge_totals(merged.get_mut("summary"), second.get("summary"));
@@ -380,7 +609,13 @@ pub fn workbuddy_token_stats() -> Value {
     merged["files_scanned"] = json!(files);
     merged["parse_errors"] = json!(errs);
     merged["generated_at"] = json!(now_ms);
-    merged["window_days"] = json!(365);
+    merged["window_days"] = json!(WINDOW_DAYS);
+    merged["cache_hit_files"] = json!(seen.len().saturating_sub(0));
+    merged["fresh"] = json!(fresh.unwrap_or(false));
+
+    if let Ok(mut guard) = RESULT_CACHE.lock() {
+        *guard = Some((Instant::now(), merged.clone()));
+    }
     merged
 }
 

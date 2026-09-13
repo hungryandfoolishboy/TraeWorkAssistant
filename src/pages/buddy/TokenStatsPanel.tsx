@@ -81,10 +81,11 @@ export default function TokenStatsPanel({ remainingCredits }: { remainingCredits
   const [range, setRange] = useState<RangeKey>('7d');
   const [modelFilter, setModelFilter] = useState('');
 
-  const loadStats = useCallback(async () => {
+  const loadStats = useCallback(async (fresh = false) => {
     setStatsLoading(true);
     try {
-      const r = await withMinDelay(api.workbuddy.tokenStats(), 800);
+      // fresh=false 走后端 10 分钟结果缓存（挂载默认）；「重扫」按钮传 true 强制刷新
+      const r = await withMinDelay(api.workbuddy.tokenStats(fresh), 800);
       setStats(r);
     } catch (err) {
       pushToast('error', `本地 Token 统计失败：${String(err)}`);
@@ -344,7 +345,7 @@ export default function TokenStatsPanel({ remainingCredits }: { remainingCredits
                 </button>
               ))}
             </div>
-            <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => void loadStats()} disabled={statsLoading}>
+            <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => void loadStats(true)} disabled={statsLoading}>
               <RefreshCw size={13} className={statsLoading ? 'animate-spin' : ''} /> 重扫
             </button>
           </div>
@@ -482,6 +483,11 @@ export default function TokenStatsPanel({ remainingCredits }: { remainingCredits
           <Server size={16} className="text-emerald-500" />
           <span className="text-sm font-medium">官方请求用量</span>
           <Badge tone="slate">来自 WorkBuddy 官方请求用量</Badge>
+          {usage?.stale && (
+            <Badge tone="amber" title={usage.stale_reason || '本次拉取失败，展示历史缓存数据'}>
+              过期缓存回退（本次查询失败）
+            </Badge>
+          )}
           {usage && (
             <span className="text-xs text-slate-400">
               {usage.range_start.slice(5).replace('-', '/')} ~ {usage.range_end.slice(5).replace('-', '/')} · {usage.request_count_total} 次请求

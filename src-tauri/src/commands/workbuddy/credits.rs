@@ -360,18 +360,36 @@ pub fn workbuddy_usage_official(
     let (acct_id, token, domain) = chosen;
 
     // 缓存命中条件（审查 P1）：状态存在 + 10min 内 + 缓存 account_id 与本次解析账号一致；
-    // 不一致或旧缓存缺 account_id 一律视为未命中，重新按当前账号拉取
+    // 不一致或旧缓存缺 account_id 一律视为未命中，重新按当前账号拉取。
+    // F-59 stale-on-error：过期缓存保留一份，拉取失败时降级回退（见下方 fail 闭包）。
+    let cached_val: Option<serde_json::Value> = {
+        let c: serde_json::Value = fs_utils::read_json(&cache_path);
+        (c.get("status").is_some()).then_some(c)
+    };
     if !refresh.unwrap_or(false) {
-        let cached: serde_json::Value = fs_utils::read_json(&cache_path);
-        let fetched = cached.get("fetched_at_ms").and_then(Value::as_i64).unwrap_or(0);
-        let cached_acct = cached.get("account_id").and_then(Value::as_str);
-        if cached.get("status").is_some()
-            && cached_acct == Some(acct_id.as_str())
-            && chrono::Utc::now().timestamp_millis() - fetched < 10 * 60_000
-        {
-            return Ok(cached);
+        if let Some(cached) = &cached_val {
+            let fetched = cached.get("fetched_at_ms").and_then(Value::as_i64).unwrap_or(0);
+            let cached_acct = cached.get("account_id").and_then(Value::as_str);
+            if cached_acct == Some(acct_id.as_str())
+                && chrono::Utc::now().timestamp_millis() - fetched < 10 * 60_000
+            {
+                return Ok(cached.clone());
+            }
         }
     }
+    // 拉取失败的降级出口：同账号存在历史缓存（即使过期）→ 返回缓存 + stale 标记，
+    // 不让看板空屏；无任何缓存才向上抛错（前端再走 usageFallback 快照回退链）
+    let fail = |msg: &str| -> Result<serde_json::Value, String> {
+        if let Some(c) = &cached_val {
+            if c.get("account_id").and_then(Value::as_str) == Some(acct_id.as_str()) {
+                let mut stale = c.clone();
+                stale["stale"] = serde_json::json!(true);
+                stale["stale_reason"] = serde_json::json!(msg);
+                return Ok(stale);
+            }
+        }
+        Err(msg.to_string())
+    };
 
     // 区域路由（T4.5/F-36，§5.2）：Global 账号（domain 含 workbuddy.ai）billing
     // 全走 www.workbuddy.ai；CN 账号维持既有 workbuddy.cn 网关。
@@ -412,19 +430,22 @@ pub fn workbuddy_usage_official(
         let v: serde_json::Value = match resp {
             Ok(r) => r.into_json().unwrap_or_default(),
             Err(ureq::Error::Status(code, _)) => {
-                return Err(format!("官方用量请求失败（HTTP {code}）：请检查凭证有效期"));
+                return fail(&format!("官方用量请求失败（HTTP {code}）：请检查凭证有效期"));
             }
-            Err(e) => return Err(format!("官方用量请求失败: {e}")),
+            Err(e) => return fail(&format!("官方用量请求失败: {e}")),
         };
         let code = v.get("code").and_then(Value::as_i64).unwrap_or(0);
         if code != 0 && code != 200 {
-            return Err(format!("官方用量请求失败（code={code}）"));
+            return fail(&format!("官方用量请求失败（code={code}）"));
         }
-        let data = v.get("data").ok_or("官方响应格式无效")?;
-        let items = data
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or("官方响应格式无效")?;
+        let data = match v.get("data") {
+            Some(d) => d,
+            None => return fail("官方响应格式无效"),
+        };
+        let items = match data.get("data").and_then(Value::as_array) {
+            Some(a) => a,
+            None => return fail("官方响应格式无效"),
+        };
         reported_total = reported_total.max(
             data.get("total")
                 .and_then(Value::as_u64)

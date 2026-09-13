@@ -352,7 +352,9 @@ export const api = {
     usageOfficial: (userId?: string, fresh?: boolean) =>
       invoke<WbUsageOfficial>('workbuddy_usage_official', { userId: userId ?? null, refresh: fresh ?? null }),
     usageFallback: () => invoke<WbUsageFallback>('workbuddy_usage_fallback'),
-    tokenStats: () => invoke<WbTokenStats>('workbuddy_token_stats'),
+    // fresh=true 强制重扫（跳过 10 分钟结果缓存；按文件增量缓存仍生效）
+    tokenStats: (fresh?: boolean) =>
+      invoke<WbTokenStats>('workbuddy_token_stats', { fresh: fresh ?? null }),
     activityInfo: (userId?: string, fresh?: boolean) =>
       invoke<WbActivityInfo>('workbuddy_activity_info', { userId: userId ?? null, refresh: fresh ?? null }),
   },
