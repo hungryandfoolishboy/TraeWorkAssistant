@@ -77,9 +77,10 @@ impl WbModel {
     }
 }
 
-/// 内置静态兜底目录（15 模型，§5.6；倍率为 2026-09 WorkBuddy 客户端截图快照：
-/// hy4-preview / hy3 限时免费 0.00x，deepseek-v4-flash 0.03x，glm-5.3-flash 0.06x，
-/// glm-5.3 / glm-5.2 0.79x，minimax-m3 0.25x）
+/// 内置静态兜底目录（15 模型，§5.6；倍率为 2026-09 WorkBuddy 客户端截图快照，
+/// 多界面并列时取最低：hy4-preview / hy3 限时免费 0.00x，deepseek-v4-flash 0.03x，
+/// glm-5.3 / glm-5.2 0.78x，deepseek-v4-pro 0.51x，kimi-k3 / kimi-k3-1 1.62x，
+/// minimax-m3 0.25x，qwen3.8-max 1.50x）
 pub fn builtin() -> Vec<WbModel> {
     let m = |id: &str,
              display: &str,
@@ -105,16 +106,16 @@ pub fn builtin() -> Vec<WbModel> {
         m("hy4", "Hy4", 1_000_000, 128_000, true, &["low", "medium", "high"], None, 0.20),
         m("hy3-x", "Hy3-X", 200_000, 64_000, false, &["high"], Some("high"), 0.05),
         m("hy3", "Hy3", 200_000, 64_000, false, &["high"], Some("high"), 0.00),
-        m("glm-5.3", "GLM-5.3", 200_000, 96_000, true, &["low", "medium", "high"], None, 0.79),
+        m("glm-5.3", "GLM-5.3", 200_000, 96_000, true, &["low", "medium", "high"], None, 0.78),
         m("glm-5.3-flash", "GLM-5.3 Flash", 128_000, 64_000, false, &["low", "medium", "high"], None, 0.06),
-        m("glm-5.2", "GLM-5.2", 128_000, 64_000, false, &["low", "medium", "high"], None, 0.79),
+        m("glm-5.2", "GLM-5.2", 128_000, 64_000, false, &["low", "medium", "high"], None, 0.78),
         m("glm-5", "GLM-5", 128_000, 64_000, false, &["low", "medium", "high"], None, 0.20),
         m("kimi-k3-1", "Kimi K3.1", 256_000, 64_000, true, &["medium", "high"], None, 1.62),
-        m("kimi-k3", "Kimi K3", 256_000, 64_000, false, &["medium", "high"], None, 0.90),
+        m("kimi-k3", "Kimi K3", 256_000, 64_000, false, &["medium", "high"], None, 1.62),
         m("deepseek-v4-flash", "DeepSeek V4 Flash", 168_000, 32_000, false, &["low", "medium"], None, 0.03),
-        m("deepseek-v4-pro", "DeepSeek V4 Pro", 168_000, 64_000, false, &["medium", "high"], None, 1.10),
+        m("deepseek-v4-pro", "DeepSeek V4 Pro", 168_000, 64_000, false, &["medium", "high"], None, 0.51),
         m("minimax-m3", "MiniMax M3", 200_000, 64_000, false, &["low", "medium", "high"], None, 0.25),
-        m("qwen3.8-max", "Qwen3.8 Max", 262_000, 64_000, true, &["low", "medium", "high"], None, 0.85),
+        m("qwen3.8-max", "Qwen3.8 Max", 262_000, 64_000, true, &["low", "medium", "high"], None, 1.50),
         m("qwen-3.7-plus", "Qwen 3.7 Plus", 131_000, 32_000, false, &["low", "medium", "high"], None, 0.25),
     ]
 }
@@ -130,7 +131,7 @@ pub fn catalog_path(data_dir: &Path) -> PathBuf {
 /// builtin_rev 低于当前值）会按新内置表重建，使倍率修正对存量安装生效；
 /// 上游同步写入的目录（fetched_at 非空）不受影响。人工维护的目录请把 builtin_rev
 /// 手工改为当前值以退出重建。
-pub const BUILTIN_REV: u32 = 3;
+pub const BUILTIN_REV: u32 = 4;
 
 /// 目录文件结构（支持上游动态替换后的全量覆盖）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
