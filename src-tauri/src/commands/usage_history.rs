@@ -392,7 +392,7 @@ mod tests {
             panic!("timestamp out of range");
         };
         let date = dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string();
-        let mut agg = BTreeMap::new();
+        let mut agg: BTreeMap<String, UsageDayStat> = BTreeMap::new();
         let e = agg.entry(date.clone()).or_default();
         e.date = date.clone();
         e.credits += 1.5;
