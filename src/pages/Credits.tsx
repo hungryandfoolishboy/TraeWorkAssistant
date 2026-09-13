@@ -163,12 +163,13 @@ export default function Credits() {
     return 0;
   }, [creditsDaily, creditsHistory, today]);
 
-  // 消耗明细按日合计（跨账号）
+  // 消耗明细按日合计（跨账号）；键统一为紧凑日期（YYYYMMDD），与区间日期格式无关
   const usageMap = useMemo(() => {
     const m = new Map<string, number>();
     for (const a of usage?.accounts ?? []) {
       for (const d of a.daily) {
-        m.set(d.date, (m.get(d.date) ?? 0) + d.credits);
+        const key = d.date.slice(0, 10).replace(/-/g, '');
+        m.set(key, (m.get(key) ?? 0) + d.credits);
       }
     }
     return m;
@@ -217,10 +218,23 @@ export default function Credits() {
             : `${+date.slice(5, 7)}/${+date.slice(8, 10)}`,
         total: snap?.total ?? null,
         earned: snap?.earned ?? null,
-        consumed: usageMap.get(date) ?? null,
+        consumed: usageMap.get(date.replace(/-/g, '')) ?? null,
       };
     });
   }, [range, creditsDaily, usageMap]);
+
+  // 明细诊断：定位「折线/柱状图不显示」断点（账号数 → 明细天数 → 覆盖范围 → 区间命中）
+  const usageDiag = useMemo(() => {
+    const all = (usage?.accounts ?? []).flatMap((a) => a.daily);
+    const sorted = all.map((d) => d.date).sort();
+    return {
+      accCount: usage?.accounts.length ?? 0,
+      dayCount: all.length,
+      first: sorted[0] ?? '—',
+      last: sorted.at(-1) ?? '—',
+      hits: trend.filter((d) => d.consumed != null).length,
+    };
+  }, [usage, trend]);
 
   const hasTrend = trend.some(
     (d) => d.total != null || d.earned != null || d.consumed != null,
@@ -435,6 +449,9 @@ export default function Credits() {
                 消耗线暂无数据：首次点击「更新消耗明细」将全量拉取近一年历史，之后每次仅增量拉取。
               </div>
             )}
+            <div className="mt-2 text-[11px] text-slate-300 dark:text-zinc-600">
+              [明细诊断] 账号 {usageDiag.accCount} · 明细 {usageDiag.dayCount} 条（{usageDiag.first} ~ {usageDiag.last}）· 区间命中 {usageDiag.hits}/{trend.length}
+            </div>
           </>
         )}
       </div>
