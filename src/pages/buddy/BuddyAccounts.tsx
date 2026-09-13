@@ -19,7 +19,6 @@ import {
   Coins,
   Users,
   AppWindow,
-  MonitorCheck,
   History,
 } from 'lucide-react';
 import { createPortal } from 'react-dom';
@@ -119,8 +118,9 @@ export default function BuddyAccounts() {
   const [resetResults, setResetResults] = useState<WbResetResult[] | null>(null);
   // CodeBuddy CLI 当前号（settings.json token → 池 id），列表内徽标展示
   const [cliActiveId, setCliActiveId] = useState<string | null>(null);
-  // CodeBuddy 桌面端当前登录 uid（env check 失败静默，仅影响「CodeBuddy在线」徽标展示）
-  const [cbUid, setCbUid] = useState<string | null>(null);
+  // 审查修复：移除 cbUid（codebuddyEnvCheck 读共享 auth 文件，信号跟随 WorkBuddy 登录，
+  // 对 CodeBuddy 桌面端是失真信号）——CodeBuddy 端当前账号改由 is_current_codebuddy
+  //（桥 current_account.txt 标记）驱动 CB当前 徽标
   // 双应用切换/保存菜单（复刻 Trae Accounts appMenu）：{ id, kind } —— kind='switch' 切换登录态 / 'save' 保存登录态
   const [appMenu, setAppMenu] = useState<{ id: string; kind: 'switch' | 'save'; x: number; y: number } | null>(null);
   // 行内异步操作互斥（凭证续期 / CLI 桥接 / 会话备份）：执行期间该行异步按钮禁用 + spinner
@@ -173,11 +173,6 @@ export default function BuddyAccounts() {
         .cliStatus()
         .then((s) => setCliActiveId(s.active_account_id))
         .catch(() => setCliActiveId(null));
-      // CodeBuddy 桌面端当前登录 uid（失败静默为纯状态复位置空：仅影响「CodeBuddy在线」徽标展示，不阻断列表）
-      api.env
-        .codebuddyEnvCheck()
-        .then((c) => setCbUid(c.uid))
-        .catch(() => setCbUid(null));
       // 积分缓存查询（≥5min 缓存，失败不阻断列表展示）
       api.workbuddy
         .creditsFetch()
@@ -764,24 +759,46 @@ export default function BuddyAccounts() {
                       })()}
                     </td>
                     <td className="px-4 py-3">
-                      <div className="flex items-center gap-1">
-                        {a.is_current ? (
-                          <Badge tone="green">在线</Badge>
-                        ) : a.needs_relogin ? (
-                          <Badge tone="red">需重登</Badge>
-                        ) : (
-                          <Badge tone="slate">备用</Badge>
-                        )}
-                        {cbUid != null && cbUid === a.uid && (
-                          <Badge tone="violet" title="CodeBuddy 桌面端当前登录此账号（与 WorkBuddy 在线相互独立）">
-                            <MonitorCheck size={12} /> CodeBuddy在线
-                          </Badge>
-                        )}
-                        {cliActiveId === a.id && (
-                          <Badge tone="blue" title="CodeBuddy CLI 当前账号（~/.codebuddy/settings.json）">
-                            <TerminalSquare size={12} /> CodeBuddy
-                          </Badge>
-                        )}
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-1">
+                          {a.is_current ? (
+                            <Badge tone="green">在线</Badge>
+                          ) : a.needs_relogin ? (
+                            <Badge tone="red">需重登</Badge>
+                          ) : (
+                            <Badge tone="slate">备用</Badge>
+                          )}
+                          {a.is_current_workbuddy && (
+                            <Badge tone="green" title="WorkBuddy 端当前账号（切换桥标记，与 CodeBuddy 端相互独立）">
+                              WB当前
+                            </Badge>
+                          )}
+                          {a.is_current_codebuddy && (
+                            <Badge tone="violet" title="CodeBuddy 端当前账号（切换桥标记，与 WorkBuddy 端相互独立）">
+                              CB当前
+                            </Badge>
+                          )}
+                          {cliActiveId === a.id && (
+                            <Badge tone="blue" title="CodeBuddy CLI 当前账号（~/.codebuddy/settings.json）">
+                              <TerminalSquare size={12} /> CodeBuddy
+                            </Badge>
+                          )}
+                        </div>
+                        {/* F2-2 双端登录态快照分端展示：一份账号池，两套快照槽 */}
+                        <div className="flex items-center gap-1.5 text-[11px] text-slate-400 dark:text-zinc-500">
+                          <span
+                            className={a.has_snapshot ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-300 dark:text-zinc-600'}
+                            title="WorkBuddy 登录态快照（profiles_workbuddy）"
+                          >
+                            WB{a.has_snapshot ? '快照✓' : '快照—'}
+                          </span>
+                          <span
+                            className={a.has_snapshot_codebuddy ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-300 dark:text-zinc-600'}
+                            title="CodeBuddy 登录态快照（profiles_codebuddy，含 vscdb 登录真源）"
+                          >
+                            CB{a.has_snapshot_codebuddy ? '快照✓' : '快照—'}
+                          </span>
+                        </div>
                       </div>
                     </td>
                     <td className="px-4 py-3">

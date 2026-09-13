@@ -715,6 +715,12 @@ export interface WorkBuddyAccountView {
   is_current: boolean;
   has_credential: boolean;
   has_snapshot: boolean;
+  /** 已录 CodeBuddy 快照（profiles_codebuddy/<id>/）——双端登录态分端展示 */
+  has_snapshot_codebuddy: boolean;
+  /** WorkBuddy 端当前账号（桥按端写入的 current_account.txt 标记） */
+  is_current_workbuddy: boolean;
+  /** CodeBuddy 端当前账号（桥按端写入的 current_account.txt 标记） */
+  is_current_codebuddy: boolean;
 }
 
 export interface WorkBuddyEnvCheck {

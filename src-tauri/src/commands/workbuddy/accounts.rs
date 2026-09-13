@@ -39,6 +39,12 @@ pub struct WorkBuddyAccountView {
     pub has_credential: bool,
     /// 已录快照（PS 桥 profiles_workbuddy/<id>/）
     pub has_snapshot: bool,
+    /// F2-2 已录 CodeBuddy 快照（profiles_codebuddy/<id>/）——双端登录态分端展示
+    pub has_snapshot_codebuddy: bool,
+    /// F2-2 WorkBuddy 端当前账号（桥 profiles_workbuddy/current_account.txt 标记）
+    pub is_current_workbuddy: bool,
+    /// F2-2 CodeBuddy 端当前账号（桥 profiles_codebuddy/current_account.txt 标记）
+    pub is_current_codebuddy: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -130,6 +136,10 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
         if raw.is_object() { as_str(fs_utils::dig(&raw, &["uid"])) } else { None }
     };
     let snap_path = state.data_dir.join("data").join("profiles_workbuddy");
+    // F2-2：CodeBuddy 快照目录 + 双端"当前账号"标记（桥按端写入 <profiles>/current_account.txt）
+    let snap_cb_path = state.data_dir.join("data").join("profiles_codebuddy");
+    let cur_wb = read_current_account_marker(&snap_path);
+    let cur_cb = read_current_account_marker(&snap_cb_path);
     let store: serde_json::Value = fs_utils::read_json(&token_store_path(state));
     let store_tokens = store.get("tokens").cloned().unwrap_or(serde_json::Value::Null);
 
@@ -158,6 +168,9 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                 is_current: auth_uid.is_some() && auth_uid == Some(a.uid.clone()),
                 has_credential: has_cred,
                 has_snapshot: has_snapshot,
+                has_snapshot_codebuddy: snap_cb_path.join(&a.id).is_dir(),
+                is_current_workbuddy: cur_wb.as_deref() == Some(a.id.as_str()),
+                is_current_codebuddy: cur_cb.as_deref() == Some(a.id.as_str()),
             }
         })
         .collect();
@@ -194,9 +207,15 @@ pub fn workbuddy_account_remove(state: State<AppState>, user_id: String, delete_
     }
     save_pool(&state, &pool)?;
     if delete_snapshot.unwrap_or(false) {
+        // F2-2：双端快照槽对称清理——只清 WorkBuddy 会留下 CodeBuddy 孤儿槽，
+        // 且账号列表徽标虽随池删除消失，孤儿目录持续占用磁盘。
         let slot = state.data_dir.join("data").join("profiles_workbuddy").join(&user_id);
         if slot.is_dir() {
             let _ = std::fs::remove_dir_all(&slot);
+        }
+        let slot_cb = state.data_dir.join("data").join("profiles_codebuddy").join(&user_id);
+        if slot_cb.is_dir() {
+            let _ = std::fs::remove_dir_all(&slot_cb);
         }
     }
     // 被删账号是 CodeBuddy CLI 当前号 → 清理轮换状态残留（active_account_id），
@@ -250,6 +269,34 @@ pub(super) fn find_uid_or_id<'a>(pool: &'a mut WbPool, uid: &str, id: &str) -> O
     pool.accounts
         .iter_mut()
         .find(|a| (!uid.is_empty() && a.uid == uid) || (!id.is_empty() && a.id == id))
+}
+
+/// F2-2：读桥按端写入的当前账号标记（<profiles_workbuddy|profiles_codebuddy>/current_account.txt）。
+/// 文件不存在/空 → None（该端从未切换过）。
+/// 注意剥 BOM：桥（Windows PowerShell 5.1）Set-Content -Encoding UTF8 写出带 BOM，
+/// 而 U+FEFF 不属于 Rust trim() 的空白字符，不剥则标记永远匹配失败。
+fn read_current_account_marker(dir: &std::path::Path) -> Option<String> {
+    let s = std::fs::read_to_string(dir.join("current_account.txt")).ok()?;
+    let t = s.trim().trim_start_matches('\u{feff}').trim().to_string();
+    if t.is_empty() { None } else { Some(t) }
+}
+
+/// F1-3（switch.rs 防误覆盖守卫用）：读共享 auth 文件当前 uid → 账号池中反查账号 id。
+/// 返回的 id 与桥的 current_account.txt 同命名空间，供 -ExpectedCurrentUid 比对；
+/// None = 未登录 / 池中无此账号（调用方 fail-open 传空串，不阻断切换）。
+/// 注意：auth 文件是两端共同的"最近写入者"信号——WorkBuddy（auth 驱动）准确；
+/// CodeBuddy（vscdb 驱动）被 WorkBuddy 覆盖时反查失败 → None，守卫按既定语义跳过回写。
+pub fn pool_account_id_by_auth_uid(state: &AppState) -> Option<String> {
+    let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(state));
+    if !raw.is_object() {
+        return None;
+    }
+    let uid = as_str(fs_utils::dig(&raw, &["uid"]))?;
+    if uid.is_empty() {
+        return None;
+    }
+    let pool = load_pool(state);
+    pool.accounts.iter().find(|a| a.uid == uid).map(|a| a.id.clone())
 }
 
 /// auth 文件导入的池合并输入（从 auth 文件解析出的可覆盖字段集合）

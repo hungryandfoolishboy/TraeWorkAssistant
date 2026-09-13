@@ -88,6 +88,13 @@ pub fn switch_account(
         // vscdb/storage 同步读取在工作线程执行，不冻结 UI
         let kind = target_app.as_deref().unwrap_or("TraeWork");
         crate::commands::trae_apps::infer_current_cloud_uid(kind).unwrap_or_default()
+    } else if matches!(target_app.as_deref(), Some("WorkBuddy") | Some("CodeBuddy")) {
+        // F1-3 authfile 布局（WorkBuddy/CodeBuddy）切换守卫：此前恒为空串（fail-open），
+        // 桥的防误覆盖守卫永不通过 → 当前账号槽位永远不被回写，客户端内手动换号即丢失
+        //（switcher.log 实证：每次切换都出现"与标记账号不一致，已跳过回写"）。
+        // 现以共享 auth 文件当前 uid 在账号池反查账号 id 填充（与桥的 current_account.txt
+        // 同命名空间）；反查失败 → 空串 fail-open 不阻断。
+        crate::commands::workbuddy::pool_account_id_by_auth_uid(&state).unwrap_or_default()
     } else {
         String::new()
     };
