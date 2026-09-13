@@ -88,12 +88,21 @@ fn cache_path(state: &AppState) -> std::path::PathBuf {
 }
 
 fn account_summary(name: String, uid: String, daily: &BTreeMap<String, UsageDayStat>) -> UsageHistoryAccount {
+    // 防御：date 一律从映射键回填（旧缓存条目的 date 字段可能为空串）
+    let daily = daily
+        .iter()
+        .map(|(k, v)| {
+            let mut d = v.clone();
+            d.date = k.clone();
+            d
+        })
+        .collect();
     UsageHistoryAccount {
         user_id: uid,
         name,
         ok: true,
         error: None,
-        daily: daily.values().cloned().collect(),
+        daily,
     }
 }
 
@@ -225,7 +234,8 @@ fn fetch_chunk(
                 .filter(|m| !m.is_empty())
                 .unwrap_or("未知模型")
                 .to_string();
-            let e = agg.entry(date).or_default();
+            let e = agg.entry(date.clone()).or_default();
+            e.date = date;
             e.credits += credits;
             e.sessions += 1;
             *e.models.entry(model).or_insert(0.0) += credits;
@@ -367,4 +377,31 @@ pub fn usage_history_fetch(
         cached: false,
         accounts: out,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：聚合产物的 date 字段必须写入（此前仅存于映射键，响应 daily.date 恒为空串，
+    /// 导致前端区间匹配全部失败、消耗折线/模型柱状图不显示）
+    #[test]
+    fn aggregated_day_stat_carries_date() {
+        let ts = 1_789_009_361i64; // 2026-09-10（+8）
+        let Some(dt) = chrono::DateTime::from_timestamp(ts, 0) else {
+            panic!("timestamp out of range");
+        };
+        let date = dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string();
+        let mut agg = BTreeMap::new();
+        let e = agg.entry(date.clone()).or_default();
+        e.date = date.clone();
+        e.credits += 1.5;
+        // account_summary 从映射键回填 date（含旧缓存 date 字段为空的条目）
+        let mut legacy = BTreeMap::new();
+        legacy.insert("2026-09-11".to_string(), UsageDayStat::default());
+        let acc = account_summary("n".into(), "u".into(), &legacy);
+        assert_eq!(acc.daily.len(), 1);
+        assert_eq!(acc.daily[0].date, "2026-09-11");
+        assert_eq!(agg[&date].date, date);
+    }
 }
