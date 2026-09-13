@@ -223,19 +223,6 @@ export default function Credits() {
     });
   }, [range, creditsDaily, usageMap]);
 
-  // 明细诊断：定位「折线/柱状图不显示」断点（账号数 → 明细天数 → 覆盖范围 → 区间命中）
-  const usageDiag = useMemo(() => {
-    const all = (usage?.accounts ?? []).flatMap((a) => a.daily);
-    const sorted = all.map((d) => d.date).sort();
-    return {
-      accCount: usage?.accounts.length ?? 0,
-      dayCount: all.length,
-      first: sorted[0] ?? '—',
-      last: sorted[sorted.length - 1] ?? '—',
-      hits: trend.filter((d) => d.consumed != null).length,
-    };
-  }, [usage, trend]);
-
   const hasTrend = trend.some(
     (d) => d.total != null || d.earned != null || d.consumed != null,
   );
@@ -449,9 +436,6 @@ export default function Credits() {
                 消耗线暂无数据：首次点击「更新消耗明细」将全量拉取近一年历史，之后每次仅增量拉取。
               </div>
             )}
-            <div className="mt-2 text-[11px] text-slate-300 dark:text-zinc-600">
-              [明细诊断] 账号 {usageDiag.accCount} · 明细 {usageDiag.dayCount} 条（{usageDiag.first} ~ {usageDiag.last}）· 区间命中 {usageDiag.hits}/{trend.length}
-            </div>
           </>
         )}
       </div>
