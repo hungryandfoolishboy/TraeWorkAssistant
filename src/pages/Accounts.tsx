@@ -50,6 +50,8 @@ import { ProfileModal } from './accounts/SnapshotModal';
 export default function Accounts() {
   const accounts = useAppStore((s) => s.accounts);
   const groups = useAppStore((s) => s.groups);
+  const localEntitlement = useAppStore((s) => s.localEntitlement);
+  const refreshLocalEntitlement = useAppStore((s) => s.refreshLocalEntitlement);
   const refreshAccounts = useAppStore((s) => s.refreshAccounts);
   const refreshGroups = useAppStore((s) => s.refreshGroups);
   const addAccount = useAppStore((s) => s.addAccount);
@@ -176,7 +178,8 @@ export default function Accounts() {
   useEffect(() => {
     void refreshAccounts();
     void refreshGroups();
-  }, [refreshAccounts, refreshGroups]);
+    void refreshLocalEntitlement();
+  }, [refreshAccounts, refreshGroups, refreshLocalEntitlement]);
 
   const onDelete = async (a: AccountView) => {
     setDeleteTarget(a);
@@ -300,7 +303,7 @@ export default function Accounts() {
     <div className="animate-fade-in">
       <PageHeader
         title="Trae · 账号管理"
-        desc="维护账号、调整分组、重置设备 ID 与登录态切换"
+        desc="账号入池与分组管理 · 登录态切换 / JWT 续期 · 标记客户端当前登录账号"
         leftExtra={
           <button
             onClick={() => setHelpOpen(true)}
@@ -408,6 +411,17 @@ export default function Accounts() {
                           expire={a.membership_expire}
                           nextBilling={a.membership_next_billing}
                         />
+                        {/* 客户端当前登录标记：本机 storage.json/vscdb 推导的登录 uid 与账号池匹配 */}
+                        {a.user_id && a.user_id === localEntitlement?.work?.uid && (
+                          <Badge tone="green" title="当前 Trae Work 客户端登录的账号">
+                            Trae Work 登录中
+                          </Badge>
+                        )}
+                        {a.user_id && a.user_id === localEntitlement?.cn?.uid && (
+                          <Badge tone="brand" title="当前 Trae 客户端登录的账号">
+                            Trae 登录中
+                          </Badge>
+                        )}
                       </div>
                       <div className="text-xs text-slate-400">{a.user_id}</div>
                     </td>

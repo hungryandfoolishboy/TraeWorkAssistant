@@ -139,6 +139,10 @@ export interface DiscoveredAccount {
 export interface AppEntitlement {
   app: string;
   app_label: string;
+  /** 当前登录账号的 Cloud-IDE uid（本机使用证据推导；未登录/推导失败为 null） */
+  uid?: string | null;
+  /** 账号池中匹配的展示名（未入池/未匹配为 null） */
+  account_name?: string | null;
   identity_str: string | null;
   identity: number | null;
   last_sync_time: number | null;

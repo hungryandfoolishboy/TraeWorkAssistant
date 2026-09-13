@@ -506,6 +506,10 @@ pub struct AppEntitlement {
     pub app: String,
     /// 展示名
     pub app_label: String,
+    /// 当前登录账号的 Cloud-IDE uid（本机使用证据推导；未登录/推导失败为 null）
+    pub uid: Option<String>,
+    /// 账号池中匹配的展示名（未入池/未匹配为 null）
+    pub account_name: Option<String>,
     /// 套餐名（Free / Lite / Pro ...）
     pub identity_str: Option<String>,
     /// 套餐数值（0=Free, 5=Lite ...）
@@ -538,21 +542,47 @@ fn parse_entitlement(kind: &str, storage: &serde_json::Value) -> Option<AppEntit
             .get("serverTimeInfo")
             .and_then(|s| s.get("lastSyncTime"))
             .and_then(|v| v.as_i64()),
+        ..Default::default()
     })
 }
 
-/// 读取本机两个 Trae 应用当前登录账号的套餐信息（零 API，来自 storage.json 明文缓存）。
-#[tauri::command]
-pub fn apps_entitlement_read() -> LocalEntitlement {
-    let mut work = None;
-    let mut cn = None;
-    if let Some(storage) = read_storage_json("TraeWork") {
-        work = parse_entitlement("TraeWork", &storage);
-    }
-    if let Some(storage) = read_storage_json("Trae") {
-        cn = parse_entitlement("Trae", &storage);
-    }
-    LocalEntitlement { work, cn }
+/// 账号池中按 uid 反查展示名：user_id 直配，或 JWT data.id 匹配（对齐 pool_uid_set 语义）。
+fn pool_name_for(accounts: &crate::models::AccountsFile, uid: &str) -> Option<String> {
+    accounts.accounts.iter().find_map(|a| {
+        let matched = a.user_id.as_deref() == Some(uid)
+            || (!a.jwt.trim().is_empty()
+                && crate::jwt::parse(&a.jwt).user_id.as_deref() == Some(uid));
+        matched.then(|| a.name.clone())
+    })
+}
+
+/// 单应用的当前登录信息 + 套餐：登录信息（uid/账号名）来自本机使用证据推导，
+/// 套餐来自 storage.json 明文缓存；套餐解析失败不影响登录信息展示。
+fn app_login(kind: &str, accounts: &crate::models::AccountsFile) -> Option<AppEntitlement> {
+    let storage = read_storage_json(kind)?;
+    let uid = infer_cloud_uid(kind, &storage);
+    let account_name = uid.as_deref().and_then(|u| pool_name_for(accounts, u));
+    let ent = parse_entitlement(kind, &storage);
+    Some(AppEntitlement {
+        app: kind.to_string(),
+        app_label: app_label(kind).to_string(),
+        uid,
+        account_name,
+        identity_str: ent.as_ref().and_then(|e| e.identity_str.clone()),
+        identity: ent.as_ref().and_then(|e| e.identity),
+        last_sync_time: ent.as_ref().and_then(|e| e.last_sync_time),
+    })
+}
+
+/// 读取本机两个 Trae 应用当前登录账号（uid + 账号池展示名）与套餐信息。
+/// async 派发：Trae Work 登录推导需全表读取 state.vscdb（可达数十 MB），同步会冻住 UI。
+#[tauri::command(async)]
+pub fn apps_entitlement_read(state: State<AppState>) -> Result<LocalEntitlement, String> {
+    let accounts = crate::vault::load_accounts(&state);
+    Ok(LocalEntitlement {
+        work: app_login("TraeWork", &accounts),
+        cn: app_login("Trae", &accounts),
+    })
 }
 
 // ---------------- 账号级套餐（API） ----------------

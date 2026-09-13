@@ -34,14 +34,6 @@ struct Totals {
 }
 
 impl Totals {
-    fn add(&mut self, usage: Usage) {
-        self.usage.input = self.usage.input.saturating_add(usage.input);
-        self.usage.output = self.usage.output.saturating_add(usage.output);
-        self.usage.read = self.usage.read.saturating_add(usage.read);
-        self.usage.write = self.usage.write.saturating_add(usage.write);
-        self.calls = self.calls.saturating_add(1);
-    }
-
     /// 增量缓存路径：按日聚合（含调用次数）累加
     fn add_day(&mut self, d: &DayTotals) {
         let t = d.to_totals();

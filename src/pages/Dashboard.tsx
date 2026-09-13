@@ -116,6 +116,16 @@ export default function Dashboard() {
     void refreshLocalEntitlement();
   }, [refreshLocalEntitlement]);
 
+  // 当前登录账号（账号池匹配名）：本机使用证据推导 uid → 反查账号池
+  const workLogin = localEntitlement?.work?.account_name ?? null;
+  const cnLogin = localEntitlement?.cn?.account_name ?? null;
+  // 告警提醒：JWT 24h 内将过期 + 积分 7 日内将过期（含已过期）的账号数
+  const nowSec = Math.floor(Date.now() / 1000);
+  const creditWarned = accounts.filter(
+    (a) => a.credits_expire_at != null && a.credits_expire_at <= nowSec + 7 * 86400,
+  ).length;
+  const alertCount = warned + creditWarned;
+
   const openTrae = async () => {
     await useAppStore.getState().openTraeWithProxy();
   };
@@ -124,7 +134,7 @@ export default function Dashboard() {
     <div className="animate-fade-in">
       <PageHeader
         title="Trae · 概览"
-        desc="多账号签到与账号管理一站式工作台 · 一眼掌握状态与快捷入口"
+        desc="多账号签到与账号管理总览 · 登录账号 / 套餐 / 告警提醒 · 签到趋势与积分榜"
         actions={
           <button onClick={refresh} className="btn-outline">
             <RefreshCw size={15} /> 刷新
@@ -137,26 +147,20 @@ export default function Dashboard() {
         <StatCard label="可用总积分" value={totalCredits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint={creditsHint} tone="amber" />
         <StatCard
           label="登录账号"
-          value={localEntitlement?.work?.identity_str ?? (env?.installed ? '未登录' : '未安装')}
+          value={
+            workLogin ?? cnLogin ?? (env?.installed || envCn?.installed ? '未登录' : '未安装')
+          }
           hint={
             [
-              env?.running ? 'Trae Work 运行中' : env?.installed ? 'Trae Work 未运行' : null,
-              localEntitlement?.cn?.identity_str
-                ? `Trae：${localEntitlement.cn.identity_str}`
-                : envCn?.installed
-                  ? 'Trae 未登录'
-                  : null,
+              env?.installed || localEntitlement?.work
+                ? `Trae Work：${workLogin ?? '未登录'}`
+                : null,
+              envCn?.installed || localEntitlement?.cn ? `Trae：${cnLogin ?? '未登录'}` : null,
             ]
               .filter(Boolean)
               .join(' · ') || undefined
           }
           tone="violet"
-        />
-        <StatCard
-          label="JWT 告警"
-          value={warned}
-          hint="24h 内将过期"
-          tone={warned > 0 ? 'red' : 'slate'}
         />
         <StatCard
           label="本机套餐"
@@ -165,6 +169,12 @@ export default function Dashboard() {
           }
           hint={entHint}
           tone="violet"
+        />
+        <StatCard
+          label="告警提醒"
+          value={alertCount}
+          hint={`JWT 24h 内过期 ${warned} · 积分 7 日内过期 ${creditWarned}`}
+          tone={alertCount > 0 ? 'red' : 'slate'}
         />
       </div>
 

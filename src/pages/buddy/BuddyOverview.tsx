@@ -20,6 +20,7 @@ import { useAppStore } from '../../store';
 import { useIsDark } from '../../lib/useIsDark';
 import type {
   ViewKey,
+  CodeBuddyEnvCheck,
   WorkBuddyEnvCheck,
   WorkBuddyAccountView,
   WbCreditsResult,
@@ -76,6 +77,7 @@ export default function BuddyOverview() {
   const setView = useAppStore((s) => s.setView);
   const isDark = useIsDark();
   const [env, setEnv] = useState<WorkBuddyEnvCheck | null>(null);
+  const [codebuddyEnv, setCodebuddyEnv] = useState<CodeBuddyEnvCheck | null>(null);
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [credits, setCredits] = useState<WbCreditsResult | null>(null);
   const [activity, setActivity] = useState<WbActivityInfo | null>(null);
@@ -102,6 +104,10 @@ export default function BuddyOverview() {
         .activityInfo()
         .then(setActivity)
         .catch(() => setActivity(null));
+      api.env
+        .codebuddyEnvCheck()
+        .then(setCodebuddyEnv)
+        .catch(() => setCodebuddyEnv(null));
       api.workbuddy
         .cliStatus()
         .then((s) => setCliBridged(s.env_token_present))
@@ -121,7 +127,6 @@ export default function BuddyOverview() {
   const total = accounts.length;
   const totalBalance = credits?.accounts.reduce((s, a) => s + (a.balance ?? 0), 0) ?? null;
   const okAccounts = credits?.accounts.filter((a) => a.ok).length ?? 0;
-  const pkgCount = credits?.accounts.reduce((s, a) => s + (a.packages?.length ?? 0), 0) ?? 0;
   // 今日签到账号数（今日记录去重 user_id）
   const today = new Date().toLocaleDateString('sv-SE');
   const checkedToday = useMemo(
@@ -130,6 +135,28 @@ export default function BuddyOverview() {
   );
 
   const trends = useMemo(() => aggregateTrends(records), [records]);
+
+  // 登录账号 / 本机套餐：客户端当前生效登录（auth 文件在线判定优先，快照/环境检测兜底）
+  const wbAccount = accounts.find((a) => a.is_current) ?? null;
+  const wbLoginName = wbAccount?.nickname || env?.snapshot_nickname || null;
+  const wbPlan = wbAccount?.edition_type || env?.snapshot_edition || null;
+  const cbAccount = accounts.find((a) => a.is_current_codebuddy) ?? null;
+  const cbLoginName = cbAccount?.nickname || codebuddyEnv?.nickname || null;
+  const cbPlan = cbAccount?.edition_type || null;
+  // 告警提醒：Token 24h 内将过期（含已过期）账号数 + 积分包 7 日内将过期包数（仍有剩余）
+  const nowSec = Math.floor(Date.now() / 1000);
+  const tokenSoon = accounts.filter(
+    (a) => a.access_token_expires_at != null && a.access_token_expires_at <= nowSec + 86400,
+  ).length;
+  const pkgSoon = (credits?.accounts ?? []).reduce(
+    (n, acc) =>
+      n +
+      (acc.packages ?? []).filter(
+        (p) => p.expire_ts != null && p.expire_ts <= nowSec + 7 * 86400 && p.remaining > 0,
+      ).length,
+    0,
+  );
+  const alertCount = tokenSoon + pkgSoon;
 
   // 积分榜 Top（按余额降序，参考 Trae 概述）
   const top = useMemo(
@@ -215,7 +242,7 @@ export default function BuddyOverview() {
     <div className="animate-fade-in">
       <PageHeader
         title="Buddy · 概述"
-        desc="WorkBuddy / CodeBuddy 多账号管理 · 切换 / 续期 / 签到 / 积分"
+        desc="WorkBuddy / CodeBuddy 运行总览 · 登录账号 / 套餐 / 告警提醒 · 签到趋势与积分榜"
         actions={
           <button onClick={() => void refresh()} className="btn-outline" disabled={refreshing}>
             <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
@@ -224,7 +251,7 @@ export default function BuddyOverview() {
       />
 
       {/* 顶部统计卡（对齐 Trae 概述：数值一眼掌握） */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
         <StatCard
           label="账号总数"
           value={total}
@@ -238,16 +265,24 @@ export default function BuddyOverview() {
           tone="amber"
         />
         <StatCard
-          label="积分包"
-          value={String(pkgCount)}
-          hint={pkgCount > 0 ? '明细见积分看板' : '暂无积分包数据'}
+          label="登录账号"
+          value={wbLoginName ?? cbLoginName ?? (env?.installed ? '未登录' : '未检测到')}
+          hint={
+            [`WorkBuddy：${wbLoginName ?? '未登录'}`, `CodeBuddy：${cbLoginName ?? '未登录'}`].join(' · ')
+          }
           tone="violet"
         />
         <StatCard
-          label="客户端"
-          value={env?.running ? '运行中' : env?.installed ? '已停止' : '未检测到'}
-          hint={env?.version ? `v${env.version}` : '环境详情见环境配置'}
-          tone={env?.running ? 'green' : env?.installed ? 'slate' : 'amber'}
+          label="本机套餐"
+          value={wbPlan ?? cbPlan ?? '—'}
+          hint={[`WorkBuddy：${wbPlan ?? '—'}`, `CodeBuddy：${cbPlan ?? '—'}`].join(' · ')}
+          tone="violet"
+        />
+        <StatCard
+          label="告警提醒"
+          value={alertCount}
+          hint={`Token 24h 内过期 ${tokenSoon} · 积分包 7 日内过期 ${pkgSoon}`}
+          tone={alertCount > 0 ? 'red' : 'slate'}
         />
         <StatCard
           label="今日签到"
