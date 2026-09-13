@@ -4,7 +4,7 @@
 
 ---
 
-## [未发布] · feature/buddy 批次 5（生态吸收与网关增强，T5.2~T5.6/T5.8）
+## [3.4.5] · feature/buddy 批次 5（生态吸收与网关增强，T5.2~T5.6/T5.8）
 
 ### 新增
 
@@ -45,7 +45,7 @@
 
 ---
 
-## [未发布] · feature/buddy §2.2 非功能需求补齐 + 批次 1-4 九大类黑盒审查修复
+## [3.4.4] · feature/buddy §2.2 非功能需求补齐 + 批次 1-4 九大类黑盒审查修复
 
 ### Added
 - **健康检测（F-34 ④/§2.2 频控）**：API 网关启动即派健康探针线程——每 5min + 0-60s 抖动对 WB 上游 CN 主域名发无凭证轻量 GET（任何 HTTP 响应=在线，仅连接失败判不可达，零凭证暴露、单次单请求不重试）；结果经 `/status` 的 `wb.probe_ok`/`wb.probe_ts_ms` 透出（-1 未探测/0 不可达/1 在线）。
@@ -67,7 +67,7 @@
 
 ---
 
-## [未发布] · feature/buddy 批次 4（Codex 投影 + 区域路由 + 快照回退 + 活动展示 + UI 兜底）
+## [3.4.3] · feature/buddy 批次 4（Codex 投影 + 区域路由 + 快照回退 + 活动展示 + UI 兜底）
 
 ### 新增
 
@@ -87,7 +87,7 @@
 - 快照回退从本版起积累时序（需 ≥2 天快照），历史数据无法回溯推导
 - UI 坐标点击为 P3 兜底：分辨率/缩放/DPI 变化会使预存坐标失效，需重新取点
 
-## [未发布] · feature/buddy 批次 3（会话数据 + 用量 + CLI 桥 + 生态）
+## [3.4.2] · feature/buddy 批次 3（会话数据 + 用量 + CLI 桥 + 生态）
 
 ### 新增
 
@@ -110,7 +110,7 @@
 - 环境重置清理项基于 oss-research 实测清单 Rust 化重写（learn-the-design 不抄码）；对 state.vscdb / workbuddy.db 的 DELETE 均在客户端关闭后执行
 - 本地 Token 统计口径：input 已含缓存读取（供应商语义），总 Token = input + output + cache_write 不重复计 read；缓存命中率 = cache_read / input
 
-## [未发布] · feature/buddy 批次 2（API 暴露 + 成长中心）
+## [3.4.1] · feature/buddy 批次 2（API 暴露 + 成长中心）
 
 ### 新增
 
@@ -136,7 +136,7 @@
 - 会话粘性在 Buddy 上游的价值为会话一致性与上游侧缓存（若有）；代理流量 prompt cache 恒不命中（§5.5 #10），成本模型按无缓存估算
 - Codex /v1/responses 投影、DSH provider 动态目录同步、CC Switch 注册按设计文档归批次 3/4
 
-## [未发布] · feature/buddy 批次 1（WorkBuddy 接入快赢闭环）
+## [3.4.0] · feature/buddy 批次 1（WorkBuddy 接入快赢闭环）
 
 ### 新增
 
