@@ -1,7 +1,8 @@
 # 产品优化需求清单（全应用统一待办）
 
-> **文档版本**: v2.0 · 2026-09-13
+> **文档版本**: v2.1 · 2026-09-13
 > **定位**: 全项目**唯一待办依据**——所有未实施的优化与需求项均在此登记，每条含需求概述 / 实现路径 / 参考开源项目。
+> **v2.1 变更**: 新增 F-74（Buddy 切换时自动迁移会话到目标账号）——可行性分析结论：WorkBuddy 侧核心能力（F-44/F-45）已落地，仅缺切换编排与 CodeBuddy 会话域扩展；Trae 侧真迁移维持 §四已排除结论不变。
 > **v2.0 变更**: ① 合并删除五份分析文档——`docs/tmp/`（trae-account-switch-data-migration-analysis / doubao-api-feasibility / oss-ecosystem-value-analysis）、`work-credit-pool-design.md`（完整并入 §W-01）、`unified-api-gateway-design.md`（已实施，要点并入 tech-framework.md）；② WorkBuddy 蓝本（原 workbuddy-product-design.md）批次 1~5 已全部完成，其机会项 F-41/F-42/F-52/F-66 转入本文；③ 新增 F-67~F-73、E-01~E-03 共 10 项（源自上述分析文档中的未实现价值点）；④ 原 F-44（TRAE 多实例并行）改号 **F-67**，消除与 WorkBuddy 蓝本 F-44（会话备份，已完成）的编号冲突。
 > **原则**: 接口层独立模块 + 失败明示 + 不硬编码奖励数额；仅管理本人合法持有的账号；借鉴开源遵循 learn-the-design, write-our-own-code。
 
@@ -12,6 +13,7 @@
 | 编号 | 功能点 | 应用域 | 优先级 | 预估 | 状态 |
 |---|---|---|---|---|---|
 | F-68 | Trae 项目列表/最近打开跨账号保留 | Trae 生态 | **P1** | 1~2 天 | 待开发（方案已论证） |
+| F-74 | Buddy 切换时自动迁移会话到目标账号 | Buddy 生态 | **P2** | 2~3 天（含实测） | 待开发（核心能力已落地，仅缺编排） |
 | F-24-余 | 豆包会员额度端点抓包固化 | 豆包 | **P1** | 0.5~1 天（含抓包） | 框架已完成，仅剩前置 |
 | F-38 | Trae → DSH 引导（不自研） | Trae 生态 | **P1** | ≈0（装即用） | 待开发 |
 | E-01 | 豆包对话网关（OpenAI 兼容 doubao provider） | 豆包/网关 | **P2** | 8~12 天（含 E-02） | 待开发（方案 B 已论证，含探测实验前置） |
@@ -46,6 +48,22 @@
   3. 操作前对 `state.vscdb` 做一次性 `.bak` 备份，失败回滚；全程在 Trae 未运行窗口期执行（切换流程本就先关闭，天然满足）。
 - **参考开源项目**：无直接同类实现（自研分析）；SQLite 处理参照本项目 `doubao_chats.py` 既有模式。
 - **验收**：双账号各建若干项目后互切，项目列表与最近打开完整保留；账号分区键零改动。
+
+### F-74 Buddy 切换时自动迁移会话到目标账号（P2，核心能力已落地，仅缺编排）
+
+- **需求概述**：切换 WorkBuddy / CodeBuddy 账号 A→B 时，把 A 名下的 AI 会话历史自动迁移到 B 名下可见可续聊，免去手动「备份 A → 会话复制 A→B」两步操作。
+- **可行性结论**（2026-09-13 分析）：
+  - **WorkBuddy 侧高可行**——会话迁移核心能力已在 F-44/F-45 落地：会话三件套（正文 `~/.workbuddy/projects/{workspace}/{cid}.jsonl` + 元数据 `workbuddy.db` sessions 表 + 云端映射 `edge-sync-mapping-v2.db` 的 `convmsg:{uid}`）的备份（`workbuddy_chatdata_backup`）与跨账号复制（`workbuddy_chatdata_copy`：新 UUID 重写正文 → sessions 整行克隆 → edge 映射注册到目标账号）均已实现且有 UI 弹框。**本项只做切换编排，不动迁移算法**。
+  - **CodeBuddy 侧需先扩展**——`chatdata` 系列命令硬编码 `~/.workbuddy`，CodeBuddy 独立会话域 `~/.codebuddy/projects`（token 统计已扫描证实其存在）未覆盖。
+  - **Trae 侧不可行**——会话真迁移已被服务端 `user_id` 归属校验证伪（§四已排除项，"幽灵会话"），维持排除结论；Trae 侧诉求由 F-69 导出存档承接，本项不涉及。
+- **实现路径**：
+  1. **B2 CodeBuddy 会话域扩展（前置，~1 天）**：`chatdata` 三命令增加 `app: "workbuddy" | "codebuddy"` 参数（数据目录 `wb_data_dir()` 参数化，分别指向 `~/.workbuddy` / `~/.codebuddy`；备份根 `workbuddy_chats/` 与 `codebuddy_chats/` 分离），前端账号管理按目标应用传参；
+  2. **B1 切换编排（~1 天）**：设置项 `buddy_switch_migrate_chats`（默认关，设置页 Buddy 区）；`switch_account` 的 WorkBuddy/CodeBuddy 分支在**调桥之前**完成全部迁移动作——① `pool_account_id_by_auth_uid` 检测当前登录账号 id，与目标相同或检测失败则跳过；② 复用备份内部函数备份当前账号三件套（客户端关闭与切换桥天然同窗口，`graceful_kill` 幂等）；③ 立即执行 `chatdata_copy(当前, 目标)`（此时 live projects 即当前账号会话，copy 后 live 同时含 A 原件 + B 名下副本）；④ 迁移结果（N 个会话 / sessions 克隆 / 映射注册数）写入 `switch-progress` 事件流供进度页展示；
+  3. **时序关键点**：全部 db 操作必须在桥的 Stop→Restore→Start 窗口之前完成（copy 后桥重启客户端，B 登录态启动即可见迁移会话）；`chatdata_copy` 自带的 `graceful_kill` 在此场景幂等无害；
+  4. **实测验证步骤（含在预估内）**：双账号互切后确认 B 名下会话可见、可续聊、云端同步不报归属校验错误（edge 映射注册为客户端上传语义，若服务端校验会话归属则降级为"仅本地可见"并在 UI 明示——与 F-45 既有边界一致）。
+- **边界与风险**：`edge_sync_mapping` 为宽容发现（表结构随客户端版本浮动）；目标账号从未在本机登录过时 edge db 无 `convmsg:{target}` 行可克隆，映射注册数为 0（会话正文与 sessions 克隆仍生效，云端同步待 B 首次登录后补注册）——编排前检测并降级提示；`workbuddy.db` 双写冲突由 copy 的 `INSERT OR IGNORE` 兜底。
+- **参考开源项目**：无直接同类（自研能力编排）；迁移算法即本项目 F-45 实现。
+- **验收**：开启设置项后，WorkBuddy 从 A 切到 B，客户端启动即见 A 的全部会话（含可续聊）；A 原件不丢失；关闭设置项行为与现状完全一致；CodeBuddy 同流程可用。
 
 ### F-24-余 豆包会员额度端点抓包固化（P1，框架已完成）
 
@@ -227,6 +245,7 @@
 3. **F-38 DSH 引导页** —— 成本≈0，随手带上
 4. **E-01/E-02 豆包网关**（批次 0 探测先行）—— 8~12 天，豆包积分资产化主路径
 5. **W-01 Work 积分接入** —— 有实现可抄（solo_work_lite），未决项 1/3 与 F-67 共享多实例底座，建议 F-67 调研后并行
-6. **F-70 tc 凭证直读** —— 情报核对 0.5 天先行，解密落地 2~3 天
-7. F-69 / E-03 / F-41 / F-42 / F-66 —— 按需启动
-8. F-52 / F-71 / F-72 / F-73 —— 远期留档，随生态演进评估
+6. **F-74 Buddy 切换自动迁移会话** —— 核心算法已上线（F-45），编排 + CodeBuddy 域扩展 2~3 天
+7. **F-70 tc 凭证直读** —— 情报核对 0.5 天先行，解密落地 2~3 天
+8. F-69 / E-03 / F-41 / F-42 / F-66 —— 按需启动
+9. F-52 / F-71 / F-72 / F-73 —— 远期留档，随生态演进评估
