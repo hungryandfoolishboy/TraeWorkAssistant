@@ -68,13 +68,8 @@ try {
 $Script:AppDataDir = if ($env:AIWORKDATA_DIR) { $env:AIWORKDATA_DIR } else { "$env:APPDATA\AIWorkAssistant" }
 $Script:LogFile = "$Script:AppDataDir\logs\switcher.log"
 $Script:_TraeExeCache = $null
-# F2-1 进程解耦：对端进程"临时关闭→操作后自动拉回"登记表。
-# PeerRestartNames：本端切换/保存时需临时关闭（防 auth 文件污染）但完成后要恢复的对端进程名；
-# PeerExeCandidates：对端 exe 回退候选（运行中进程拿不到 Path 时用）；
-# StoppedPeerExes：Stop-Trae 实际关停的对端 exe 路径（Start-StoppedPeers 消费）。
-$Script:PeerRestartNames  = @()
-$Script:PeerExeCandidates = @()
-$Script:StoppedPeerExes   = @()
+# F2-3 双端解耦：WorkBuddy 与 CodeBuddy 切换/保存互不关停对方进程（对端登记/拉回
+# 机制 F2-1 已整体移除——实测 CodeBuddy 从不回写共享 auth 文件，无污染风险）。
 
 # ── 目标应用档案（F-48 表驱动）─────────────────────────────────────────────
 # icube 布局（TraeWork/Trae）：同为 icube 内核的 VSCode fork，登录态文件结构完全同构
@@ -131,19 +126,14 @@ switch ($TargetApp) {
         $Script:ProfilesDir     = "$Script:AppDataDir\data\profiles_workbuddy"
         $Script:SettingsPathKey = 'workbuddy_path'
         $Script:GracefulWaitSecs = 5
-        # auth 文件与 CodeBuddy 共用同一物理文件（CodeBuddyExtension 宿主目录，实测确认）。
-        # 两客户端同时运行时，在跑的一端会用内存中的旧登录回写 auth 文件，把刚恢复的
-        # 目标登录态覆盖掉（实测 2026-09-12：恢复后 3 秒 auth 被旧账号回写，切换"不生效"）。
-        # 因此 authfile 布局下切换/保存前必须同时关闭另一端（ProcNames 附带对端进程名；
-        # exe 缓存有 Test-ExeMatchesApp 校验，不会因此启动错应用）。
-        # F2-1 感知解耦：对端 CodeBuddy 仍需临时关闭（防其回写污染恢复中的 auth 文件），
-        # 但操作完成后由 Start-StoppedPeers 自动拉回，用户不再感知"切一个、另一个没了"。
-        $Script:ProcNames       = @('WorkBuddy', 'CodeBuddy', 'CodeBuddy CN')
-        $Script:PeerRestartNames = @('CodeBuddy', 'CodeBuddy CN')
-        $Script:PeerExeCandidates = @(
-            "$env:LOCALAPPDATA\Programs\CodeBuddy\CodeBuddy.exe",
-            "$env:LOCALAPPDATA\Programs\CodeBuddy CN\CodeBuddy CN.exe"
-        )
+        # F2-3 双端完全解耦：auth 文件虽与 CodeBuddy 共用同一物理文件（CodeBuddyExtension
+        # 宿主目录），但实测确认 CodeBuddy 从不回写共享 auth 文件——其登录真源在自身
+        # %APPDATA%\CodeBuddy CN\User\globalStorage\state.vscdb（vscdb 驱动，F1-2 切换
+        # 验证中 auth mtime 恒不变化、客户端启动也不重写 auth）。2026-09-12 观测到的
+        # "恢复后 3 秒 auth 被旧账号回写"实为 WorkBuddy 自身强杀后残留子进程的延迟落盘
+        # （Wait-AuthFileQuiet 等待静默已兜底），与 CodeBuddy 无关。因此切/存 WorkBuddy
+        # 不再关停 CodeBuddy，两端切换/保存完全独立（ProcNames 仅本端）。
+        $Script:ProcNames       = @('WorkBuddy')
         $Script:ExeNames        = @('WorkBuddy.exe')
         $Script:LnkPatterns     = @('*WorkBuddy*')
         $Script:RegPatterns     = @('*WorkBuddy*')
@@ -408,28 +398,6 @@ function Stop-Trae {
     $p = Get-Process -Name $Script:ProcNames -ErrorAction SilentlyContinue | Where-Object {
         $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
     }
-    # F2-1：关停前登记存活的对端进程及 exe 路径（操作完成后 Start-StoppedPeers 自动拉回）。
-    # exe 优先取运行中进程的 Path（最准确，含自定义安装位置），取不到再回退候选路径。
-    $Script:StoppedPeerExes = @()
-    if (@($Script:PeerRestartNames).Count -gt 0) {
-        $peers = Get-Process -Name $Script:PeerRestartNames -ErrorAction SilentlyContinue | Where-Object {
-            $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
-        }
-        foreach ($peer in @($peers)) {
-            if ($peer.Path -and (Test-Path $peer.Path)) {
-                $Script:StoppedPeerExes += $peer.Path
-            }
-        }
-        if (@($Script:StoppedPeerExes).Count -eq 0 -and @($peers).Count -gt 0) {
-            # 进程在跑但拿不到 Path（权限/已退出竞态）→ 用回退候选
-            foreach ($cand in $Script:PeerExeCandidates) {
-                if ($cand -and (Test-Path $cand)) { $Script:StoppedPeerExes += $cand }
-            }
-        }
-        if (@($Script:StoppedPeerExes).Count -gt 0) {
-            Write-Step -Stage 'stop' -Message "检测到对端应用运行中，将临时关闭并在操作完成后自动恢复" -Status 'info'
-        }
-    }
     if ($p) {
         Write-Step -Stage 'stop' -Message "正在关闭 $($Script:AppName)" -Status 'running'
         # 在关闭前缓存 exe 路径，供 Start-Trae 使用
@@ -502,30 +470,6 @@ function Start-Trae {
         Write-Step -Stage 'start' -Message "正在启动 $($Script:AppName): $exe" -Status 'running'
         Start-Process -FilePath $exe -WindowStyle Normal
     }
-}
-
-function Start-StoppedPeers {
-    # F2-1：拉回 Stop-Trae 临时关闭的对端应用。仅当对端当前确实不在运行才启动
-    # （防用户在操作期间手动启动/关闭造成重复拉起）；等待 2 秒让本端先完成启动
-    # 与登录态落盘，降低对端启动即回写 auth 文件的竞争窗口。
-    $peersToStart = @($Script:StoppedPeerExes | Select-Object -Unique)
-    if ($peersToStart.Count -eq 0) { return }
-    Start-Sleep -Seconds 2
-    $running = Get-Process -Name $Script:PeerRestartNames -ErrorAction SilentlyContinue
-    if ($running) {
-        Write-Step -Stage 'peer' -Message '对端应用已在运行，跳过自动恢复' -Status 'info'
-        return
-    }
-    foreach ($exe in $peersToStart) {
-        if (-not ($exe -and (Test-Path $exe))) { continue }
-        try {
-            Start-Process -FilePath $exe -WindowStyle Normal
-            Write-Step -Stage 'peer' -Message "对端应用已自动恢复运行: $exe" -Status 'info'
-        } catch {
-            Write-Step -Stage 'peer' -Message "对端应用恢复失败（请手动启动）: $_" -Status 'warn'
-        }
-    }
-    $Script:StoppedPeerExes = @()
 }
 
 function Reset-MachineId {
@@ -1192,11 +1136,14 @@ function Restore-AuthFileProfile {
     Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态 ($restored 项)" -Status 'ok'
 }
 
-# 批次1：authfile 切换后轮询确认（F-02 验收项，超时 30s）。双信号，命中任一即确认：
+# 批次1：authfile 切换后轮询确认（F-02 验收项，超时 30s）。三信号，命中任一即确认：
 #   ①数据目录 skeleton 登录快照 uid（仅 WorkBuddy 有，CodeBuddy 无）；
 #   ②共享 auth 文件 uid —— 客户端启动后若接受恢复的登录会保持/重写目标 uid；
-#     若被残留进程回写会退回旧 uid（实测切换"不生效"的形态），同样能被观测到。
-# auth 信号需连续两次轮询（间隔 2 秒）均命中才算确认，排除恢复刚落盘时的瞬时匹配。
+#     若被残留进程回写会退回旧 uid（实测切换"不生效"的形态），同样能被观测到；
+#   ③vscdb mtime 因果信号（F2-3，仅 CodeBuddy）——CodeBuddy 登录真源在自身 vscdb、
+#     实测从不回写 auth 文件，信号②恒不触发导致 verify 恒超时告警。改以客户端启动后
+#     实际重写自身登录库（state.vscdb mtime 偏离恢复锚点）计为已接受恢复的登录态。
+# ②需连续两次轮询（间隔 2 秒）均命中才算确认，排除恢复刚落盘时的瞬时匹配。
 # 返回值：'ok' 已确认 / 'timeout' 30 秒未确认（fail-open：快照已恢复、客户端已启动，仅警告）。
 function Confirm-AuthFileSwitch {
     param([string]$Slot)
@@ -1213,8 +1160,17 @@ function Confirm-AuthFileSwitch {
     # 影响（仍走内容匹配 + skeleton 双信号）。
     $restoreMtime = $null
     try { $restoreMtime = (Get-Item $Script:WbAuthFile).LastWriteTimeUtc } catch {}
+    # 信号③锚点（仅 CodeBuddy）：恢复落盘后的 vscdb mtime。仅在快照确实包含 vscdb
+    # 登录真源（本次恢复覆盖了它）时启用——旧版快照（无 vscdb 槽）只恢复了 auth 文件，
+    # 登录真源未变，客户端启动正常写 vscdb 也会翻动 mtime，贸然启用会假阳性确认。
+    $slotHasVscdb = ($Script:AppName -eq 'CodeBuddy') -and (Test-Path (Join-Path (Join-Path $Script:ProfilesDir $Slot) 'vscdb\state.vscdb'))
+    $vscdbFile = if ($slotHasVscdb -and $Script:CbGlobalStorageDir) { Join-Path $Script:CbGlobalStorageDir 'state.vscdb' } else { $null }
+    $vscdbMtime = $null
+    if ($vscdbFile -and (Test-Path $vscdbFile)) {
+        try { $vscdbMtime = (Get-Item $vscdbFile).LastWriteTimeUtc } catch {}
+    }
     if (-not $hasSnapDir) {
-        Write-Step -Stage 'verify' -Message "$($Script:AppName) 数据目录无登录快照（storage\skeleton 不存在），改以 auth 文件重写信号确认（客户端须实际重写 auth 文件，静默不动不算确认）" -Status 'info'
+        Write-Step -Stage 'verify' -Message "$($Script:AppName) 数据目录无登录快照（storage\skeleton 不存在），改以客户端实际重写信号确认（auth 重写或 vscdb 更新，静默不动不算确认）" -Status 'info'
     } else {
         Write-Step -Stage 'verify' -Message '等待客户端刷新登录快照（最长 30 秒）…' -Status 'running'
     }
@@ -1233,7 +1189,12 @@ function Confirm-AuthFileSwitch {
             $authRewritten = $false
             try { $authRewritten = ((Get-Item $Script:WbAuthFile).LastWriteTimeUtc -ne $restoreMtime) } catch {}
         }
-        if ($authUid -and $authUid -eq $expectUid -and $authRewritten) {
+        # 信号③（仅 CodeBuddy）：客户端启动后重写自身登录库（vscdb mtime 偏离恢复锚点）。
+        $vscdbRewritten = $false
+        if ($vscdbMtime) {
+            try { $vscdbRewritten = ((Get-Item $vscdbFile).LastWriteTimeUtc -ne $vscdbMtime) } catch {}
+        }
+        if ($vscdbRewritten -or ($authUid -and $authUid -eq $expectUid -and $authRewritten)) {
             $authHits++
             if ($authHits -ge 2) {
                 Write-Step -Stage 'verify' -Message '登录身份已确认为目标账号' -Status 'ok'
@@ -1260,11 +1221,10 @@ function Confirm-AuthFileSwitch {
         }
     }
     if (-not $hasSnapDir) {
-        # CodeBuddy L3 快照（vscdb）存在时登录态由 vscdb 恢复，客户端可能不回写 auth
-        # 文件——此时超时不代表失败，如实区分提示；旧快照（无 vscdb）超时则大概率未生效。
-        $slotHasVscdb = ($Script:AppName -eq 'CodeBuddy') -and (Test-Path (Join-Path (Join-Path $Script:ProfilesDir $Slot) 'vscdb\state.vscdb'))
+        # 快照含 vscdb（登录真源已恢复）时以"客户端是否重写登录数据"为判据；
+        # 旧快照（无 vscdb）登录真源未变，超时则大概率未生效。
         if ($slotHasVscdb) {
-            Write-Step -Stage 'verify' -Message "30 秒内未观察到 $($Script:AppName) 客户端重写 auth 文件（登录态已由 vscdb 快照恢复，auth 文件可能不被该客户端回写），请打开客户端核实登录身份" -Status 'warn'
+            Write-Step -Stage 'verify' -Message "30 秒内未观察到 $($Script:AppName) 客户端重写登录数据（auth 文件与 vscdb 均无更新——客户端可能未启动或未接受恢复的登录态），请打开客户端核实登录身份" -Status 'warn'
         } else {
             Write-Step -Stage 'verify' -Message "30 秒内未观察到 $($Script:AppName) 客户端重写 auth 文件为目标账号——切换很可能未生效（该客户端登录态不由 auth 文件驱动），请打开客户端核实；若未登录，请手动登录后「保存当前登录态」升级快照" -Status 'warn'
         }
@@ -1494,9 +1454,6 @@ try {
             } else {
                 Write-Step -Stage 'done' -Message "已切换至账号 $UserId" -Status 'ok'
             }
-            # F2-1：拉回切换期间临时关闭的对端应用（放在 verify 之后，避免对端启动回写
-            # auth 文件干扰本端登录确认）
-            Start-StoppedPeers
         }
         'SaveCurrentLogin' {
             # 保存当前登录态：关闭 Trae → 备份 → 启动
@@ -1504,7 +1461,6 @@ try {
             Backup-CurrentProfile -Slot $UserId
             Set-CurrentAccount -AccountId $UserId
             Start-Trae
-            Start-StoppedPeers
             Write-Step -Stage 'done' -Message "已保存账号 $UserId 的当前登录态" -Status 'ok'
         }
         'ResetMachineId' {
@@ -1529,7 +1485,6 @@ try {
             Restore-Profile -Slot $UserId
             Set-CurrentAccount -AccountId $UserId
             Start-Trae
-            Start-StoppedPeers
             Write-Step -Stage 'done' -Message "已恢复账号 $UserId 的登录态（当前登录态已备份到 last 槽）" -Status 'ok'
         }
         'KeepAlive' {
@@ -1545,16 +1500,11 @@ try {
             Write-Step -Stage 'keepalive' -Message '已启动，等待会话联网刷新（8 秒）' -Status 'running'
             Start-Sleep -Seconds 8
             Stop-Trae
-            Start-StoppedPeers
             Write-Step -Stage 'done' -Message '保活完成（启动 8 秒 → 优雅关闭，sid_guard 已滑动续期）' -Status 'ok'
         }
     }
     exit 0
 } catch {
-    # 审查修复：操作中途 fatal（快照损坏/恢复校验失败等）也要拉回被临时关闭的对端应用，
-    # 否则一次失败切换会把用户的 CodeBuddy 永久关停（Start-StoppedPeers 内有运行中检测，
-    # 关停失败的进程不会被重复拉起）
-    Start-StoppedPeers
     Write-Step -Stage 'fatal' -Message "失败: $_" -Status 'error'
     exit 1
 }
