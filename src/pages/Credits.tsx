@@ -1,7 +1,9 @@
-﻿import { useMemo, useState, useCallback } from 'react';
+﻿import { useMemo, useState, useCallback, useEffect } from 'react';
 import {
   LineChart,
   Line,
+  BarChart,
+  Bar,
   XAxis,
   YAxis,
   ResponsiveContainer,
@@ -13,8 +15,10 @@ import PageHeader from '../components/PageHeader';
 import { StatCard, Badge, EmptyState } from '../components/ui';
 import ExpiryCalendar, { type ExpiryItem } from '../components/ExpiryCalendar';
 import { useAppStore } from '../store';
+import { api } from '../lib/tauri';
 import { useIsDark } from '../lib/useIsDark';
 import { fmtCredits, normZero } from '../lib/format';
+import type { UsageHistoryResult } from '../types';
 
 function localDate(d: Date): string {
   const y = d.getFullYear();
@@ -36,6 +40,59 @@ export default function Credits() {
   const refreshCreditsHistory = useAppStore((s) => s.refreshCreditsHistory);
   const pushToast = useAppStore((s) => s.pushToast);
   const [refreshing, setRefreshing] = useState(false);
+
+  // ---- 积分消耗统计（Trae Work 接口明细，按本地日聚合） ----
+  const [usage, setUsage] = useState<UsageHistoryResult | null>(null);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const USAGE_DAYS = 30;
+
+  const loadUsage = useCallback(async (fresh: boolean) => {
+    setUsageLoading(true);
+    try {
+      const r = await api.accounts.usageHistory(USAGE_DAYS, fresh);
+      setUsage(r);
+    } catch (err) {
+      pushToast('error', `消耗统计查询失败：${String(err)}`);
+    } finally {
+      setUsageLoading(false);
+    }
+  }, [pushToast]);
+
+  useEffect(() => {
+    void loadUsage(false);
+  }, [loadUsage]);
+
+  // 日粒度数据（升序，接口已按日期升序）
+  const usageDaily = useMemo(
+    () => (usage?.accounts ?? []).flatMap((a) => a.daily).reduce((map, d) => {
+      const e = map.get(d.date) ?? { label: `${+d.date.slice(5, 7)}/${+d.date.slice(8, 10)}`, credits: 0, sessions: 0 };
+      e.credits += d.credits;
+      e.sessions += d.sessions;
+      map.set(d.date, e);
+      return map;
+    }, new Map<string, { label: string; credits: number; sessions: number }>()),
+    [usage],
+  );
+  const usageChart = useMemo(
+    () => [...usageDaily.values()].sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true })),
+    [usageDaily],
+  );
+  // 模型消耗 Top（窗口内合计，降序取前 5）
+  const usageModels = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const a of usage?.accounts ?? []) {
+      for (const d of a.daily) {
+        for (const [model, credits] of Object.entries(d.models)) {
+          m.set(model, (m.get(model) ?? 0) + credits);
+        }
+      }
+    }
+    return [...m.entries()].sort((x, y) => y[1] - x[1]).slice(0, 5);
+  }, [usage]);
+  const usageErrors = useMemo(
+    () => (usage?.accounts ?? []).filter((a) => a.error),
+    [usage],
+  );
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -174,6 +231,96 @@ export default function Credits() {
         <StatCard label="平均可用积分" value={normZero(avg).toLocaleString()} tone="blue" />
         <StatCard label="今日新增积分" value={normZero(todayNew).toLocaleString()} tone="green" hint={today} />
         <StatCard label="今日消耗积分" value={normZero(todayConsumed).toLocaleString()} tone="amber" hint={today} />
+      </div>
+
+      {/* 积分消耗统计（Trae Work 接口明细；与下方余额差值推算的 7 日趋势口径独立） */}
+      <div className="card p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <h3 className="font-medium">近 30 日积分消耗</h3>
+            <Badge tone={usage?.cached ? 'slate' : 'green'}>
+              {usage?.cached ? '缓存' : '接口'}
+            </Badge>
+            {usage && (
+              <span className="text-xs text-slate-400">
+                {new Date(usage.fetched_at * 1000).toLocaleString('zh-CN', { hour12: false })}
+              </span>
+            )}
+          </div>
+          <button
+            className="btn-ghost flex items-center gap-1.5 text-sm"
+            onClick={() => void loadUsage(true)}
+            disabled={usageLoading}
+            title="重新从接口拉取全部账号消耗明细（分页拉取，稍耗时）"
+          >
+            <RefreshCw size={14} className={usageLoading ? 'animate-spin' : ''} />
+            {usageLoading ? '拉取中' : '拉取明细'}
+          </button>
+        </div>
+        {usageLoading && !usage ? (
+          <div className="flex h-40 items-center justify-center text-sm text-slate-400">
+            正在从 Trae Work 接口拉取消耗明细…
+          </div>
+        ) : !usage || usage.total_sessions === 0 ? (
+          <EmptyState
+            icon={<Coins size={28} />}
+            title="暂无消耗数据"
+            hint="账号已录入 JWT 且有会话消耗时，这里展示每日消耗明细（含模型分布）。"
+          />
+        ) : (
+          <>
+            <div className="mb-4 grid grid-cols-3 gap-3">
+              <StatCard label="消耗总积分" value={fmtCredits(usage.total_credits)} tone="amber" hint={`近 ${usage.days} 天 · ${usage.total_sessions} 个会话`} />
+              <StatCard label="日均消耗" value={fmtCredits(usage.total_credits / Math.max(usage.days, 1))} tone="blue" />
+              <StatCard label="会话均耗" value={fmtCredits(usage.total_sessions > 0 ? usage.total_credits / usage.total_sessions : 0)} tone="violet" />
+            </div>
+            {usageModels.length > 0 && (
+              <div className="mb-4 flex flex-wrap gap-2">
+                {usageModels.map(([model, credits]) => (
+                  <Badge key={model} tone="slate" title={`${model} 窗口内共消耗 ${fmtCredits(credits)} 积分`}>
+                    {model} · {fmtCredits(credits)}
+                  </Badge>
+                ))}
+              </div>
+            )}
+            <div className="h-56">
+              <ResponsiveContainer>
+                <BarChart data={usageChart} margin={{ top: 24, right: 16, left: 0, bottom: 4 }} barCategoryGap="24%">
+                  <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
+                  <XAxis
+                    dataKey="label"
+                    tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
+                    axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
+                    tickLine={false}
+                  />
+                  <YAxis tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={56} />
+                  <Tooltip
+                    cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
+                    contentStyle={{
+                      fontSize: 12,
+                      borderRadius: 10,
+                      border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+                      background: isDark ? '#18181b' : '#fff',
+                      color: isDark ? '#e4e4e7' : '#1e293b',
+                      boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
+                      padding: '8px 12px',
+                    }}
+                    formatter={(v: number, name: string) => [
+                      normZero(v).toLocaleString('zh-CN', { maximumFractionDigits: 2 }),
+                      name === 'credits' ? '消耗积分' : '会话数',
+                    ]}
+                  />
+                  <Bar dataKey="credits" fill="#f59e0b" radius={[4, 4, 0, 0]} maxBarSize={28} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            {usageErrors.length > 0 && (
+              <div className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">
+                {usageErrors.map((a) => a.error).join('；')}
+              </div>
+            )}
+          </>
+        )}
       </div>
 
       <div className="card p-5">

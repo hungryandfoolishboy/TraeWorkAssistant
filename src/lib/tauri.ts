@@ -68,6 +68,7 @@ import type {
   WbActivityInfo,
   WbPoolImportResult,
   WbModelInfo,
+  UsageHistoryResult,
 } from '../types';
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
@@ -131,6 +132,9 @@ export const api = {
     getJwt: (userId: string) => invoke<string>('account_get_jwt', { userId }),
     // 会员/套餐信息
     refreshPayStatus: () => invoke<number>('refresh_pay_status'),
+    // 积分消耗历史（Trae Work query_user_usage_group_by_session，按本地日聚合 + 落盘缓存）
+    usageHistory: (days?: number, fresh?: boolean) =>
+      invoke<UsageHistoryResult>('usage_history_fetch', { days: days ?? null, fresh: fresh ?? null }),
   },
   traeApps: {
     localEntitlement: () => invoke<LocalEntitlement>('apps_entitlement_read'),

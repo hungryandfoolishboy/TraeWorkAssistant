@@ -13,6 +13,7 @@ pub mod proxy;
 pub mod switch;
 pub mod trae_apps;
 pub mod updater;
+pub mod usage_history;
 pub mod wb_config;
 pub mod workbuddy;
 pub mod workbuddy_stats;

@@ -75,6 +75,41 @@ export interface AccountView {
   membership_next_billing?: number | null;
 }
 
+// ---- 积分消耗历史（Trae Work query_user_usage_group_by_session，按本地日聚合） ----
+export interface UsageDayStat {
+  /** 本地自然日 YYYY-MM-DD */
+  date: string;
+  credits: number;
+  sessions: number;
+  /** 模型 → 当日消耗积分 */
+  models: Record<string, number>;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+}
+
+export interface UsageHistoryAccount {
+  user_id: string;
+  name: string;
+  ok: boolean;
+  /** 本次查询失败但已沿用缓存时的说明；ok=false 时为失败原因 */
+  error: string | null;
+  sessions: number;
+  credits: number;
+  /** 按日期升序 */
+  daily: UsageDayStat[];
+}
+
+export interface UsageHistoryResult {
+  fetched_at: number;
+  days: number;
+  /** true = 命中缓存（含 stale-on-error 沿用） */
+  cached: boolean;
+  accounts: UsageHistoryAccount[];
+  total_credits: number;
+  total_sessions: number;
+}
+
 // ---- F-08 双应用账号自动发现 ----
 /** 账号导入结果报告 */
 export interface ImportReport {
