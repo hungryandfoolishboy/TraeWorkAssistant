@@ -209,7 +209,22 @@ export default function BuddyCredits() {
                       <td className="px-4 py-2">
                         <div className="flex items-center gap-1.5 font-medium">
                           {a.name}
-                          {a.source === 'legacy' && <Badge tone="slate">旧接口回退</Badge>}
+                          {a.source === 'legacy' && (
+                            <Badge
+                              tone="slate"
+                              title="新版计费三接口（summary/paid/free）本次未返回数据，已自动改用旧版聚合接口（v2 get-user-resource）兜底取数：余额 = 积分包剩余求和，数据可信。偶发多为网络抖动或接口短暂异常；若该账号持续出现，建议在日志页核查计费接口返回码。"
+                            >
+                              旧接口回退
+                            </Badge>
+                          )}
+                          {a.source === 'local_quota' && (
+                            <Badge
+                              tone="slate"
+                              title="云端计费接口全部失败，已探测本机桌面服务端口兜底取得余额（无积分包明细）。"
+                            >
+                              本地兜底
+                            </Badge>
+                          )}
                         </div>
                         {!a.ok && <div className="text-xs text-rose-500">{a.message}</div>}
                       </td>

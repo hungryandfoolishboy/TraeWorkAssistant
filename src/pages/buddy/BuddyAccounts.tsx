@@ -688,9 +688,9 @@ export default function BuddyAccounts() {
               <tr>
                 <th className="px-4 py-2 text-left">账号</th>
                 <th className="px-4 py-2 text-left">会员套餐</th>
+                <th className="px-4 py-2 text-left">积分包</th>
                 <th className="px-4 py-2 text-right">可用积分</th>
                 <th className="px-4 py-2 text-left">token 到期</th>
-                <th className="px-4 py-2 text-left">积分包</th>
                 <th className="px-4 py-2 text-left">签到状态</th>
                 <th className="px-4 py-2 text-left">状态</th>
                 <th className="px-4 py-2 text-right">操作</th>
@@ -699,6 +699,13 @@ export default function BuddyAccounts() {
             <tbody>
               {accounts.map((a) => {
                 const pkgs = credits.get(a.id) ?? [];
+                // 7 日内将过期（仍有剩余）的积分包 → 列表标记提示
+                const nowSec = Math.floor(Date.now() / 1000);
+                const soonestExpire = pkgs.reduce<number | null>((min, p) => {
+                  if (p.expire_ts == null || p.remaining <= 0 || p.expire_ts <= nowSec) return min;
+                  if (p.expire_ts > nowSec + 7 * 86400) return min;
+                  return min == null ? p.expire_ts : Math.min(min, p.expire_ts);
+                }, null);
                 const switching = switchingTo === a.id || savingLogin === a.id;
                 // 本行有异步操作执行中时，该行其余异步小按钮一并禁用（防连点/并发）
                 const rowOpKind = rowOp && rowOp.id === a.id ? rowOp.kind : null;
@@ -728,6 +735,28 @@ export default function BuddyAccounts() {
                         <span className="text-xs text-slate-300 dark:text-zinc-600">—</span>
                       )}
                     </td>
+                    <td className="px-4 py-3">
+                      {pkgs.length > 0 ? (
+                        <div className="flex flex-col items-start gap-1">
+                          <button
+                            className="flex items-center gap-1 text-xs text-brand-600 hover:underline dark:text-brand-400"
+                            onClick={() => setDetailFor(a)}
+                          >
+                            <Coins size={13} /> {pkgs.length} 个包
+                          </button>
+                          {soonestExpire != null && (
+                            <Badge
+                              tone="amber"
+                              title={`有积分包将于 ${new Date(soonestExpire * 1000).toLocaleDateString('zh-CN')} 过期，明细见积分包弹窗`}
+                            >
+                              7 日内到期
+                            </Badge>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-xs text-slate-300">-</span>
+                      )}
+                    </td>
                     <td className="px-4 py-3 text-right tabular-nums">
                       {a.credits_balance != null ? a.credits_balance.toFixed(2) : '-'}
                     </td>
@@ -735,18 +764,6 @@ export default function BuddyAccounts() {
                       <div className={tokenTone(a.access_token_expires_at)}>{fmtExpire(a.access_token_expires_at)}</div>
                       {a.refresh_token_expires_at && (
                         <div className="text-slate-400">RT {fmtExpire(a.refresh_token_expires_at)}</div>
-                      )}
-                    </td>
-                    <td className="px-4 py-3">
-                      {pkgs.length > 0 ? (
-                        <button
-                          className="flex items-center gap-1 text-xs text-brand-600 hover:underline dark:text-brand-400"
-                          onClick={() => setDetailFor(a)}
-                        >
-                          <Coins size={13} /> {pkgs.length} 个包
-                        </button>
-                      ) : (
-                        <span className="text-xs text-slate-300">-</span>
                       )}
                     </td>
                     <td className="px-4 py-3">

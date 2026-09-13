@@ -77,7 +77,8 @@ impl WbModel {
     }
 }
 
-/// 内置静态兜底目录（15 模型，§5.6；倍率/上下文为 2026-09 快照）
+/// 内置静态兜底目录（15 模型，§5.6；倍率/上下文为 2026-09 官网快照：
+/// hy4-preview 0.29x / hy3 免费 0.00x / hy3-x 0.05x）
 pub fn builtin() -> Vec<WbModel> {
     let m = |id: &str,
              display: &str,
@@ -99,10 +100,10 @@ pub fn builtin() -> Vec<WbModel> {
         }
     };
     vec![
-        m("hy4-preview", "Hy4 Preview", 1_000_000, 128_000, true, &["low", "medium", "high"], None, 0.00),
+        m("hy4-preview", "Hy4 Preview", 1_000_000, 128_000, true, &["low", "medium", "high"], None, 0.29),
         m("hy4", "Hy4", 1_000_000, 128_000, true, &["low", "medium", "high"], None, 0.20),
         m("hy3-x", "Hy3-X", 200_000, 64_000, false, &["high"], Some("high"), 0.05),
-        m("hy3", "Hy3", 200_000, 64_000, false, &["high"], Some("high"), 0.05),
+        m("hy3", "Hy3", 200_000, 64_000, false, &["high"], Some("high"), 0.00),
         m("glm-5.3", "GLM-5.3", 200_000, 96_000, true, &["low", "medium", "high"], None, 0.79),
         m("glm-5.3-flash", "GLM-5.3 Flash", 128_000, 64_000, false, &["low", "medium", "high"], None, 0.10),
         m("glm-5.2", "GLM-5.2", 128_000, 64_000, false, &["low", "medium", "high"], None, 0.30),
@@ -124,6 +125,12 @@ pub fn catalog_path(data_dir: &Path) -> PathBuf {
     data_dir.join("data").join("wb_model_catalog.json")
 }
 
+/// 内置表版本：倍率等快照更新时 +1。由旧版本内置表自动落盘的目录（fetched_at 为空且
+/// builtin_rev 低于当前值）会按新内置表重建，使倍率修正对存量安装生效；
+/// 上游同步写入的目录（fetched_at 非空）不受影响。人工维护的目录请把 builtin_rev
+/// 手工改为当前值以退出重建。
+pub const BUILTIN_REV: u32 = 2;
+
 /// 目录文件结构（支持上游动态替换后的全量覆盖）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WbCatalogFile {
@@ -131,6 +138,8 @@ pub struct WbCatalogFile {
     pub models: Vec<WbModel>,
     #[serde(default)]
     pub fetched_at: Option<i64>,
+    #[serde(default)]
+    pub builtin_rev: u32,
 }
 
 /// 加载目录：wb_model_catalog.json 优先（动态替换结果 / 人工维护），
@@ -141,7 +150,10 @@ pub fn load(data_dir: &Path) -> Vec<WbModel> {
     // 缓存未命中/缺失/为空才走内置表落盘自愈
     if let Some(file) = crate::fs_utils::read_json_cached::<WbCatalogFile>(&path) {
         if !file.models.is_empty() {
-            return file.models;
+            // 上游同步结果优先保留；否则旧版本内置表落盘的目录按新内置表重建
+            if file.fetched_at.is_some() || file.builtin_rev >= BUILTIN_REV {
+                return file.models;
+            }
         }
     }
     let builtin = builtin();
@@ -150,6 +162,7 @@ pub fn load(data_dir: &Path) -> Vec<WbModel> {
         &WbCatalogFile {
             models: builtin.clone(),
             fetched_at: None,
+            builtin_rev: BUILTIN_REV,
         },
     );
     builtin
@@ -293,6 +306,7 @@ pub fn fetch_and_replace(
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0),
             ),
+            ..Default::default()
         },
     )
     .map_err(|e| format!("写目录文件失败: {e}"))?;
