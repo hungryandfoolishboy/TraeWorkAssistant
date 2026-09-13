@@ -89,8 +89,9 @@ _iso_to_ts = _to_ts
 
 
 def _total_of(pkg):
-    """总量：CycleTotalCapacity → CapacitySize → TotalCapacity（§5.4 字段链）"""
-    for k in ("CycleTotalCapacity", "CapacitySize", "TotalCapacity", "capacity"):
+    """总量：CycleTotalCapacity（summary 新结构）→ CycleCapacitySize（free/旧接口
+    周期总量）→ CapacitySize → TotalCapacity（§5.4 字段链）"""
+    for k in ("CycleTotalCapacity", "CycleCapacitySize", "CapacitySize", "TotalCapacity", "capacity"):
         v = _num(wb.dig(pkg, k))
         if v is not None:
             return v
@@ -98,9 +99,12 @@ def _total_of(pkg):
 
 
 def _remaining_of(pkg, total):
-    """剩余：CycleCapacitySizePrecise（本周期剩余精确容量）优先，
-    回退 RemainingCapacity/remaining；仅剩 used 时由总量倒推"""
-    for k in ("CycleCapacitySizePrecise", "RemainingCapacity", "remaining", "Remaining", "LeftCapacity"):
+    """剩余：CycleCapacityRemainPrecise（free/旧接口周期剩余，实测 2026-09）优先，
+    CycleRemainCapacity（summary 新结构）次之，回退 RemainingCapacity/remaining；
+    仅剩 used 时由总量倒推。
+    注意：CycleCapacitySizePrecise 是周期**总量**而非剩余（实测语义），不参与剩余链。"""
+    for k in ("CycleCapacityRemainPrecise", "CycleRemainCapacity", "RemainingCapacity",
+              "remaining", "Remaining", "LeftCapacity"):
         v = _num(wb.dig(pkg, k))
         if v is not None:
             return v
@@ -110,8 +114,10 @@ def _remaining_of(pkg, total):
     return None
 
 
-CAPACITY_KEYS = ("CycleCapacitySizePrecise", "RemainingCapacity", "Remaining",
-                 "CycleTotalCapacity", "CapacitySize", "TotalCapacity", "UsedCapacity")
+CAPACITY_KEYS = ("CycleCapacitySizePrecise", "CycleRemainCapacity", "CycleCapacityRemainPrecise",
+                 "CycleCapacityRemain", "RemainingCapacity", "Remaining",
+                 "CycleTotalCapacity", "CycleCapacitySize", "CapacitySize", "TotalCapacity",
+                 "UsedCapacity", "CycleUsedCapacity")
 
 
 def _walk_capable_dicts(v, depth=0):
@@ -164,6 +170,9 @@ def _packages_from(body):
         #                日历过滤），与日历侧口径严格对齐。
         out.append({
             "name": str(name) if name else "积分包",
+            # PackageCode：跨接口去重/合并用（summary 与 paid/free 的 name 字段不同源）
+            "code": (str(wb.dig(item, "PackageCode", "packageCode"))
+                     if wb.dig(item, "PackageCode", "packageCode") else None),
             "remaining": remaining or 0.0,
             "total": total or 0.0,
             "used": used or 0.0,
@@ -174,13 +183,36 @@ def _packages_from(body):
 
 
 def _balance_from_summary(body):
-    """summary 响应 → 余额（remaining 求和；字段链宽容）"""
+    """summary 响应 → 余额。
+    旧结构：顶层 RemainingCapacity/Balance 等字段；
+    新结构（2026-09 实测）：data.Packages[] 各包 CycleRemainCapacity 求和。"""
     total = _num(wb.dig(body, "RemainingCapacity", "remaining", "TotalRemaining",
                         "Balance", "balance"))
     if total is not None:
         return total
+    s = 0.0
+    has = False
+    for item in _walk_capable_dicts(body):
+        v = _num(wb.dig(item, "CycleRemainCapacity", "RemainingCapacity", "remaining"))
+        if v is not None:
+            s += v
+            has = True
+    if has:
+        return s
     v = wb.dig(body, "CycleCapacitySizePrecise", "CycleTotalCapacity", "CapacitySize")
     return _num(v)
+
+
+def _package_codes_from(body):
+    """summary 响应 → PackageCode 列表（去重，保序）。
+    2026-09 起 paid/free 接口要求请求体携带 PackageCodes（空 body 返回
+    400 code=10001 "PackageCodes required"），代码列表只能先从 summary 提取。"""
+    codes = []
+    for item in _walk_capable_dicts(body):
+        code = wb.dig(item, "PackageCode", "packageCode")
+        if code and code not in codes:
+            codes.append(code)
+    return codes
 
 
 def _billing_urls(domain):
@@ -194,31 +226,63 @@ def _billing_urls(domain):
 
 
 def _fetch_round(headers, urls):
-    """单轮三件套取数；返回 (pkgs, balance, net_down)——net_down=全部网络不可达"""
+    """单轮取数；返回 (pkgs, balance, saw_auth, net_down)——net_down=summary 网络不可达。
+
+    2026-09 实测结构（代理诊断）：
+    - summary：200，data.Packages[] 自带 PackageCode + 容量三项（**无到期时间字段**）；
+    - paid/free：400 code=10001 "PackageCodes required"——需携带 summary 提取的
+      PackageCodes 回查（到期时间仅这两个接口提供）。
+    流程：summary（余额 + 包）→ paid/free 带 PackageCodes 回查到期 → 按 PackageCode
+    去重合并（paid/free 有到期信息的优先，summary 包补齐未被覆盖的）。
+    paid/free 失败不影响 cloud 成功判定（仅缺到期信息，明细显示「未知」）。"""
+    summary_url, paid_url, free_url = urls
     pkgs = []
     balance = None
     saw_auth = False
     net_down = True
-    for url in urls:
-        status, body, _ = wb.post_json(url, headers, {})
-        if status == 0:
-            continue  # 网络不可达 → 尝试下一个（供双探测判定）
-        net_down = False
-        if status == 401:
-            saw_auth = True
+
+    status, body, _ = wb.post_json(summary_url, headers, {})
+    if status == 0:
+        return pkgs, balance, saw_auth, net_down  # 网络不可达 → 供双探测判定
+    net_down = False
+    if status == 401:
+        saw_auth = True
+        return pkgs, balance, saw_auth, net_down
+    if status != 200 or not isinstance(body, dict):
+        return pkgs, balance, saw_auth, net_down
+
+    balance = _balance_from_summary(body)
+    codes = _package_codes_from(body)
+
+    # paid/free 带 PackageCodes + 分页回查（到期时间/周期明细数据源）
+    enriched = []
+    enriched_codes = set()
+    if codes:
+        req = {"PackageCodes": codes, "PageNumber": 1, "PageSize": 100}
+        for url in (paid_url, free_url):
+            st2, body2, _ = wb.post_json(url, headers, req)
+            if st2 == 401:
+                saw_auth = True
+                continue
+            if st2 == 200 and isinstance(body2, dict):
+                for p in _packages_from(body2):
+                    enriched.append(p)
+                    if p.get("code"):
+                        enriched_codes.add(p["code"])
+
+    # summary 自带包：仅补 paid/free 未覆盖的 PackageCode（无到期信息）
+    for p in _packages_from(body):
+        if p.get("code") and p["code"] in enriched_codes:
             continue
-        if status == 200 and isinstance(body, dict):
-            if url == urls[0]:
-                balance = _balance_from_summary(body)
-            else:
-                pkgs.extend(_packages_from(body))
+        enriched.append(p)
+    pkgs.extend(enriched)
     return pkgs, balance, saw_auth, net_down
 
 
 def fetch_credits_once(creds):
-    """一次取数：三件套（带 web 头）→ 全 401 刷新一次仅重试失败分支 → 旧接口回退。
+    """一次取数：summary（余额+包）→ paid/free 带 PackageCodes 回查到期 →
+    全 401 刷新一次仅重试失败分支 → 旧接口回退。
     主域名整体网络不可达时切备用域名重试一轮（§2.2 域名双探测，仅一次、不循环）。
-    summary 只取余额不产包（其容量字段是池级汇总，入包会制造脏行）。
     返回 (packages, balance, source, new_creds|None)"""
     headers = wb.build_auth_headers(creds, web_platform=True)
     summary_url, paid_url, free_url, old_url = _billing_urls(creds.get("domain", ""))
