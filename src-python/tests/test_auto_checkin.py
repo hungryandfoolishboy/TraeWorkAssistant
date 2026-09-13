@@ -22,6 +22,9 @@ from auto_checkin import (
     save_cooldown,
     parse_claim_reward,
     resolve_claim_credits,
+    _unwrap_scopes,
+    _find_payload_field,
+    _as_int,
 )
 
 
@@ -159,6 +162,51 @@ def _no_recheck():
     raise AssertionError("不应触发 status 复查")
 
 
+def test_unwrap_scopes_and_find_field():
+    """信封下钻：沿 data/result/resp/response/info 递归，外层优先查找字段。"""
+    nested2 = {"checked_in": True, "credits": 150}
+    nested1 = {"data": nested2, "result": {"checked_in": False}}
+    payload = {"code": 0, "message": "ok", "data": nested1}
+    scopes = _unwrap_scopes(payload)
+    assert scopes[0] is payload
+    assert nested1 in scopes and nested2 in scopes
+    # 外层优先：顶层无该字段 → 逐层下钻命中
+    assert _find_payload_field(payload, "checked_in") is True
+    assert _find_payload_field(payload, "credits") == 150
+    # 顶层字段不被嵌套同名遮蔽
+    assert _find_payload_field({"credits": 99, "data": {"credits": 1}}, "credits") == 99
+    # 不存在的字段 / 非 dict 输入
+    assert _find_payload_field(payload, "missing") is None
+    assert _find_payload_field(None, "credits") is None
+
+
+def test_as_int_tolerant():
+    """宽容数值归一：int / 整值 float / 数字串 → int；bool / 负数浮点 / 非数字串 → None。"""
+    assert _as_int(5) == 5
+    assert _as_int(2.0) == 2
+    assert _as_int("15") == 15
+    assert _as_int(True) is None
+    assert _as_int(False) is None
+    assert _as_int(-5) == -5  # 归一不拦负值，由调用方按语义排除
+    assert _as_int(1.5) is None
+    assert _as_int("abc") is None
+    assert _as_int(None) is None
+
+
+def test_parse_claim_reward_zero_skip_and_deep_nesting():
+    """0 值占位字段跳过继续查找；多层信封内层奖励字段可命中；全 0 → None。"""
+    # credits:0 占位不挡住后面的真实奖励字段
+    assert parse_claim_reward({"code": 0, "data": {"credits": 0, "reward": 12}}) == 12
+    # 多层信封：data.data.reward 也能命中
+    assert parse_claim_reward({"code": 0, "data": {"data": {"reward": 9}}}) == 9
+    # 内层优先于顶层
+    assert parse_claim_reward({"code": 0, "data": {"delta": 7}, "credits": 99}) == 7
+    # 全部候选字段均为 0 → 无奖励
+    assert parse_claim_reward({"code": 0, "data": {"credits": 0}}) is None
+    # 0 值不再被当作有效奖励（旧行为会返回 0，delta 联动显示「积分+0」）
+    assert parse_claim_reward({"code": 0, "data": {"amount": 0}}) is None
+
+
 def test_resolve_claim_credits_layer1_claim_reward():
     """层1：claim 带奖励字段 → delta 取奖励值，credits 沿用签到前余额，不做复查。"""
     assert resolve_claim_credits({"code": 0, "data": {"reward": 20}}, 500, recheck=_no_recheck) == (
@@ -212,6 +260,9 @@ if __name__ == "__main__":
     test_consecutive_server_errors_cooldown()
     test_client_errors_share_strike_counter_type_gate()
     test_parse_claim_reward_fields()
+    test_unwrap_scopes_and_find_field()
+    test_as_int_tolerant()
+    test_parse_claim_reward_zero_skip_and_deep_nesting()
     test_resolve_claim_credits_layer1_claim_reward()
     test_resolve_claim_credits_layer2_balance_diff()
     test_resolve_claim_credits_layer3_fallback()

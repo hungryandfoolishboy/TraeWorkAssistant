@@ -305,8 +305,18 @@ def status_check(name, jwt, device_map, timeout=30):
     except Exception:
         return False, None, None, status, f"非 JSON 响应: {body[:200]}"
     code = data.get("code")
-    checked_in = data.get("checked_in")
-    credits = data.get("credits")
+    # 宽容解析：checked_in / credits 可能被 data 信封包裹。此前只读顶层，
+    # 字段被包裹时恒为 None → 已签账号被判「未签」重复 claim、余额拿不到
+    # → delta 联动失败，前端显示「积分+0」。code 保持顶层口径（与 Rust 侧一致，
+    # 不深挖以免误伤嵌套业务对象里的通用错误码）。
+    checked_in_raw = _find_payload_field(data, "checked_in")
+    if isinstance(checked_in_raw, bool):
+        checked_in = checked_in_raw
+    elif isinstance(checked_in_raw, (int, float)):
+        checked_in = checked_in_raw != 0
+    else:
+        checked_in = None
+    credits = _as_int(_find_payload_field(data, "credits"))
     msg = data.get("message", "")
     if code != 0:
         return False, checked_in, credits, code, msg or f"HTTP {status}"
@@ -431,6 +441,54 @@ def signin_with_retry(name, jwt, device_map, timeout=30, retry=0, with_data=Fals
     return last if with_data else last[:4]
 
 
+# ----------------- 响应宽容解析（信封字段下钻） -----------------
+# 对齐 Rust 侧 fs_utils::dig 宽容口径（F-49）：官方响应的业务字段可能被
+# data/result/resp/response/info 等信封键包裹。此前 status_check 只读顶层
+# checked_in/credits、parse_claim_reward 只下钻一层 data，字段被包裹时恒取不到
+# → 已签账号被判「未签」、余额拿不到、delta 解析失败，前端联动显示「积分+0」。
+_PAYLOAD_WRAPPER_KEYS = ("data", "result", "resp", "response", "info")
+
+
+def _unwrap_scopes(data, max_depth=8):
+    """沿信封包裹键递归下钻，返回 [最外层, …, 最内层业务对象]（限深防环，纯函数）。"""
+    scopes = []
+    seen = set()
+
+    def _walk(obj, depth):
+        if not isinstance(obj, dict) or depth > max_depth or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        scopes.append(obj)
+        for k in _PAYLOAD_WRAPPER_KEYS:
+            child = obj.get(k)
+            if isinstance(child, dict):
+                _walk(child, depth + 1)
+
+    _walk(data, 0)
+    return scopes
+
+
+def _find_payload_field(data, key):
+    """在各层 scope 查找 key（外层优先，保持顶层字段口径），命中即返回原始值。"""
+    for scope in _unwrap_scopes(data):
+        if key in scope:
+            return scope[key]
+    return None
+
+
+def _as_int(val):
+    """宽容数值归一：int / 整值 float / 数字串 → int；bool / 负数 / 非数字串 → None。"""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float) and val.is_integer():
+        return int(val)
+    if isinstance(val, str) and val.isdigit():
+        return int(val)
+    return None
+
+
 # ----------------- 签到积分归属解析（三层兜底，纯函数便于单测） -----------------
 # claim 响应中疑似「本次奖励」的候选字段（按优先级排列；data 层优先于顶层）。
 # 说明：status 接口顶层 credits 无法离线确证是「签到后余额」还是「可领奖励额度」，
@@ -443,24 +501,18 @@ _CLAIM_REWARD_KEYS = (
 
 def parse_claim_reward(data):
     """从 claim 响应 JSON 中提取本次签到奖励值（纯函数）。
-    依次在 data 层与顶层查找候选奖励字段，仅接受整数型数值（int / 整值 float / 数字串），
-    排除 bool 与负值；无可用奖励字段时返回 None。"""
+    候选字段按「内层业务对象优先于顶层」在各信封层查找，仅接受正整数型数值
+    （int / 整值 float / 数字串），排除 bool 与非正值；0 值占位字段（如奖励未发放时的
+    credits:0）跳过并继续向后查找，避免挡住真实奖励字段；无可用奖励字段时返回 None。"""
     if not isinstance(data, dict):
         return None
-    nested = data.get("data")
-    scopes = [nested] if isinstance(nested, dict) else []
-    scopes.append(data)
+    scopes = _unwrap_scopes(data)
+    scopes.reverse()  # 内层业务对象优先于顶层兜底（与原「data 层优先」口径一致）
     for scope in scopes:
         for key in _CLAIM_REWARD_KEYS:
-            val = scope.get(key)
-            if isinstance(val, bool):
-                continue
-            if isinstance(val, int) and val >= 0:
+            val = _as_int(scope.get(key))
+            if val is not None and val > 0:
                 return val
-            if isinstance(val, float) and val.is_integer() and val >= 0:
-                return int(val)
-            if isinstance(val, str) and val.isdigit():
-                return int(val)
     return None
 
 
@@ -631,7 +683,8 @@ def main():
             })
             already += 1
             emit({"type": "account", "index": idx, "user_id": user_id, "name": name, "status": "already", "credits": credits_before})
-            save_credits_history(user_id, credits_before, 0)
+            if isinstance(credits_before, int):
+                save_credits_history(user_id, credits_before, 0)
             continue
         if not ok_s:
             tout(f"  [WARN] status 预检失败 (code={code_s}) {msg_s} —— 仍尝试 claim")

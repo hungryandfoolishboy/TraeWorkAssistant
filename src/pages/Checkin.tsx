@@ -383,8 +383,14 @@ export default function Checkin() {
                   <span className="w-8 text-right text-xs text-slate-400">{r.index}</span>
                   <span className="flex-1 truncate">{r.name}</span>
                   <span className={`text-xs ${tone}`} title={r.message ?? undefined}>
-                    {r.status === 'success' && `积分+${r.delta ?? 0}`}
-                    {r.status === 'already' && `积分+${r.credits ?? 0}`}
+                    {r.status === 'success' &&
+                      (r.delta != null
+                        ? `积分+${r.delta}`
+                        : r.credits != null
+                        ? `已签 · 余额 ${r.credits}`
+                        : '已签到')}
+                    {r.status === 'already' &&
+                      (r.credits != null ? `已签 · 余额 ${r.credits}` : '已签到')}
                     {r.status === 'skip' && skipLabel}
                     {r.status === 'fail' &&
                       (r.error_type === 'SessionDead'
