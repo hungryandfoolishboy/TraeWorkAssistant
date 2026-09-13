@@ -2,6 +2,9 @@
 import {
   LineChart,
   Line,
+  BarChart,
+  Bar,
+  LabelList,
   XAxis,
   YAxis,
   ResponsiveContainer,
@@ -183,18 +186,20 @@ export default function Credits() {
     return snap ? snap.consumed : 0;
   }, [usage, creditsDaily, today]);
 
-  // 模型消耗 Top（已拉取范围内合计，降序取前 5）
-  const usageModels = useMemo(() => {
+  // 各模型消耗（按所选区间过滤，跨账号合计，降序）
+  const modelChart = useMemo(() => {
+    const dates = new Set(rangeDates(range));
     const m = new Map<string, number>();
     for (const a of usage?.accounts ?? []) {
       for (const d of a.daily) {
+        if (!dates.has(d.date)) continue;
         for (const [model, credits] of Object.entries(d.models)) {
           m.set(model, (m.get(model) ?? 0) + credits);
         }
       }
     }
-    return [...m.entries()].sort((x, y) => y[1] - x[1]).slice(0, 5);
-  }, [usage]);
+    return [...m.entries()].sort((x, y) => y[1] - x[1]);
+  }, [usage, range]);
   const usageErrors = useMemo(
     () => (usage?.accounts ?? []).filter((a) => a.error),
     [usage],
@@ -370,17 +375,55 @@ export default function Credits() {
                   />
                   <Line type="monotone" dataKey="total" stroke="#6366f1" strokeWidth={2.5} dot={showDots ? { r: 3, fill: '#6366f1', strokeWidth: 0 } : false} activeDot={{ r: 5 }} connectNulls />
                   <Line type="monotone" dataKey="earned" stroke="#22c55e" strokeWidth={2} dot={showDots ? { r: 3, fill: '#22c55e', strokeWidth: 0 } : false} activeDot={{ r: 5 }} connectNulls />
-                  <Line type="monotone" dataKey="consumed" stroke="#f59e0b" strokeWidth={2.5} dot={showDots ? { r: 3, fill: '#f59e0b', strokeWidth: 0 } : false} activeDot={{ r: 5 }} connectNulls />
+                  <Line type="monotone" dataKey="consumed" stroke="#f59e0b" strokeWidth={3} dot={showDots ? { r: 3, fill: '#f59e0b', strokeWidth: 0 } : false} activeDot={{ r: 5 }} connectNulls />
                 </LineChart>
               </ResponsiveContainer>
             </div>
-            {usageModels.length > 0 && (
-              <div className="mt-3 flex flex-wrap gap-2">
-                {usageModels.map(([model, credits]) => (
-                  <Badge key={model} tone="slate" title={`${model} 已拉取范围内共消耗 ${fmtCredits(credits)} 积分`}>
-                    {model} · {fmtCredits(credits)}
-                  </Badge>
-                ))}
+            {modelChart.length > 0 && (
+              <div className="mt-4">
+                <div className="mb-2 flex items-center gap-2">
+                  <h4 className="text-sm font-medium">各模型消耗积分</h4>
+                  <span className="text-xs text-slate-400">当前区间 · 跨账号合计</span>
+                </div>
+                <div className="h-52">
+                  <ResponsiveContainer>
+                    <BarChart data={modelChart} margin={{ top: 20, right: 16, left: 0, bottom: 4 }} barCategoryGap="24%">
+                      <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
+                      <XAxis
+                        dataKey="0"
+                        tick={{ fontSize: 10, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
+                        axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
+                        tickLine={false}
+                        interval={0}
+                        angle={-20}
+                        textAnchor="end"
+                        height={58}
+                      />
+                      <YAxis tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={56} />
+                      <Tooltip
+                        cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
+                        contentStyle={{
+                          fontSize: 12,
+                          borderRadius: 10,
+                          border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+                          background: isDark ? '#18181b' : '#fff',
+                          color: isDark ? '#e4e4e7' : '#1e293b',
+                          boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
+                          padding: '8px 12px',
+                        }}
+                        formatter={(v: number) => [normZero(v).toLocaleString('zh-CN', { maximumFractionDigits: 2 }), '消耗积分']}
+                      />
+                      <Bar dataKey="1" fill="#8b5cf6" radius={[4, 4, 0, 0]} maxBarSize={40}>
+                        <LabelList
+                          dataKey="1"
+                          position="top"
+                          formatter={(v: number) => (v >= 10000 ? `${(v / 10000).toFixed(1)}w` : v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(0))}
+                          style={{ fontSize: 10, fill: isDark ? '#a1a1aa' : '#94a3b8', fontWeight: 500 }}
+                        />
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
               </div>
             )}
             {usageErrors.length > 0 && (
