@@ -48,8 +48,16 @@ const CTX_1M: u64 = 1_000_000;
 /// L3：其余模型默认 128K（与旧 /v1/models 的 131072 一致）
 const CTX_128K: u64 = 131_072;
 
-/// 倍率初始参考（客户端下拉实测，随官网同步覆盖，§3.2）
-const RATE_REF: [(&str, f64); 13] = [
+/// 倍率初始参考（客户端下拉实测，随官网同步覆盖，§3.2）。
+/// 审查补充（2026-09-13）：本机 api_models.json 官网同步从未带出 rate（L2 恒 None），
+/// 下列 5 个模型三层兜底全空 → 帮助列表倍率恒"—"。按官方上线公告/社区实测帖补齐：
+/// - qwen3.8-max 1.50x：forum.trae.cn/t/topic/175814（官方上线公告 2026-08-13）
+/// - qwen3.8-flash 0.08x：forum.trae.cn/t/topic/178258（官方上线公告 2026-08-27）
+/// - kimi-k2.6 0.69 / minimax-m3 0.26 / qwen-3.7-plus 0.25：
+///   forum.trae.cn/t/topic/175456（社区实测帖 2026-08-11）
+/// 注意：该帖与其余 RATE_REF 值存在口径差异（如 glm-5.2 0.40 vs 0.78），为不覆盖
+/// 原有"客户端下拉实测"口径，仅补缺失条目、不改既有值。
+const RATE_REF: [(&str, f64); 18] = [
     ("doubao-seed-evolving", 0.08),
     ("doubao-seed-2.1-pro", 0.08),
     ("doubao-seed-2.1-turbo", 0.20),
@@ -63,6 +71,11 @@ const RATE_REF: [(&str, f64); 13] = [
     ("deepseek-v4-pro-official", 0.72),
     ("kimi-k3", 1.83),
     ("kimi-k2.7-code", 0.83),
+    ("kimi-k2.6", 0.69),
+    ("minimax-m3", 0.26),
+    ("qwen-3.7-plus", 0.25),
+    ("qwen3.8-flash", 0.08),
+    ("qwen3.8-max", 1.50),
 ];
 
 fn doc_rate(canonical: &str) -> Option<f64> {
