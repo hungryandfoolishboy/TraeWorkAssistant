@@ -19,9 +19,11 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 
-/// 托盘菜单句柄：API 启停项文本随服务状态动态切换（do_start/do_stop 内同步）
+/// 托盘菜单句柄：API 网关与代理启停项文本随服务状态动态切换
+///（API 由 api_server::sync_tray_api_text 同步；代理由 proxy::sync_tray_proxy_text 同步）
 pub struct TrayMenu {
     pub api_item: MenuItem<tauri::Wry>,
+    pub proxy_item: MenuItem<tauri::Wry>,
 }
 
 fn main() {
@@ -286,17 +288,19 @@ fn main() {
                     let toggle_item =
                         MenuItem::with_id(app, "toggle", "显示/隐藏", true, None::<&str>)?;
                     let checkin_item =
-                        MenuItem::with_id(app, "checkin", "立即签到", true, None::<&str>)?;
+                        MenuItem::with_id(app, "checkin", "一键签到", true, None::<&str>)?;
                     let api_item =
-                        MenuItem::with_id(app, "api-toggle", "启动 API 服务", true, None::<&str>)?;
+                        MenuItem::with_id(app, "api-toggle", "启动 API 网关", true, None::<&str>)?;
+                    let proxy_item =
+                        MenuItem::with_id(app, "proxy-toggle", "启动 代理", true, None::<&str>)?;
                     let sep = PredefinedMenuItem::separator(app)?;
                     let quit_item =
                         MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
                     let menu = Menu::with_items(
                         app,
-                        &[&toggle_item, &sep, &checkin_item, &api_item, &sep, &quit_item],
+                        &[&toggle_item, &sep, &checkin_item, &api_item, &proxy_item, &sep, &quit_item],
                     )?;
-                    app.manage(TrayMenu { api_item });
+                    app.manage(TrayMenu { api_item, proxy_item });
 
                     let icon = app
                         .default_window_icon()
@@ -345,8 +349,8 @@ fn main() {
                                 }
                             }
                             "checkin" => {
-                                // 托盘一键签到：后台线程执行，防重入锁内完成；
-                                // 跳过已签/冷却账号，完成后发系统通知
+                                // 托盘一键签到：Trae（start_checkin_core 内部防重入锁）
+                                // + WorkBuddy 签到 + 成长计划（同步串行线程，各阶段完成发系统通知）
                                 let app2 = app.clone();
                                 std::thread::spawn(move || {
                                     let st = app2.state::<AppState>();
@@ -361,10 +365,11 @@ fn main() {
                                     ) {
                                         fs_utils::app_log(
                                             &st.data_dir,
-                                            &format!("托盘签到失败: {e}"),
+                                            &format!("托盘 Trae 签到失败: {e}"),
                                         );
-                                        notify::notify(&app2, "签到启动失败", &e);
+                                        notify::notify(&app2, "Trae 签到启动失败", &e);
                                     }
+                                    commands::workbuddy::tray_checkin_all(&app2, &st);
                                 });
                             }
                             "api-toggle" => {
@@ -394,6 +399,36 @@ fn main() {
                                         &format!("托盘 API 服务操作失败: {e}"),
                                     );
                                     notify::notify(app, "API 服务操作失败", &e);
+                                }
+                            }
+                            "proxy-toggle" => {
+                                // 托盘启停代理：与前端共用 proxy_start/proxy_stop 命令
+                                //（菜单文本由 proxy.rs 内 sync_tray_proxy_text 统一同步，覆盖托盘/前端/自动启动三条路径）
+                                let running = app
+                                    .state::<Mutex<Option<commands::proxy::ProxyHandle>>>()
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .is_some();
+                                let result = if running {
+                                    let st = app.state::<AppState>();
+                                    let ps =
+                                        app.state::<Mutex<Option<commands::proxy::ProxyHandle>>>();
+                                    commands::proxy::proxy_stop(app.clone(), st, ps).map(|_| ())
+                                } else {
+                                    let port = app.state::<AppState>().settings().proxy_port;
+                                    let st = app.state::<AppState>();
+                                    let ps =
+                                        app.state::<Mutex<Option<commands::proxy::ProxyHandle>>>();
+                                    commands::proxy::proxy_start(app.clone(), st, ps, port)
+                                        .map(|_| ())
+                                };
+                                if let Err(e) = result {
+                                    let st = app.state::<AppState>();
+                                    fs_utils::app_log(
+                                        &st.data_dir,
+                                        &format!("托盘代理操作失败: {e}"),
+                                    );
+                                    notify::notify(app, "代理操作失败", &e);
                                 }
                             }
                             "quit" => {

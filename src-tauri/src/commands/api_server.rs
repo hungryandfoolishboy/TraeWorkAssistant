@@ -267,7 +267,7 @@ pub async fn do_start(
     sync_tray_api_text(app, true);
     crate::notify::notify(
         app,
-        "API 服务已启动",
+        "API 网关已启动",
         &format!("端口 {port}，池内 {pool_count} 个账号"),
     );
 
@@ -295,7 +295,7 @@ pub async fn do_stop(
         fs_utils::app_log(&state.data_dir, "API 服务已停止");
         drop(guard);
         sync_tray_api_text(app, false);
-        crate::notify::notify(app, "API 服务已停止", "本地网关已关闭");
+        crate::notify::notify(app, "API 网关已停止", "本地网关已关闭");
     }
     Ok(())
 }

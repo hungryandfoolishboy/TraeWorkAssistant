@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -91,6 +91,16 @@ fn kill_stale_proxy_processes(script_path: &std::path::Path) -> Vec<u32> {
 #[cfg(not(target_os = "windows"))]
 fn kill_stale_proxy_processes(_script_path: &std::path::Path) -> Vec<u32> {
     Vec::new()
+}
+
+/// 同步托盘「代理」菜单文本（未运行显示"启动"，运行中显示"停止"）；
+/// 托盘 / 前端命令 / 开机自启三条路径都汇聚到 proxy_start/proxy_stop，此处统一覆盖
+fn sync_tray_proxy_text(app: &tauri::AppHandle, running: bool) {
+    if let Some(tray) = app.try_state::<crate::TrayMenu>() {
+        let _ = tray
+            .proxy_item
+            .set_text(if running { "停止 代理" } else { "启动 代理" });
+    }
 }
 
 #[tauri::command]
@@ -301,6 +311,7 @@ pub fn proxy_start(
                 );
             }
             let _ = app_for_thread.emit("proxy-crashed", "");
+            sync_tray_proxy_text(&app_for_thread, false);
         }
     });
 
@@ -335,6 +346,7 @@ pub fn proxy_start(
         }
     }
 
+    sync_tray_proxy_text(&app, true);
     Ok(ProxyStatus {
         running: true,
         port,
@@ -388,6 +400,7 @@ pub fn proxy_stop(
             );
         }
     }
+    sync_tray_proxy_text(&_app, false);
     Ok(ProxyStatus {
         running: false,
         port,

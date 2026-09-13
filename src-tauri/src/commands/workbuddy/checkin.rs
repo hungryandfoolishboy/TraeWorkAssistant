@@ -341,3 +341,75 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
         }
     });
 }
+
+// ── 托盘一键签到（Trae 之外的两个阶段由 main.rs 托盘线程调用）──────────────
+
+/// 托盘一键签到 WorkBuddy 部分：签到 → 成长计划 同步串行执行（同脚本两阶段，
+/// 串行避免 WB_ROUND_LOCK 并发互斥拒绝），各阶段完成发系统通知。
+/// Trae 签到由 main.rs 复用 start_checkin_core 并行触发，互不阻塞。
+pub fn tray_checkin_all(app: &AppHandle, state: &AppState) {
+    let s = load_settings(state);
+    let script = state.python_dir.join("workbuddy_checkin.py");
+    if !script.exists() {
+        fs_utils::app_log(&state.data_dir, "托盘一键签到：WB 脚本不存在，跳过 WorkBuddy 部分");
+        return;
+    }
+    let growth_args = {
+        let mut a = vec!["--growth".to_string()];
+        if s.growth_travel { a.push("--growth-travel".into()); }
+        if s.growth_lottery { a.push("--growth-lottery".into()); }
+        if s.growth_tasks { a.push("--growth-tasks".into()); }
+        a
+    };
+    let stages = [
+        ("签到", vec!["--json-stream".to_string(), "--skip-checked".to_string()]),
+        ("成长计划", growth_args),
+    ];
+    for (name, args) in stages {
+        let result = Command::new(&state.python_exe)
+            .arg(&script)
+            .args(&args)
+            .creation_flags(0x08000000)
+            .env("AIWORKDATA_DIR", &state.data_dir)
+            .env("PYTHONIOENCODING", "utf-8")
+            .output();
+        match result {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                // 取最后一条可解析 NDJSON；仅 type=done 视为有效轮次结果
+                let done = stdout
+                    .lines()
+                    .rev()
+                    .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+                    .filter(|v| v.get("type") == Some(&serde_json::json!("done")));
+                match done {
+                    Some(d) => {
+                        // 计数器仅签到阶段输出齐全；成长阶段缺字段时降级为「完成」
+                        let summary = match (
+                            d.get("ok").and_then(|v| v.as_i64()),
+                            d.get("already").and_then(|v| v.as_i64()),
+                            d.get("failed").and_then(|v| v.as_i64()),
+                        ) {
+                            (Some(o), Some(a), Some(f)) => format!("成功 {o}，已签 {a}，失败 {f}"),
+                            _ => "完成".to_string(),
+                        };
+                        let msg = format!("WorkBuddy {name}: {summary}");
+                        fs_utils::app_log(&state.data_dir, &msg);
+                        push_notify(Some(app), &state.data_dir, "一键签到", &msg);
+                    }
+                    None => {
+                        fs_utils::app_log(
+                            &state.data_dir,
+                            &format!("托盘一键签到：WorkBuddy {name} 无有效结果输出"),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = format!("WorkBuddy {name}失败: {e}");
+                fs_utils::app_log(&state.data_dir, &msg);
+                push_notify(Some(app), &state.data_dir, "一键签到", &msg);
+            }
+        }
+    }
+}
