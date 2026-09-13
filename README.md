@@ -10,6 +10,8 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 
 </div>
 
+![AI Work 助手](./docs/images/main.png)
+
 > 深度支持 **Trae Work / Trae（Trae CN IDE）/ WorkBuddy / CodeBuddy / 豆包** 五应用：多账号签到、登录态切换、积分看板、成长中心自动化、OpenAI / Anthropic / Codex 三协议兼容 API 网关（Trae + WorkBuddy + 自定义模型三池调度）、6 层设备标识重置等；Trae 双应用同一账号体系可分别切换，WorkBuddy 与 CodeBuddy 共享账号体系，豆包支持快照切换 / 保活 / 额度巡检 / 对话备份。后续规划扩展更多 AI 应用。
 >
 > ⚠️ 本工具与 Trae Work / WorkBuddy / 豆包等官方均无任何关联，仅供学习研究。使用本工具可能违反相关服务条款，风险自担。请仅管理本人合法持有的账号。
