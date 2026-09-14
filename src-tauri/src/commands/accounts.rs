@@ -784,8 +784,11 @@ struct CreditStats {
     work: f64,
     /// 最近一个仍未用完且未过期的积分包过期时间（Unix 秒）
     earliest_expire: Option<i64>,
-    /// 今日购买获得积分（charge_amount > 0 且 start_time 在今日）
-    today_non_checkin_earned: f64,
+    /// 各日期新开积分包额度聚合（键=北京时间日期）：
+    /// entitlement_base_info.start_time 即积分包 CycleStartTime（如
+    /// "2026-09-14 15:52:38"），某日获得积分 = 该日新开全部积分包 credits_limit
+    /// 合计（签到包与购买包均计）；覆盖范围受 API 返回的包历史限制
+    pack_earned_daily: std::collections::BTreeMap<String, f64>,
     /// 会员套餐到期时间（Unix 秒，如「会员 Lite 连续包月」包的 end_time）
     membership_expire: Option<i64>,
     /// 会员套餐下次自动续费扣款时间（Unix 秒，next_billing_time）
@@ -919,25 +922,13 @@ fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, S
     let mut general: f64 = 0.0;
     let mut work: f64 = 0.0;
     let mut earliest_expire: Option<i64> = None;
-    let mut today_non_checkin_earned: f64 = 0.0;
+    let mut pack_earned_daily: std::collections::BTreeMap<String, f64> = Default::default();
     let mut membership_expire: Option<i64> = None;
     let mut membership_next_billing: Option<i64> = None;
 
     // 使用固定 UTC+8 偏移，不依赖 chrono::Local（某些 Windows 环境下可能误判时区）
     let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
     let now_ts = chrono::Utc::now().timestamp();
-
-    // 今日北京时间范围 [00:00:00 +08:00, 23:59:59 +08:00]
-    // start_time 来自 API 是 UTC Unix 时间戳，比较时需要按北京时间判定日期
-    let today_start = chrono::Utc::now()
-        .with_timezone(&cst)
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_local_timezone(cst)
-        .unwrap()
-        .timestamp();
-    let today_end = today_start + 86400;
 
     for pack in &packs {
         // ---- 会员套餐到期时间（不限积分包，扫描全部权益包）----
@@ -1002,23 +993,23 @@ fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, S
                 }
             }
 
-            // 今日购买获得的积分：
-            // start_time 在今日北京时间范围内，且 charge_amount > 0（实际付费购买）
-            // 签到获得的 pack charge_amount=0，不会误判为购买积分
+            // 获得积分归日（积分包 CycleStartTime 口径）：
+            // entitlement_base_info.start_time 即该包 CycleStartTime，某日获得积分 =
+            // 该日新开全部积分包的 credits_limit 合计。签到包（charge_amount=0）与
+            // 购买包（>0）均计入——不能按「签到 delta 合计」算（漏购买），也不能按
+            // 「total - 昨日total + consumed」恒等式反推（包过期/消耗波动虚增，
+            // 实测昨日 earned 虚增至 1300）。
             let start_time = pack
                 .get("entitlement_base_info")
                 .and_then(|e| e.get("start_time"))
                 .and_then(|v| v.as_i64());
-            let charge_amount = pack
-                .get("entitlement_base_info")
-                .and_then(|e| e.get("charge_amount"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            // charge_amount > 0 表示付费购买（如会员连续包月），签到 pack charge_amount=0
-            let is_purchased = charge_amount > 0;
             if let Some(st) = start_time {
-                if st >= today_start && st < today_end && is_purchased {
-                    today_non_checkin_earned += limit;
+                // start_time 为 UTC 秒，按固定 UTC+8 归日
+                let date = chrono::TimeZone::timestamp_opt(&chrono::Utc, st, 0)
+                    .single()
+                    .map(|dt| dt.with_timezone(&cst).date_naive().to_string());
+                if let Some(date) = date {
+                    *pack_earned_daily.entry(date).or_insert(0.0) += limit;
                 }
             }
         }
@@ -1034,7 +1025,7 @@ fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, S
         general: r2(general),
         work: r2(work),
         earliest_expire,
-        today_non_checkin_earned: r2(today_non_checkin_earned),
+        pack_earned_daily,
         membership_expire,
         membership_next_billing,
     })
@@ -1175,7 +1166,7 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
     let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
     let mut ok_count = 0usize;
     let mut thawed_count = 0usize;
-    let mut total_non_checkin_earned: f64 = 0.0;
+    let mut pack_earned_daily: std::collections::BTreeMap<String, f64> = Default::default();
     for a in &accounts.accounts {
         let uid = a
             .user_id
@@ -1210,7 +1201,10 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
                         rc.membership_next_billing.remove(&uid);
                     }
                 }
-                total_non_checkin_earned += stats.today_non_checkin_earned;
+                // 各账号包起始日聚合合并（跨账号同日累加）
+                for (d, e) in &stats.pack_earned_daily {
+                    *pack_earned_daily.entry(d.clone()).or_insert(0.0) += e;
+                }
                 ok_count += 1;
                 // 自动解冻：有积分 + 冷却类型非 SessionDead → 清除
                 if stats.total > 0.0 {
@@ -1243,7 +1237,7 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
     fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
 
     // 记录每日积分快照（total / earned / consumed）
-    record_daily_snapshot(&state, &rc, total_non_checkin_earned);
+    record_daily_snapshot(&state, &rc, &pack_earned_daily);
 
     if thawed_count > 0 {
         cd.updated_at = Some(fs_utils::now_iso());
@@ -1254,13 +1248,19 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
 
 /// 记录每日积分快照（每次刷新剩余积分时计算）：
 /// - total = 所有账号剩余积分之和
+/// - earned = 积分包 CycleStartTime 归日口径：某日获得积分 = 该日新开积分包
+///   （entitlement_base_info.start_time 落在该日）的 credits_limit 合计，签到包与
+///   购买包均计。不能按签到 delta 合计（获得也可能来自购买），也不能按
+///   「total - 昨日total + consumed」恒等式反推——包过期/消耗波动都会被塞进
+///   earned 造成虚增（实测昨日 earned 虚增至 1300）。API 返回历史包时，
+///   可见范围内的历史快照 earned 一并修正。
 /// - consumed 优先取 Trae Work 用量接口今日合计（usage_history.json 的 credits_float，
-///   实际消耗口径，见 commands/usage_history.rs）；无接口数据时回退旧公式
-/// - earned 由恒等式「total = 昨日total + earned - consumed」反推：
-///   earned = total - 昨日total + consumed。
-///   此前 earned 依赖 credits_history.json 的签到 delta 求和，delta 漏记（如今日已签
-///   但 delta=0）时 earned 恒为 0、消耗反被虚增——恒等式口径下数据自愈。
-fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non_checkin_earned: f64) {
+///   实际消耗口径，见 commands/usage_history.rs）；无接口数据时由余额式推算
+fn record_daily_snapshot(
+    state: &State<AppState>,
+    rc: &RemainingCreditsFile,
+    pack_earned_daily: &std::collections::BTreeMap<String, f64>,
+) {
     let today = fs_utils::today_prefix(); // "YYYY-MM-DD"
     let total: f64 = rc.credits.values().sum();
     let total = (total * 100.0).round() / 100.0;
@@ -1299,28 +1299,21 @@ fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non
         }
     }
 
-    let (earned, consumed) = match usage_consumed {
-        Some(consumed) => {
-            let earned = ((total - yesterday_total + consumed) * 100.0).round() / 100.0;
-            // 恒等式在「消耗 > 全部新增」时为负，earned 语义为「获得」，钳制为 0
-            let earned = if earned < 0.0 { 0.0 } else { earned };
-            (earned, consumed)
-        }
+    let r2 = |v: f64| {
+        let r = (v * 100.0).round() / 100.0;
+        if r == 0.0 { 0.0 } else { r }
+    };
+
+    // earned：今日新开积分包额度合计（CycleStartTime 归今日；今日无新包则为 0）
+    let earned = pack_earned_daily.get(&today).copied().unwrap_or(0.0);
+    let earned = r2(earned);
+
+    let consumed = match usage_consumed {
+        Some(consumed) => consumed,
         None => {
-            // 回退口径（用量接口无今日数据时）：
-            // earned = 签到获得积分（credits_history.json delta 之和）+ 非签到获得积分（API 查询）
-            let credits_file: CreditsFile = fs_utils::read_json(&state.path("credits_history.json"));
-            let checkin_earned: f64 = credits_file
-                .records
-                .iter()
-                .filter(|r| r.date == today && r.user_id != "_daily_total")
-                .map(|r| r.delta as f64)
-                .sum();
-            let earned = ((checkin_earned + non_checkin_earned) * 100.0).round() / 100.0;
-            // consumed = |total - earned - yesterday_total|
-            let consumed = (total - earned - yesterday_total).abs();
-            let consumed = (consumed * 100.0).round() / 100.0;
-            (earned, consumed)
+            // 回退口径（用量接口无今日数据时）：余额式推算 |昨日total + earned - total|
+            let consumed = (yesterday_total + earned - total).abs();
+            r2(consumed)
         }
     };
 
@@ -1331,11 +1324,23 @@ fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non
         existing.consumed = consumed;
     } else {
         file.snapshots.push(CreditsDailySnapshot {
-            date: today,
+            date: today.clone(),
             total,
             earned,
             consumed,
         });
+    }
+
+    // 历史修正：API 可见范围内的历史日期（如昨日已入账的签到/购买包），
+    // 用 CycleStartTime 归日口径覆盖旧 earned（旧值多为恒等式反推的失真数据，
+    // 实测昨日 1300）；无快照的日期不补建（total/consumed 无数据源）
+    for (date, e) in pack_earned_daily {
+        if date == &today {
+            continue;
+        }
+        if let Some(snap) = file.snapshots.iter_mut().find(|s| &s.date == date) {
+            snap.earned = r2(*e);
+        }
     }
 
     // 保留 90 天

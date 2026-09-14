@@ -188,8 +188,8 @@ export default function Credits() {
 
   const today = localDate(new Date());
 
-  // 今日新增积分：优先使用 daily snapshot 的 earned 字段（含签到+购买）
-  // 回退：仅签到 history delta
+  // 今日新增积分：优先使用 daily snapshot 的 earned 字段（积分包 CycleStartTime
+  // 归日口径，含签到包与购买包）；回退：仅签到 history delta
   const todayNew = useMemo(() => {
     // 1. 优先从每日快照获取 earned（包含签到 + 非签到获得）
     const snap = creditsDaily.find((s) => s.date === today);
@@ -275,7 +275,7 @@ export default function Credits() {
       const mm = usageModelDay.get(modelFilter);
       if (mm) for (const key of dates) consumed += mm.get(key) ?? 0;
     }
-    // 获得总积分：余额快照 earned 按区间求和
+    // 获得总积分：快照 earned（积分包 CycleStartTime 归日口径）按区间求和
     let earned = 0;
     for (const date of rangeDates(range)) {
       const snap = creditsDaily.find((s) => s.date === date);
@@ -474,7 +474,7 @@ export default function Credits() {
           <StatCard
             label="获得总积分"
             value={normZero(Math.round(rangeAgg.earned)).toLocaleString()}
-            hint="所选区间内获得（余额快照口径）"
+            hint="所选区间内获得（积分包 CycleStartTime 口径）"
             tone="green"
           />
           <StatCard

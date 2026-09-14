@@ -1,5 +1,4 @@
 //! 后台任务域（Python → Rust 重写）：原 src-python 运行时脚本的 Rust 实现。
-//! 方案依据 .trae/documents/python-removal-rust-rewrite.md（P1~P5，由简到难）。
 //!
 //! 布局：
 //! - `wb_common`：WorkBuddy 公共请求层（双源凭证/统一请求头/区域路由/token 刷新/本地 quota 兜底）
