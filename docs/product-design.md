@@ -562,8 +562,8 @@ AI Work 助手是一款面向多账号 Trae Work 用户的桌面端管理工具�
 ```
 前端：React 18 + TypeScript + Tailwind CSS + shadcn/ui + Recharts + Zustand
 外壳：Tauri 2.x（Rust）
-核心：Python 3.13（复用 auto_checkin.py / device_proxy.py）
-切换：PowerShell（复用 trae-switch-bridge.ps1）
+核心：Rust（switcher / tasks / device_proxy 全模块，无外部运行时）
+切换：Rust switcher 模块（原 trae-switch-bridge.ps1 已 Rust 化）
 打包：Tauri Bundler → MSI / NSIS 单文件安装包
 ```
 
@@ -583,11 +583,10 @@ AI Work 助手是一款面向多账号 Trae Work 用户的桌面端管理工具�
 │  ├─ sys::       TW 检测 / CA 检测 / UAC 提权 / 计划任务  │
 │  ├─ jwt::       JWT 解析（exp / data.id），不校验签名    │
 │  └─ watch::     文件监听（accounts.json 变更 → 推事件）  │
-├──────────────────────┬──────────────────────────────────┤
-│  Python Core         │  PowerShell Core                 │
-│  auto_checkin.py     │  trae-switch-bridge.ps1     │
-│  device_proxy.py     │  （登录态备份/恢复、机器码重置）  │
-└──────────────────────┴──────────────────────────────────┘
+├─────────────────────────────────────────────────────────┤
+│  Core (Rust)     tasks / switcher / device_proxy         │
+│  （签到、登录态备份/恢复、机器码重置、MITM 代理）        │
+└─────────────────────────────────────────────────────────┘
 ```
 
 > v2.0 API 网关已实现，内嵌于 Tauri 应用中（axum + tokio runtime），无需独立进程。
@@ -666,17 +665,11 @@ Rust 侧实现，避免为读一个 exp 而拉起 Python 进程：
 
 #### 6.3.6 账号切换
 
-本项目自主实现的账号切换桥（`trae-switch-bridge.ps1`），以参数化非交互模式调用：
+本项目自主实现的登录态切换器（Rust `switcher` 模块，原 `trae-switch-bridge.ps1` 已全量 Rust 化）：
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File trae-switch-bridge.ps1 `
-  -Action Switch -UserId 4487568582777872 -Json
-```
-
-- 新增 `-Action`（Switch / Save / New / Reset / List）与 `-Json` 参数。
-- 以 NDJSON 输出每步进度，Rust 侧转发给前端渲染步骤条。
-- 需管理员权限（重置 MachineGuid），Rust 侧统一以 runas 提权启动。
+- Action：`Switch / SaveCurrentLogin / BackupCurrent / RestoreOnly / ResetMachineId / ResetDeviceIds / KeepAlive`，5 应用档案表驱动（TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy）。
+- 以 NDJSON 输出每步进度（`ProgressSink` 回调 → 前端渲染步骤条），`*-done {success, raw}` 事件契约不变。
+- 仅重置 MachineGuid 需管理员（失败跳过不阻断切换）；其余动作普通用户可运行。
 
 #### 6.3.7 文件监听与状态同步
 
@@ -979,8 +972,7 @@ Anthropic Request─┘                    └─→ Anthropic SSE
 | 设备限制根因分析 | `docs/技术框架（本项目设计）` |
 | 设备 ID 代理方案 | `docs/技术框架（本项目设计）` |
 | JWT 重抓指南 | `docs/tech-framework.md`（开发与运维） |
-| 账号切换器（命令行） | `src-ps/trae-switch-bridge.ps1` |
-| 账号切换器（GUI） | `src-ps/trae-switch-bridge.ps1（集成模式）` |
+| 账号切换器 | `src-tauri/src/switcher/`（原 `src-ps/trae-switch-bridge.ps1` 已 Rust 化删除） |
 | 功能参考界面 | `docs/product-design.md（界面参考）` |
 
 ### 11.2 上游接口清单（v1.0 涉及）

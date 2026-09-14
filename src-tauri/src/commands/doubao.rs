@@ -7,8 +7,6 @@
 //! P3（会话续期）将在 DoubaoAccount 上追加 sessionid/sid_guard 等字段（serde default，向后兼容）。
 
 use serde::Serialize;
-use std::io::BufRead;
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, State};
 
@@ -718,122 +716,48 @@ fn value_to_uid(v: &serde_json::Value) -> Option<String> {
 // 明文 sessionid。因此续期主路径为 KeepAlive（让豆包客户端自己联网滑动续期 sid_guard），
 // 探活巡检对池内明文 sessionid 生效（手动录入 manual 或代理抓包 proxy 来源均可，两者同为明文）。
 
-/// 运行 PS 桥 KeepAlive：启动豆包 → 等待会话联网刷新（8s）→ 优雅关闭（运行中则跳过）。
+/// 运行 KeepAlive：启动豆包 → 等待会话联网刷新（8s）→ 优雅关闭（运行中则跳过）。
 /// NDJSON 进度走 keepalive-progress / keepalive-done 事件，完成后记录池级保活时间戳。
+/// （原经 PS 桥子进程，switcher Rust 化后进程内直调，终态由 run_action 返回值承载）
 #[tauri::command]
 pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    let ps_dir = crate::state::resolve_ps_dir();
-    let bridge = ps_dir.join("trae-switch-bridge.ps1");
-    if !bridge.exists() {
-        return Err(format!("找不到切换脚本: {}", bridge.display()));
-    }
-    let mut child = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &bridge.to_string_lossy(),
-            "-Action",
-            "KeepAlive",
-            "-TargetApp",
-            "Doubao",
-            "-Json",
-        ])
-        // 数据目录注入：与计划任务版保活（已 set AIWORKDATA_DIR）行为对齐，桥日志/ProfilesDir 解析一致
-        .env("AIWORKDATA_DIR", &state.data_dir)
-        .creation_flags(0x08000000)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("启动保活脚本失败: {e}"))?;
-
-    let stdout = child.stdout.take().ok_or("保活脚本无输出")?;
-    let stderr = child.stderr.take();
+    let args = crate::switcher::RunArgs {
+        action: crate::switcher::Action::KeepAlive,
+        target_app: crate::switcher::TargetApp::Doubao,
+        user_id: None,
+        proxy_port: None,
+        include_indexeddb: false,
+        expected_current_uid: String::new(),
+        data_dir: state.data_dir.clone(),
+    };
     let app2 = app.clone();
     let data_dir = state.data_dir.clone();
-    let stderr_dir = data_dir.clone();
-
     std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut done_emitted = false;
-        // 不能用 BufRead::lines()：PS 桥 stdout 为 GBK（中文非 UTF-8），lines() 首行即 Err
-        // 且 map_while(Result::ok) 会直接终止——保活完成信号永远收不到（实测保活计数恒 0 的根因）。
-        // 改为字节级 read_until + lossy 解码：ASCII 的 stage 标记不受 GBK 影响。
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-            let l = String::from_utf8_lossy(&buf).trim().to_string();
-            if l.is_empty() {
-                continue;
-            }
-            let _ = app2.emit("keepalive-progress", &l);
-            if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
-                let success = l.contains("\"stage\":\"done\"");
-                done_emitted = true;
-                let _ = app2.emit("keepalive-done", serde_json::json!({ "success": success, "raw": l }));
-                if success {
-                    // 记录池级保活时间戳 + 运维历史（写入失败不影响保活结果）
-                    let pool_path = data_dir.join("data").join("doubao_accounts.json");
-                    if let Ok(raw) = std::fs::read_to_string(&pool_path) {
-                        if let Ok(mut pool) = serde_json::from_str::<DoubaoAccountPool>(&raw) {
-                            pool.last_keepalive_at = Some(fs_utils::now_ts());
-                            let _ = fs_utils::write_json(&pool_path, &pool);
-                        }
-                    }
-                    append_history_event(
-                        &data_dir,
-                        serde_json::json!({
-                            "ts": fs_utils::now_ts(), "kind": "keepalive", "ok": true,
-                            "summary": "KeepAlive 保活完成", "source": "app",
-                        }),
-                    );
+        let sink = crate::switcher::TauriSink::new(&app2, "keepalive-progress", &data_dir);
+        let result = crate::switcher::run_action(args, &sink);
+        let (success, raw) = match &result {
+            Ok(line) => (true, line.clone()),
+            Err(line) => (false, line.clone()),
+        };
+        let _ = app2.emit("keepalive-done", serde_json::json!({ "success": success, "raw": raw }));
+        if success {
+            // 记录池级保活时间戳 + 运维历史（写入失败不影响保活结果）
+            let pool_path = data_dir.join("data").join("doubao_accounts.json");
+            if let Ok(raw) = std::fs::read_to_string(&pool_path) {
+                if let Ok(mut pool) = serde_json::from_str::<DoubaoAccountPool>(&raw) {
+                    pool.last_keepalive_at = Some(fs_utils::now_ts());
+                    let _ = fs_utils::write_json(&pool_path, &pool);
                 }
             }
-        }
-        let exit_status = child.wait();
-        if !done_emitted {
-            let success = matches!(&exit_status, Ok(s) if s.success());
-            let _ = app2.emit(
-                "keepalive-done",
-                serde_json::json!({ "success": success, "raw": format!("exit: {:?}", exit_status) }),
+            append_history_event(
+                &data_dir,
+                serde_json::json!({
+                    "ts": fs_utils::now_ts(), "kind": "keepalive", "ok": true,
+                    "summary": "KeepAlive 保活完成", "source": "app",
+                }),
             );
         }
     });
-
-    // stderr 线程：防管道写满死锁，落 switcher.log
-    if let Some(stderr) = stderr {
-        std::thread::spawn(move || {
-            let log_path = stderr_dir.join("logs").join("switcher.log");
-            let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
-            // 桥 stderr 同为 GBK：字节级读取 + lossy，避免 lines() 首行 Err 截断后续日志
-            let mut stderr_reader = std::io::BufReader::new(stderr);
-            let mut stderr_buf: Vec<u8> = Vec::new();
-            loop {
-                stderr_buf.clear();
-                match stderr_reader.read_until(b'\n', &mut stderr_buf) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-                let line = String::from_utf8_lossy(&stderr_buf);
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                {
-                    use std::io::Write;
-                    let _ = f.write_all(format!("[{}] [keepalive][stderr] {}\n", fs_utils::now_ts(), line.trim()).as_bytes());
-                }
-            }
-        });
-    }
-
     Ok(())
 }
 
@@ -1281,25 +1205,20 @@ fn schtasks_create_failure(state: &State<AppState>, task: &str, stderr: &str) ->
     detail.to_string()
 }
 
-/// 注册豆包会话续期每日计划任务（schtasks 调 PS 桥 KeepAlive：启动豆包 8s 联网滑动续期后关闭）
+/// 注册豆包会话续期每日计划任务（schtasks 直调主 exe --task-run doubao-keepalive：
+/// 启动豆包 8s 联网滑动续期后关闭，switcher Rust 化后不再依赖 PS 桥）
 #[tauri::command(async)]
 pub fn doubao_renew_task_register(state: State<AppState>, time: String) -> Result<(), String> {
     // 审查修复（命令注入）：原 contains(':')/len 弱校验可被 "12:3&calc" 绕过，改严格白名单
     crate::commands::misc::validate_hhmm(&time)?;
-    let ps_dir = crate::state::resolve_ps_dir();
-    let bridge = ps_dir.join("trae-switch-bridge.ps1");
-    if !bridge.exists() {
-        return Err(format!("找不到切换脚本: {}", bridge.display()));
-    }
+    let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
     let data_dir = state.data_dir.to_string_lossy();
-    // 命令写入 .cmd 启动器（/TR 261 字符上限，详见 write_task_launcher）；KeepAlive 无需 UserId
+    // 命令写入 .cmd 启动器（/TR 261 字符上限，详见 write_task_launcher）；KeepAlive 无需 UserId。
+    // 规则 R3：set "VAR=..." 与 "{exe}" 双引号形态使值中空格/中文/& 均安全
     let tr = write_task_launcher(
         &state,
         "doubao_renew",
-        format!(
-            "set \"AIWORKDATA_DIR={data_dir}\"\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\" -Action KeepAlive -TargetApp Doubao -Json",
-            bridge.to_string_lossy()
-        ),
+        format!("set \"AIWORKDATA_DIR={data_dir}\"\r\n\"{}\" --task-run doubao-keepalive", exe.to_string_lossy()),
     )?;
     let (ok, _stdout, stderr) = crate::commands::misc::run_schtasks(&[
         "/Create",
@@ -1318,6 +1237,30 @@ pub fn doubao_renew_task_register(state: State<AppState>, time: String) -> Resul
     }
     fs_utils::app_log(&state.data_dir, &format!("豆包续期定时任务已注册: {time}（启动器 {tr}）"));
     Ok(())
+}
+
+/// 已注册机器的一次性迁移（PS 7.2）：旧 KeepAlive 启动器引用 PS 桥 → 原地改写为
+/// `--task-run doubao-keepalive`。schtasks 条目指向启动器文件路径——改写文件内容即
+/// 完成迁移，无需 schtasks 操作。幂等：内容不含 trae-switch-bridge.ps1 即跳过；
+/// 失败静默（app_log 留痕，下次启动重试）。main.rs 启动期调用（try_migrate_legacy_task 之后）。
+pub fn try_migrate_keepalive_launcher(state: &AppState) -> Option<String> {
+    let launcher = state.data_dir.join("task_doubao_renew.cmd");
+    let Ok(content) = std::fs::read_to_string(&launcher) else { return None };
+    if !content.contains("trae-switch-bridge.ps1") {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let body = format!(
+        "@echo off\r\nset \"AIWORKDATA_DIR={dir}\"\r\n\"{exe}\" --task-run doubao-keepalive\r\n",
+        dir = state.data_dir.to_string_lossy(),
+        exe = exe.to_string_lossy()
+    );
+    if std::fs::write(&launcher, body).is_err() {
+        return None;
+    }
+    let note = "计划任务迁移：豆包续期 KeepAlive 已切换为内置 Rust 实现（--task-run doubao-keepalive）".to_string();
+    fs_utils::app_log(&state.data_dir, &note);
+    Some(note)
 }
 
 /// 查询豆包续期计划任务状态（存在与否 + 触发时间）
@@ -1460,117 +1403,37 @@ pub fn doubao_open_as_account(
     // passport 会吊销会话（快照文件完好但已"中毒"），恢复后一联网即被强制登出。
     // 探测 expired 时中止并给出补救指引；不可验证 fail-open（见 probe_slot_session_alive）。
     probe_slot_session_alive(&state.data_dir, &uid)?;
-    let bridge = crate::state::resolve_ps_dir().join("trae-switch-bridge.ps1");
-    if !bridge.exists() {
-        return Err(format!("找不到切换脚本: {}", bridge.display()));
-    }
     let include_idb = state.settings().doubao_snapshot_include_idb;
-    // 防误覆盖守卫（严格版）：切换回写"当前态"到来源账号槽前，桥会校验检测 uid 与
-    // current_account.txt 一致。这里取"uid 检测 + Live Cookies 登录会话验证"双条件——
-    // 未登录时返回空串，桥侧跳过账号槽回写只备份 last（防止未登录态污染账号快照）
+    // 防误覆盖守卫（严格版）：切换回写"当前态"到来源账号槽前，switcher 会校验检测
+    // uid 与 current_account.txt 一致。这里取"uid 检测 + Live Cookies 登录会话验证"
+    // 双条件——未登录时返回空串，switcher 跳过账号槽回写只备份 last
+    //（防止未登录态污染账号快照）
     let expected_uid = detect_guard_uid_strict(&state);
 
     fs_utils::app_log(&state.data_dir, &format!("一键以账号打开豆包: user_id={uid}"));
 
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args([
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        &bridge.to_string_lossy(),
-        "-Action",
-        "Switch",
-        "-UserId",
-        &uid,
-        "-TargetApp",
-        "Doubao",
-        "-Json",
-    ]);
-    if let Some(p) = proxy_port.filter(|p| *p > 0) {
-        cmd.args(["-ProxyPort", &p.to_string()]);
-    }
-    if include_idb {
-        cmd.arg("-IncludeIndexedDB");
-    }
-    if !expected_uid.is_empty() {
-        cmd.args(["-ExpectedCurrentUid", &expected_uid]);
-    }
-    // 数据目录注入：桥的 ProfilesDir/日志按 AIWORKDATA_DIR 解析（与 switch.rs 一致）
-    cmd.env("AIWORKDATA_DIR", &state.data_dir);
-    let mut child = cmd
-        .creation_flags(0x08000000)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("启动切换脚本失败: {e}"))?;
-
-    let stdout = child.stdout.take().ok_or("切换脚本无输出")?;
-    let stderr = child.stderr.take();
+    let args = crate::switcher::RunArgs {
+        action: crate::switcher::Action::Switch,
+        target_app: crate::switcher::TargetApp::Doubao,
+        user_id: Some(uid),
+        proxy_port: proxy_port.filter(|p| *p > 0),
+        include_indexeddb: include_idb,
+        expected_current_uid: expected_uid,
+        data_dir: state.data_dir.clone(),
+    };
     let app2 = app.clone();
-    let stderr_dir = state.data_dir.clone();
-
-    // stdout 线程：NDJSON -> switch-progress / switch-done（与切换管线完全一致）
+    let data_dir = state.data_dir.clone();
+    // 后台线程执行（含优雅关闭 8s 等待，不阻塞命令返回）
     std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut done_emitted = false;
-        // 同 KeepAlive：桥 stdout 为 GBK，BufRead::lines() 首行 Err 即终止，改字节级读取
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-            let l = String::from_utf8_lossy(&buf).trim().to_string();
-            if l.is_empty() {
-                continue;
-            }
-            let _ = app2.emit("switch-progress", &l);
-            if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
-                let success = l.contains("\"stage\":\"done\"");
-                done_emitted = true;
-                let _ = app2.emit("switch-done", serde_json::json!({ "success": success, "raw": l }));
-            }
-        }
-        let exit_status = child.wait();
-        if !done_emitted {
-            let success = matches!(&exit_status, Ok(s) if s.success());
-            let _ = app2.emit(
-                "switch-done",
-                serde_json::json!({ "success": success, "raw": format!("exit: {:?}", exit_status) }),
-            );
-        }
+        // 进度复用 switch-progress / switch-done 事件管线（与切换管线完全一致）
+        let sink = crate::switcher::TauriSink::new(&app2, "switch-progress", &data_dir);
+        let result = crate::switcher::run_action(args, &sink);
+        let (success, raw) = match &result {
+            Ok(line) => (true, line.clone()),
+            Err(line) => (false, line.clone()),
+        };
+        let _ = app2.emit("switch-done", serde_json::json!({ "success": success, "raw": raw }));
     });
-
-    // stderr 线程：防管道写满死锁，落 switcher.log
-    if let Some(stderr) = stderr {
-        std::thread::spawn(move || {
-            let log_path = stderr_dir.join("logs").join("switcher.log");
-            let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
-            // 桥 stderr 同为 GBK：字节级读取 + lossy，避免 lines() 首行 Err 截断后续日志
-            let mut stderr_reader = std::io::BufReader::new(stderr);
-            let mut stderr_buf: Vec<u8> = Vec::new();
-            loop {
-                stderr_buf.clear();
-                match stderr_reader.read_until(b'\n', &mut stderr_buf) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-                let line = String::from_utf8_lossy(&stderr_buf);
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                {
-                    use std::io::Write;
-                    let _ = f.write_all(format!("[{}] [open-as][stderr] {}\n", fs_utils::now_ts(), line.trim()).as_bytes());
-                }
-            }
-        });
-    }
     Ok(())
 }
 

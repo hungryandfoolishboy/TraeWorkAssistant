@@ -1,11 +1,10 @@
 use serde::Serialize;
-use std::io::Write;
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
+use crate::switcher::{Action, RunArgs, TauriSink, TargetApp};
 
 /// 登录态快照信息
 #[derive(Serialize, Clone)]
@@ -110,7 +109,7 @@ pub fn profile_list(state: State<AppState>, target_app: Option<String>) -> Vec<P
     out
 }
 
-/// 备份当前 TRAE 登录态到指定 slot（调用 PowerShell 脚本）
+/// 备份当前登录态到指定 slot（switcher BackupCurrent 动作，进程内直调）
 #[tauri::command]
 pub fn profile_backup(
     app: AppHandle,
@@ -118,108 +117,43 @@ pub fn profile_backup(
     user_id: String,
     target_app: Option<String>,
 ) -> Result<(), String> {
-    // uid 直接作为快照槽目录名传给 PS 桥，先做防路径注入校验
+    // uid 直接作为快照槽目录名传入 switcher，先做防路径注入校验
     fs_utils::ensure_uid_safe(user_id.trim())?;
     let target = normalize_target_app(target_app.as_deref());
-    // 复用全局解析（便携模式 TAURI_RESOURCE_DIR / 默认资源目录），与 switch.rs 同源
-    let ps_dir = crate::state::resolve_ps_dir();
-    let bridge = ps_dir.join("trae-switch-bridge.ps1");
-    if !bridge.exists() {
-        return Err(format!("找不到切换脚本: {}", bridge.display()));
-    }
-
     fs_utils::app_log(
         &state.data_dir,
         &format!("开始备份登录态: user_id={user_id}, target_app={target}"),
     );
-
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args([
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        &bridge.to_string_lossy(),
-        "-Action",
-        "BackupCurrent",
-        "-UserId",
-        &user_id,
-        "-TargetApp",
-        target,
-        "-Json",
-    ]);
     // C4：豆包快照可选纳入 IndexedDB
-    if target == "Doubao" && state.settings().doubao_snapshot_include_idb {
-        cmd.arg("-IncludeIndexedDB");
-    }
-    let mut child = cmd
-        .creation_flags(0x08000000)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("启动备份失败: {e}"))?;
-
-    let stdout = child.stdout.take().ok_or("备份脚本无输出")?;
-    let stderr = child.stderr.take();
+    let include_idb = target == "Doubao" && state.settings().doubao_snapshot_include_idb;
+    let args = RunArgs {
+        action: Action::BackupCurrent,
+        target_app: TargetApp::parse(target),
+        user_id: Some(user_id),
+        proxy_port: None,
+        include_indexeddb: include_idb,
+        expected_current_uid: String::new(),
+        data_dir: state.data_dir.clone(),
+    };
     let app2 = app.clone();
     let data_dir = state.data_dir.clone();
-
-    // stdout 线程：NDJSON -> profile-progress 事件
+    // 后台线程执行（含优雅关闭等待，不阻塞命令返回；与原 stdout 读线程同语义）
     std::thread::spawn(move || {
-        let reader = std::io::BufReader::new(stdout);
-        let mut done_emitted = false;
-        for line in std::io::BufRead::lines(reader) {
-            if let Ok(l) = line {
-                let l = l.trim().to_string();
-                if l.is_empty() {
-                    continue;
-                }
-                let _ = app2.emit("profile-progress", &l);
-                if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
-                    let success = l.contains("\"stage\":\"done\"");
-                    done_emitted = true;
-                    let _ = app2.emit(
-                        "profile-done",
-                        serde_json::json!({ "success": success, "raw": l, "action": "backup" }),
-                    );
-                }
-            }
-        }
-        let exit_status = child.wait();
-        if !done_emitted {
-            let success = matches!(&exit_status, Ok(s) if s.success());
-            let _ = app2.emit(
-                "profile-done",
-                serde_json::json!({ "success": success, "raw": format!("exit: {:?}", exit_status), "action": "backup" }),
-            );
-        }
+        let sink = TauriSink::new(&app2, "profile-progress", &data_dir);
+        let result = crate::switcher::run_action(args, &sink);
+        let (success, raw) = match &result {
+            Ok(line) => (true, line.clone()),
+            Err(line) => (false, line.clone()),
+        };
+        let _ = app2.emit(
+            "profile-done",
+            serde_json::json!({ "success": success, "raw": raw, "action": "backup" }),
+        );
     });
-
-    // stderr 线程
-    if let Some(stderr) = stderr {
-        std::thread::spawn(move || {
-            let log_path = data_dir.join("logs").join("switcher.log");
-            let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
-            let reader = std::io::BufReader::new(stderr);
-            for line in std::io::BufRead::lines(reader) {
-                if let Ok(l) = line {
-                    let l = format!("[stderr] {}", l.trim());
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log_path)
-                    {
-                        let _ = std::writeln!(f, "[{}] {}", fs_utils::now_ts(), l);
-                    }
-                }
-            }
-        });
-    }
-
     Ok(())
 }
 
-/// 恢复指定 slot 的登录态（关闭 TRAE → 恢复 → 启动 TRAE）
+/// 恢复指定 slot 的登录态（关闭客户端 → 恢复 → 启动，switcher RestoreOnly 动作）
 #[tauri::command]
 pub fn profile_restore(
     app: AppHandle,
@@ -232,103 +166,38 @@ pub fn profile_restore(
     if !slot_dir.exists() {
         return Err(format!("账号 {} 的登录态快照不存在", user_id));
     }
-    // uid 直接作为快照槽目录名传给 PS 桥，先做防路径注入校验
+    // uid 直接作为快照槽目录名传入 switcher，先做防路径注入校验
     fs_utils::ensure_uid_safe(user_id.trim())?;
     let target = normalize_target_app(target_app.as_deref());
-
-    // 复用全局解析（便携模式 TAURI_RESOURCE_DIR / 默认资源目录），与 switch.rs 同源
-    let ps_dir = crate::state::resolve_ps_dir();
-    let bridge = ps_dir.join("trae-switch-bridge.ps1");
-    if !bridge.exists() {
-        return Err(format!("找不到切换脚本: {}", bridge.display()));
-    }
-
     fs_utils::app_log(
         &state.data_dir,
         &format!("开始恢复登录态: user_id={user_id}, target_app={target}"),
     );
-
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args([
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        &bridge.to_string_lossy(),
-        "-Action",
-        "RestoreOnly",
-        "-UserId",
-        &user_id,
-        "-TargetApp",
-        target,
-        "-Json",
-    ]);
-    // C4：豆包快照可选纳入 IndexedDB（恢复侧桥脚本对快照内含 IndexedDB 一律回写，此开关主要影响备份）
-    if target == "Doubao" && state.settings().doubao_snapshot_include_idb {
-        cmd.arg("-IncludeIndexedDB");
-    }
-    let mut child = cmd
-        .creation_flags(0x08000000)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("启动恢复失败: {e}"))?;
-
-    let stdout = child.stdout.take().ok_or("恢复脚本无输出")?;
-    let stderr = child.stderr.take();
+    // C4：豆包快照可选纳入 IndexedDB（恢复侧对快照内含 IndexedDB 一律回写，此开关主要影响备份）
+    let include_idb = target == "Doubao" && state.settings().doubao_snapshot_include_idb;
+    let args = RunArgs {
+        action: Action::RestoreOnly,
+        target_app: TargetApp::parse(target),
+        user_id: Some(user_id),
+        proxy_port: None,
+        include_indexeddb: include_idb,
+        expected_current_uid: String::new(),
+        data_dir: state.data_dir.clone(),
+    };
     let app2 = app.clone();
     let data_dir = state.data_dir.clone();
-
     std::thread::spawn(move || {
-        let reader = std::io::BufReader::new(stdout);
-        let mut done_emitted = false;
-        for line in std::io::BufRead::lines(reader) {
-            if let Ok(l) = line {
-                let l = l.trim().to_string();
-                if l.is_empty() {
-                    continue;
-                }
-                let _ = app2.emit("profile-progress", &l);
-                if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
-                    let success = l.contains("\"stage\":\"done\"");
-                    done_emitted = true;
-                    let _ = app2.emit(
-                        "profile-done",
-                        serde_json::json!({ "success": success, "raw": l, "action": "restore" }),
-                    );
-                }
-            }
-        }
-        let exit_status = child.wait();
-        if !done_emitted {
-            let success = matches!(&exit_status, Ok(s) if s.success());
-            let _ = app2.emit(
-                "profile-done",
-                serde_json::json!({ "success": success, "raw": format!("exit: {:?}", exit_status), "action": "restore" }),
-            );
-        }
+        let sink = TauriSink::new(&app2, "profile-progress", &data_dir);
+        let result = crate::switcher::run_action(args, &sink);
+        let (success, raw) = match &result {
+            Ok(line) => (true, line.clone()),
+            Err(line) => (false, line.clone()),
+        };
+        let _ = app2.emit(
+            "profile-done",
+            serde_json::json!({ "success": success, "raw": raw, "action": "restore" }),
+        );
     });
-
-    if let Some(stderr) = stderr {
-        std::thread::spawn(move || {
-            let log_path = data_dir.join("logs").join("switcher.log");
-            let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
-            let reader = std::io::BufReader::new(stderr);
-            for line in std::io::BufRead::lines(reader) {
-                if let Ok(l) = line {
-                    let l = format!("[stderr] {}", l.trim());
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log_path)
-                    {
-                        let _ = std::writeln!(f, "[{}] {}", fs_utils::now_ts(), l);
-                    }
-                }
-            }
-        });
-    }
-
     Ok(())
 }
 

@@ -21,8 +21,7 @@ node scripts/rename_release.mjs     # 产物统一输出到 release/，中文命
 测试：
 
 ```powershell
-cargo test                                    # Rust 单测（需先装工具链）
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Pester -Script tests/ps/trae-switch-bridge.Tests.ps1 -EnableExit"   # PS 桥黑盒测试（Pester 3.4+，守卫/参数校验路径）
+cargo test                                    # Rust 单测（需先装工具链；切换器/签到/网关全覆盖）
 ```
 
 ## 3. 技术栈
@@ -32,7 +31,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Pester -Script te
 | 外壳 | Tauri 2.x (Rust 1.75+ MSVC) |
 | 前端 | React 18 + TypeScript 5 + Vite 5 + Tailwind 3 + Zustand 4 + Recharts 2 + lucide-react |
 | 后端 | Rust (serde / chrono / axum / ureq / tauri-plugin-{shell,dialog,notification,single-instance}) |
-| 辅助 | Node.js 18+（scripts/*.mjs 发布工具链，零 npm 依赖）+ PowerShell 5.1+（系统自带） |
+| 辅助 | Node.js 18+（scripts/*.mjs 发布工具链，零 npm 依赖）；PowerShell 运行时依赖已移除（switcher 模块进程内直调） |
 
 ## 4. 目录地图
 
@@ -51,7 +50,7 @@ ai-work-assistant/
 │   └── pages/                    # Dashboard / Accounts(661行编排 + accounts/ 16 个拆分子组件) / Checkin / Credits / Logs / ApiService / Settings
 ├── scripts/                      # dev-tauri.mjs(tauri 脚本入口) / sync_version.mjs / rename_release.mjs / package_portable.mjs / gen_asset_base64.mjs
 ├── src-tauri/
-│   ├── tauri.conf.json           # 无装饰窗 / bundle.resources = ../src-ps/（Python 运行时已移除，全 Rust）
+│   ├── tauri.conf.json           # 无装饰窗 / 无外部资源（Python 与 PS 桥均已移除，全 Rust）
 │   └── src/
 │       ├── main.rs               # 注册全部命令
 │       ├── state.rs              # AppState（%APPDATA%\AIWorkAssistant + 旧目录迁移）
@@ -73,7 +72,14 @@ ai-work-assistant/
 │           ├── trae_checkin.rs   # 批量签到（vault 解密内存传递，无子进程）
 │           ├── wb_checkin.rs     # WorkBuddy 签到/成长/续期（run_checkin_round / run_growth_round / run_renew_only）
 │           └── doubao_*.rs       # 豆包会话续期 / 额度巡检 / 对话导出
-└── src-ps/trae-switch-bridge.ps1 # 非交互切换桥 + NDJSON 步骤输出
+│       └── switcher/            # 登录态切换器（原 PS 桥 trae-switch-bridge.ps1 全量 Rust 化）
+│           ├── mod.rs           # run_action 入口 + 7 Action 编排 + ProgressSink（TauriSink/CliSink）
+│           ├── profile.rs       # 5 应用 × 3 快照布局档案表（icube/chromium/authfile）
+│           ├── locate.rs        # exe 六级发现（settings→候选→lnk→注册表→进程→缓存）
+│           ├── proc.rs          # 三级关闭（WM_CLOSE→强杀→等待）+ 启动（可选 --proxy-server）
+│           ├── machine.rs       # 6 层设备标识重置 + MachineGuid
+│           ├── copy.rs          # 快照复制原语 + .bak 单代轮转
+│           └── icube / chromium / authfile.rs  # 三布局快照管线
 ```
 
 ## 5. Tauri 命令契约
@@ -103,9 +109,9 @@ ai-work-assistant/
 | 签到 | `checkin_trends(days?)` → `CheckinTrendPoint[]` | 近 N 天签到结果按日汇总（T8，data/checkin_results.json，保留 90 天） |
 | 环境 | `app_locate(targetApp)` → `AppLocate` | 四应用安装位置四级探测（手动指定→注册表→默认路径→进程反查，F-01）；`targetApp: trae_work\|trae\|doubao\|workbuddy` |
 | 环境 | `open_doubao_app()` | 启动豆包桌面版（复用 app_locate 豆包档案探测） |
-| 切换 | `switch_account(userId)` | 调 `trae-switch-bridge.ps1 -Action Switch`（进程三级关闭策略）；`target_app` 支持 TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy |
+| 切换 | `switch_account(userId)` | 调 `switcher::run_action(Switch)`（进程内直调，三级关闭策略）；`target_app` 支持 TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy |
 | 切换 | `reset_device_ids(userId)` | switch 模块：重置设备指纹（区别于 misc 的 `device_reset` 只删映射）；仅 icube 布局 |
-| 保存 | `save_current_login(userId)` | 调 `trae-switch-bridge.ps1 -Action SaveCurrentLogin`；`target_app` 支持 TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy |
+| 保存 | `save_current_login(userId)` | 调 `switcher::run_action(SaveCurrentLogin)`；`target_app` 支持 TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy |
 | 快照 | `profile_list` → `ProfileInfo[]` | 列出快照槽；`target_app` 决定根目录 profiles / profiles_trae / profiles_doubao / profiles_codebuddy |
 | 快照 | `profile_backup(userId)` / `profile_restore(userId)` / `profile_delete(slot)` | 手动备份/恢复/删除；`target_app` 同上 |
 | 快照 | `profile_format_size(...)` | 快照体积格式化 |
@@ -206,9 +212,9 @@ ai-work-assistant/
 | `proxy-log` | `string`（代理 stdout 逐行） |
 | `account-captured` | `string`（新捕获的 userId） |
 | `checkin-progress` | `{type:'start',total}` / `{type:'account',...}` / `{type:'done',ok,already,failed}` |
-| `switch-progress` | `string`（PowerShell NDJSON 单行） |
+| `switch-progress` | `string`（switcher NDJSON 单行） |
 | `switch-done` | `{ success: boolean, raw: string }` |
-| `save-login-progress` | `string`（PowerShell NDJSON 单行） |
+| `save-login-progress` | `string`（switcher NDJSON 单行） |
 | `save-login-done` | `{ success: boolean, raw: string }` |
 | `update-download-progress` | `{ received, total, percent }`（更新包下载进度） |
 | `update-installing` | `string`（asset_name，安装器已启动、应用即将退出） |
@@ -254,17 +260,16 @@ ai-work-assistant/
 
 **写入约定**：`fs_utils::write_json` 用 `tmp + rename` 原子替换，避免断电损坏。
 
-## 8. PowerShell 切换桥约定
+## 8. 登录态切换器（switcher 模块，原 PS 桥）约定
 
-- **非交互模式**：不需要 `#Requires RunAsAdministrator`，普通用户即可运行。
-- `-Json` 时输出 NDJSON 单行 `{"stage":"...","status":"...","message":"...","time":"..."}`。
-- 入口目录：`$env:APPDATA\TRAE SOLO CN` + `$env:APPDATA\AIWorkAssistant\data\profiles`。
-- **Action 参数**：`Switch` / `SaveCurrentLogin` / `ResetMachineId` / `ResetDeviceIds` / `BackupCurrent` / `RestoreOnly` / `KeepAlive`。
-- **通用参数**：`-TargetApp TraeWork|Trae|Doubao|WorkBuddy|CodeBuddy`、`-Json`、`-ProxyPort <int>`（C1：>0 时启动应用注入 `--proxy-server`）、`-IncludeIndexedDB`（C4：备份纳入 `Default/IndexedDB`）。CodeBuddy 为 authfile 布局：ProcNames 双形态 `CodeBuddy/CodeBuddy CN`、ProfilesDir=profiles_codebuddy、`~/.codebuddy` 无 account-snapshot 时确认步 skip+warn。
+- **进程内直调**：`switcher::run_action(RunArgs, &ProgressSink)`——原 powershell 子进程管道已下线，NDJSON 行 `{"stage","status","message","time"}` 语义与 `*-done {success,raw}` 由 TauriSink/CliSink 一步到位，前端契约不变。
+- **全局互斥**：并发 run_action 直接拒绝（「已有切换/备份操作进行中」），命令层预检（JWT/会话/守卫 uid）在前。
+- **入参**：`action: Switch/SaveCurrentLogin/BackupCurrent/RestoreOnly/ResetMachineId/ResetDeviceIds/KeepAlive`；`user_id`（Reset*/KeepAlive 可空，经 ensure_uid_safe 白名单）；`target_app: trae_work|trae|doubao|workbuddy|codebuddy`；`proxy_port>0` 注入 `--proxy-server`（C1）；`include_indexeddb`（C4：备份纳入 `Default/IndexedDB`）；`expected_current_uid`（防误覆盖守卫）。CodeBuddy 为 authfile 布局：ProcNames 双形态 `CodeBuddy/CodeBuddy CN`、ProfilesDir=profiles_codebuddy、`~/.codebuddy` 无 account-snapshot 时确认步 skip+warn。
+- **CLI 任务模式**：`--task-run doubao-keepalive`（schtasks 直调主 exe；启动器 `task_doubao_renew.cmd` 启动期原地迁移，内容不含 trae-switch-bridge.ps1 即跳过）。
 - **精准备份**：仅复制 9 类核心登录文件（storage.json / state.vscdb / machineid / aha / Network 等），非全量镜像。
 - **Switch 流程**：预检查目标快照 → 关闭 Trae Work → 保存当前到 last + 当前账号槽位 → 恢复目标 → 启动。
 - **SaveCurrentLogin 流程**：关闭 Trae Work → 精准备份到 userId 槽位 → 启动。
-- storage.json 路径：`User\globalStorage\storage.json`，键名用点号访问（`$storage.'telemetry.machineId'`）。
+- storage.json 路径：`User\globalStorage\storage.json`，键名为点号形态整体键（`telemetry.machineId`，非嵌套对象）。
 - **豆包数据目录**：`%LOCALAPPDATA%\Doubao\User Data`（Trae 系用 `%APPDATA%`）；备份项含 Local State / Network/Cookies* / Local Storage/leveldb / Session Storage / DoubaoStorage / saman_app_state / saman_shell_db_storage，`Last Version`（C3 版本基线）。
 - **C3 快照元数据与校验**：备份时写 `snapshot_meta.json`（`schemaVersion=1` / createdAt / chromiumVersion / includeIndexedDB）并复制 `Last Version`；恢复前 `Test-SnapshotIntegrity` 三层校验——① schemaVersion ≠ 1 直接中止（无元数据文件的旧快照仅 warn 并跳过）② leveldb 缺 CURRENT 或 CURRENT 指向的 MANIFEST 缺失 → 中止 ③ 快照版本 ≠ 当前安装版本 → 仅 warn 继续恢复。
 - **单代回滚保护（chromium 布局）**：`Backup-ChromiumProfile` 覆盖已有槽位前把旧快照整体 `Move-Item` 到 `<slot>.bak`（旧 .bak 淘汰）；`Restore-ChromiumProfile` 主槽缺失时回退用 .bak，Switch 预检查同样放行 .bak。背景：Switch 的"备份当前到来源槽"依赖 current_account.txt 与客户端实际登录一致，不一致时会把错误状态反复刷进该槽且不可恢复（实测把 B 快照覆盖成混乱状态）。`Copy-SnapshotItem` 文件分支先删旧目标再拷贝——文件被锁拷贝失败时不会留下旧文件冒充成功；`Copy-SnapshotItem`/`Test-SnapshotIntegrity` 的参数为最终路径（`-Path`），由调用方解析主槽或 .bak。豆包优雅关闭等待 `GracefulWaitSecs=8`（chromium 落盘慢，3 秒强杀会导致文件锁/未落盘）。
@@ -360,7 +365,7 @@ ai-work-assistant/
 ## 14. 已知约束
 
 - 仅 Windows（代理证书安装 + MachineGuid 重置只在 Windows 验证）。
-- PowerShell 切换桥需 Win10/11 自带 PowerShell 5.1+。
+- **PowerShell 运行时依赖已移除**：切换/保存/备份/恢复/保活全链路由 `switcher` 模块进程内直调（仅 Windows，sysinfo 0.33 锁定版——0.38+ 需 rustc 1.88 超出项目 MSRV 1.85）。
 - `profiles_dir` 路径为 `data_dir.join("data").join("profiles")`，注意 `data/` 子目录。
 - LLM API 上游必须设置 `NO_PROXY=*` 避免系统代理循环。
 - 日志文件首行可能有 BOM 前缀（PowerShell 5.1 `-Encoding UTF8`），`split_time` 已处理。

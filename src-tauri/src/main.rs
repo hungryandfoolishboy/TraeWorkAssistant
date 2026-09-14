@@ -9,6 +9,7 @@ mod jwt;
 mod models;
 mod notify;
 mod state;
+mod switcher;
 mod tasks;
 mod vault;
 mod api_server;
@@ -56,6 +57,11 @@ fn main() {
     // 旧版计划任务迁移（并存语义）：按旧任务触发时间重建 AIWorkAssistant_DailyCheckin，
     // 旧任务保留供老应用继续使用；任何一步失败都静默跳过
     if let Some(note) = commands::misc::try_migrate_legacy_task(&state) {
+        fs_utils::app_log(&state.data_dir, &note);
+    }
+    // PS 桥 KeepAlive 启动器一次性迁移：旧 task_doubao_renew.cmd 引用
+    // trae-switch-bridge.ps1 → 原地改写为 --task-run doubao-keepalive（幂等，失败静默）
+    if let Some(note) = commands::doubao::try_migrate_keepalive_launcher(&state) {
         fs_utils::app_log(&state.data_dir, &note);
     }
 

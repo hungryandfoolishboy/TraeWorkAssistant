@@ -76,6 +76,24 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         // TRAE 本地登录态捕获（原 device_proxy.py --capture-local 兜底迁移）：
         // MITM 抓不到鉴权头时，解密 TRAE 本地 Cookies + 扫描 leveldb 提取 Cloud-IDE-JWT 写回
         "trae-capture-local" => crate::device_proxy::local_capture::capture_from_local(state),
+        // 豆包会话保活（schtasks 直调主 exe；原 PS 桥 KeepAlive 已 Rust 化）：
+        // 进度 NDJSON 打印到 stdout（任务日志可查），终态 {"ok":bool}
+        "doubao-keepalive" => {
+            let sink = crate::switcher::CliSink::new(&state.data_dir);
+            crate::switcher::run_action(
+                crate::switcher::RunArgs {
+                    action: crate::switcher::Action::KeepAlive,
+                    target_app: crate::switcher::TargetApp::Doubao,
+                    user_id: None,
+                    proxy_port: None,
+                    include_indexeddb: false,
+                    expected_current_uid: String::new(),
+                    data_dir: state.data_dir.clone(),
+                },
+                &sink,
+            )
+            .map(|_| serde_json::json!({ "ok": true }))
+        }
         // 刷新全部账号剩余积分：按积分包 CycleStartTime 归日口径重算 credits_daily
         // 快照（今日 earned + API 可见历史修正），无需启动 GUI
         "refresh-credits" => crate::commands::accounts::refresh_remaining_credits_impl(state)

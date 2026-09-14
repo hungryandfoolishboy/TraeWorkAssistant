@@ -81,7 +81,7 @@
 - **需求概述**：切换账号后 Trae 内「项目列表」「最近打开」随槽位快照整体回滚而"消失"——根因是 `state.vscdb` 全局键（`solo-lite.local-project-folders`、`history.recentlyOpenedPathsList`）被快照覆盖，而项目本体（本地文件夹）与 `workspaceStorage`/`User/History` 本就跨账号保留。目标：**切到任何账号，项目列表与最近打开都在**。
 - **数据归属事实**（2026-09-10 实测侦察结论）：`state.vscdb` 共约 200 键，其中 7 个账号前缀键（`solo-lite:content-map:<uid>` 会话映射、`solo-lite-mode-state-map-<uid>`）**按账号分区、绝不跨账号合并**（否则产生服务端归属校验失败的"幽灵会话"）；`local-project-folders` / `recentlyOpenedPathsList` 为**全局单键**，是本项目唯一可合并对象；登录态（storage.json/machineid）绝不合并。
 - **实现路径**：
-  1. 在 `src-ps/trae-switch-bridge.ps1` 的 `Switch` / `RestoreOnly` 管线中，恢复槽位快照**前**从当前 state.vscdb 抽出两个全局键，恢复**后**合并写回（`local-project-folders` 按项目 id 合并、快照内已有以快照为准；`recentlyOpenedPathsList` 去重并保留最近打开时间排序）；
+  1. 在 `switcher` 模块的 `Switch` / `RestoreOnly` 管线（原 PS 桥，已 Rust 化）中，恢复槽位快照**前**从当前 state.vscdb 抽出两个全局键，恢复**后**合并写回（`local-project-folders` 按项目 id 合并、快照内已有以快照为准；`recentlyOpenedPathsList` 去重并保留最近打开时间排序）；
   2. SQLite 键级读写：项目约束零新增依赖——优先 PS 调 Python `sqlite3`（标准库）小工具（`src-python/` 已有 sqlite 读库先例 `doubao_chats.py --check-login-cookie`），或 PS `System.Data.SQLite`（系统未必自带，需探测）；
   3. 操作前对 `state.vscdb` 做一次性 `.bak` 备份，失败回滚；全程在 Trae 未运行窗口期执行（切换流程本就先关闭，天然满足）。
 - **参考开源项目**：无直接同类实现（自研分析）；SQLite 处理参照本项目 `doubao_chats.py` 既有模式。

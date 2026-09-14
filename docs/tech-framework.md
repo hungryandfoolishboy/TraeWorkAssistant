@@ -11,7 +11,7 @@
 | UI | React 18 + TypeScript 5 + Vite 5 + Tailwind 3 + Zustand 4 + Recharts 2 + lucide-react | Web 技术栈还原设计稿；Zustand 单一状态源；Recharts 图表 |
 | 外壳 | Tauri 2.x（Rust 1.75+ MSVC） | 包体 8~15MB（远小于 Electron），可调用系统 API（注册表/证书/计划任务/DPAPI） |
 | 核心逻辑 | Rust（`src-tauri/src/tasks/` 直调模块） | 原 Python 脚本已全部重写为 Rust 后台任务（trae_checkin / wb_* / doubao_* / device_proxy），无子进程、无解释器依赖 |
-| 登录态切换 | PowerShell 5.1+（`trae-switch-bridge.ps1`，四应用档案表驱动） | 复用备份/恢复/设备标识重置逻辑，系统自带 |
+| 登录态切换 | Rust `switcher/` 模块（5 应用 × 3 快照布局档案表驱动，进程内直调） | 原 `trae-switch-bridge.ps1` 已全量 Rust 化：sysinfo 进程管理 + windows-registry + lnk 解析，无外部运行时 |
 | API 网关 | Rust axum（内嵌，复用 Tauri tokio runtime） | OpenAI / Anthropic 双协议端点 + SSE 转换 + 账号池调度，无独立进程 |
 | HTTP 客户端 | ureq（同步）+ `spawn_blocking` 包装 | 双 Client 设计：短请求 120s 超时 / 流式仅 ResponseHeaderTimeout 120s，共享连接池 |
 | 加密 | tauri-plugin-stronghold + windows-sys(DPAPI) | jwt/refresh_token 入 vault，主密码经 DPAPI 仅本机当前用户可解 |
@@ -39,7 +39,8 @@ Bridge        Tauri Commands（src-tauri/src/commands/）
                               + WB 池（wb_route/wb_payload/wb_sse/wb_upstream/wb_responses/wb_images/wb_sticky/wb_toolexec/wb_catalog/wb_model_route）
                               + 三池调度（dispatch/unified_catalog/custom_models/custom_route/retry/api_keys/gateway_settings）
 Rust Tasks    tasks/（trae_checkin / wb_checkin / wb_common / wb_credits / ui_click / doubao_session / doubao_quota / doubao_chats）+ device_proxy/（MITM 代理模块）
-PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy + SnapshotLayout）
+Switcher      tasks 外的独立域：switcher/（原 PS 切换桥——profile 档案表 / locate 六级 exe 发现 /
+              proc 三级关闭 / machine 6 层重置 / copy+icube+chromium+authfile 三布局快照管线）
 ```
 
 关键机制：
@@ -127,12 +128,12 @@ PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy
 - 结构化日志 `logs/proxy_req_YYYY-MM-DD.log` 供 `proxy_logs_list/detail` 查询。
 - 同时承担豆包凭证抓包（doubao.com Cookie sessionid/sid_guard/ttwid 落盘供回写）。
 
-### 5.3 `trae-switch-bridge.ps1`（四应用切换桥）
+### 5.3 `switcher/`（登录态切换器，原 PS 切换桥 Rust 化）
 
-- Action：`Switch / SaveCurrentLogin / ResetMachineId / ResetDeviceIds / BackupCurrent / RestoreOnly / KeepAlive`；通用参数 `-TargetApp TraeWork|Trae|Doubao|WorkBuddy`、`-Json`、`-ProxyPort`、`-IncludeIndexedDB`、`-ExpectedCurrentUid`。
-- icube 布局（Trae 双应用）：精准备份 9 类核心文件；chromium 布局（豆包）：白名单目录快照 + `snapshot_meta.json`（schemaVersion=1）+ `Test-SnapshotIntegrity` 三层校验 + `.bak` 单代回滚 + ExpectedCurrentUid 防误覆盖守卫；authfile 布局（WorkBuddy）随其批次接入。
-- 保存前预检登录会话（Cookie 存在性检测），未登录态拒绝入槽。
-- PowerShell 5 需 UTF-8 with BOM + CRLF 行尾（LF 无 BOM 中文解析错误）。
+- Action：`Switch / SaveCurrentLogin / ResetMachineId / ResetDeviceIds / BackupCurrent / RestoreOnly / KeepAlive`；入参 `target_app: TraeWork|Trae|Doubao|WorkBuddy|CodeBuddy`、`proxy_port`（>0 注入 `--proxy-server`）、`include_indexeddb`、`expected_current_uid`（防误覆盖守卫）。
+- icube 布局（Trae 双应用）：精准备份 9 类核心文件；chromium 布局（豆包）：白名单目录快照 + `snapshot_meta.json`（schemaVersion=1）+ 完整性三层校验 + `.bak` 单代回滚 + ExpectedCurrentUid 防误覆盖守卫；authfile 布局（WorkBuddy/CodeBuddy）：L1 auth 文件 + L2 storage/user-* + L3（仅 CodeBuddy）vscdb 登录真源（含 -wal/-shm 边车）。
+- 保存前预检登录会话（Cookie 存在性检测），未登录态拒绝入槽；全局互斥拒绝并发切换。
+- 进度通道：`ProgressSink` 回调（TauriSink emit 事件 / CliSink 打印 stdout），NDJSON 行结构与 `*-done` 事件契约与 PS 桥逐字段兼容。
 
 ### 5.4 API 网关（api_server 模块）
 

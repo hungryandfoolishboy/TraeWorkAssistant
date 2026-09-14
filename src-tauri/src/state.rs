@@ -229,38 +229,5 @@ impl AppState {
     }
 }
 
-/// 定位 ps 脚本目录：覆盖安装版(MSI/NSIS)、便携版(zip 直接运行)、开发期三种布局。
-/// （P5 Python 移除后原 resolve_python_dir 已删；ps 脚本与资源目录定位逻辑保留同构布局）
-pub fn resolve_ps_dir() -> PathBuf {
-    // 1) 运行期 Tauri 注入的资源目录：<RESOURCE_DIR>/ps
-    if let Ok(res) = std::env::var("TAURI_RESOURCE_DIR") {
-        let p = PathBuf::from(res).join("ps");
-        if p.exists() {
-            return p;
-        }
-    }
-    // 2) 可执行文件周边布局（便携版 sidecar / 安装版均可能命中）
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            // dir/resources/ps
-            let c1 = dir.join("resources").join("ps");
-            if c1.exists() {
-                return c1;
-            }
-            // dir/ps（少数打包方式把 ps 放 exe 同级）
-            let c2 = dir.join("ps");
-            if c2.exists() {
-                return c2;
-            }
-            // 上层再找 resources/ps（如 exe 在 "<App>/ai-work-assistant.exe" 嵌套一层）
-            if let Some(parent) = dir.parent() {
-                let c3 = parent.join("resources").join("ps");
-                if c3.exists() {
-                    return c3;
-                }
-            }
-        }
-    }
-    // 3) 开发期：仓库 src-ps
-    PathBuf::from("src-ps")
-}
+// （PS 桥 Rust 化后 resolve_ps_dir 与 tauri.conf.json resources 的 ps/ 资源一并移除——
+// 切换/保存/备份/恢复/保活全链路由 switcher 模块进程内直调，无外部运行时依赖）
