@@ -1,8 +1,13 @@
+//! CA 证书状态与安装（P4-9 Rust 化）：
+//! - 生成：直调 [`crate::device_proxy::ca::ensure_ca`]（兼容 Python 版 RSA CA，
+//!   缺失则用 rcgen 生成，布局 data/certs/{ca.crt,ca.key,ca.cer} 不变）；
+//!   原「device_proxy.py --gen-ca + pip 依赖自愈」链路随 Python 移除一并删除。
+//! - 安装：certutil 管理员写入受信任根（PowerShell RunAs 触发 UAC），流程不变。
+
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use tauri::{AppHandle, State};
 
-use crate::python::spawn_script;
 use crate::state::AppState;
 
 #[derive(serde::Serialize)]
@@ -11,43 +16,6 @@ pub struct CertStatus {
 }
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-/// 取多行文本尾部若干行作为错误摘要（防 traceback 过长刷屏）
-fn stderr_tail(text: &str, lines: usize) -> String {
-    let collected: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let start = collected.len().saturating_sub(lines);
-    collected[start..].join(" | ")
-}
-
-/// 检查当前解析到的 Python 环境能否导入指定模块
-fn python_import_ok(state: &AppState, module: &str) -> bool {
-    matches!(
-        Command::new(&state.python_exe)
-            .args(["-c", &format!("import {module}")])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output(),
-        Ok(o) if o.status.success()
-    )
-}
-
-/// 用当前 Python 环境安装依赖包（用于 cryptography 缺失时自愈）
-fn pip_install(state: &AppState, pkgs: &[&str]) -> Result<(), String> {
-    let out = Command::new(&state.python_exe)
-        .args(["-m", "pip", "install", "--disable-pip-version-check", "--no-input"])
-        .args(pkgs)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("启动 pip 失败: {e}"))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let err = stderr_tail(&String::from_utf8_lossy(&out.stderr), 3);
-    Err(format!(
-        "exit {}：{}",
-        out.status.code().unwrap_or(-1),
-        if err.is_empty() { "无错误输出".into() } else { err }
-    ))
-}
 
 #[tauri::command(async)]
 pub fn cert_status(_app: AppHandle, _state: State<AppState>) -> CertStatus {
@@ -67,43 +35,10 @@ pub fn cert_status(_app: AppHandle, _state: State<AppState>) -> CertStatus {
 
 #[tauri::command(async)]
 pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus, String> {
-    // 0. 依赖自检：cryptography 缺失是 --gen-ca 失败的头号原因（issue #6），先尝试自愈再继续
-    if !python_import_ok(&state, "cryptography") {
-        pip_install(&state, &["cryptography>=42.0.0", "pywin32>=306"]).map_err(|e| {
-            format!(
-                "Python 缺少 cryptography 模块且自动安装失败（{}）。请手动执行：\"{}\" -m pip install cryptography pywin32",
-                e, state.python_exe
-            )
-        })?;
-    }
-
-    // 1. 确保 CA 证书已生成（data_dir/certs/ca.cer），失败时携带子进程真实报错
-    let cer = state.path("certs").join("ca.cer");
-    if !cer.exists() {
-        let child = spawn_script(&state, "device_proxy.py", &["--gen-ca".to_string()], true)?;
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("等待 CA 生成进程失败: {e}"))?;
-        if !cer.exists() {
-            let err = stderr_tail(&String::from_utf8_lossy(&out.stderr), 4);
-            // 最常见根因是 Python 依赖缺失（issue #6）；自检已自动装过 cryptography，
-            // 仍报此错说明环境异常，给出可执行的手动修复指引
-            let hint = if err.contains("No module named") {
-                format!(
-                    "。提示：Python 依赖缺失，请在 \"{}\" 中执行 -m pip install cryptography pywin32 后重试（解释器可查 app.log 的 python_exe= 行）",
-                    state.python_exe
-                )
-            } else {
-                String::new()
-            };
-            return Err(format!(
-                "CA 证书生成失败（exit {}）：{}{}",
-                out.status.code().unwrap_or(-1),
-                if err.is_empty() { "无错误输出".into() } else { err },
-                hint
-            ));
-        }
-    }
+    // 1. 确保 CA 证书已生成（data_dir/certs/ca.cer；ensure_ca 内部兼容历史 RSA CA）
+    let certs_dir = state.path("certs");
+    crate::device_proxy::ca::ensure_ca(&certs_dir)?;
+    let cer = certs_dir.join("ca.cer");
     let cer_arg = cer.to_string_lossy().replace('\\', "/").to_string();
 
     // 2. 管理员权限安装到本地计算机受信任根证书颁发机构（触发 UAC）：

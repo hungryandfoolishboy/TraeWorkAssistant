@@ -3,12 +3,13 @@
 
 mod commands;
 mod checkin_results;
+mod device_proxy;
 mod fs_utils;
 mod jwt;
 mod models;
 mod notify;
-mod python;
 mod state;
+mod tasks;
 mod vault;
 mod api_server;
 mod workbuddy_cli;
@@ -39,6 +40,13 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // CLI 任务模式（D2）：schtasks 计划任务直调主 exe（`--task-run <name>`），
+    // 执行完任务即退出；分支在 Builder 之前，天然绕开单实例插件，不启动 GUI。
+    // Python 运行时移除后计划任务链依赖此入口（原 python 脚本直调的替代）。
+    if let Some(task) = tasks::parse_task_mode(&std::env::args().collect::<Vec<_>>()) {
+        std::process::exit(tasks::run_cli_task(&task, &state));
+    }
 
     if let Some(note) = &migrate_note {
         fs_utils::app_log(&state.data_dir, note);
@@ -420,8 +428,12 @@ fn main() {
                                     let st = app.state::<AppState>();
                                     let ps =
                                         app.state::<Mutex<Option<commands::proxy::ProxyHandle>>>();
-                                    commands::proxy::proxy_start(app.clone(), st, ps, port)
-                                        .map(|_| ())
+                                    // P4 Rust 化：proxy_start 已是异步命令（进程内代理启动含异步绑定），
+                                    // 托盘回调运行在主线程，用 block_on 等待（与 API 服务托盘同款模式）
+                                    tauri::async_runtime::block_on(commands::proxy::proxy_start(
+                                        app.clone(), st, ps, port,
+                                    ))
+                                    .map(|_| ())
                                 };
                                 if let Err(e) = result {
                                     let st = app.state::<AppState>();
@@ -521,13 +533,16 @@ fn main() {
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            // 应用退出时清理代理子进程，防止端口占用
+            // 应用退出时停止进程内代理（P4 Rust 化），防止端口占用
+            commands::proxy::mark_intentional_stop();
             let proxy_state = app_handle.state::<Mutex<Option<commands::proxy::ProxyHandle>>>();
             let mut g = proxy_state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut proxy_was_running = false;
             if let Some(h) = g.take() {
+                proxy_was_running = true;
                 let state = app_handle.state::<AppState>();
-                fs_utils::app_log(&state.data_dir, "应用退出：正在清理代理子进程");
-                drop(h); // Drop trait 会 kill + wait 子进程
+                fs_utils::app_log(&state.data_dir, "应用退出：正在停止进程内代理");
+                h.server.stop(); // 发送 shutdown 信号；句柄 drop 亦触发退出
             }
             // 应用退出时停止 API 服务
             let api_state = app_handle
@@ -538,8 +553,10 @@ fn main() {
                 fs_utils::app_log(&state.data_dir, "应用退出：正在停止 API 服务");
                 rt.handle.stop();
             }
-            // 还原系统代理，避免退出后本机全局断网
-            if let Err(e) = commands::proxy::clear_win_proxy() {
+            // 还原系统代理（#14）：仅当「我们曾接管系统代理」时才还原——
+            // 有用户 VPN 原值则原样还原（原 clear_win_proxy 会把用户梯子一并清掉）；
+            // 代理从未启动/已正常停止则不触碰，避免误关用户自己的 VPN
+            if let Err(e) = commands::proxy::restore_system_proxy_on_exit(proxy_was_running) {
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     fs_utils::app_log(&state.data_dir, &format!("应用退出：还原系统代理失败(可手动关闭): {e}"));
                 }

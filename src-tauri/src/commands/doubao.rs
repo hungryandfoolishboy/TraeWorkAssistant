@@ -32,7 +32,7 @@ pub struct DoubaoAccount {
     /// 最近一次切换/保存登录态时间（展示用，PS 桥写 current_account.txt，这里由前端操作后回填）
     #[serde(default)]
     pub last_active_at: Option<String>,
-    // ── P3 会话续期字段（由 doubao_renew.py 写回）──
+    // ── P3 会话续期字段（由续期巡检 tasks/doubao_session 写回）──
     /// 明文 sessionid（凭证等同密码：仅存本地文件，前端全程掩码展示）
     #[serde(default)]
     pub session_id: Option<String>,
@@ -340,7 +340,7 @@ pub fn doubao_account_remove(state: State<AppState>, user_id: String) -> Result<
 
 /// 探测豆包当前登录账号。
 /// 来源⓪（主）：Local Storage leveldb 的 client_device_info.userId（客户端每次启动自写，
-///   不依赖代理；doubao_chats.py --detect-uid 解析，内部与抓包文件按时间戳比新鲜度）。
+///   不依赖代理；tasks/doubao_chats::detect_uid 解析，内部与抓包文件按时间戳比新鲜度）。
 ///   注意：同 profile 重新登录后 Local State 的 saman.user_id **不更新**（实测 2026-09-09），
 ///   抓包文件在代理未开时也不更新——两者都只能作兜底。
 /// 来源①（兜底）：抓包凭证文件 uid（multi_sids）→ `%LOCALAPPDATA%\Doubao\User Data\Local State`
@@ -369,40 +369,20 @@ pub fn doubao_detect_uid(state: State<AppState>) -> Result<Option<String>, Strin
     Ok(read_current_uid(&state))
 }
 
-/// 调 doubao_chats.py --check-login-cookie 检测某 profile 目录是否持有登录会话 Cookie。
+/// 检测某 profile 目录是否持有登录会话 Cookie（Rust 实现，原 doubao_chats.py --check-login-cookie）。
 /// cookie 名为明文（值加密不影响），可直接判定 sessionid/sid_guard 是否存在。
-/// 返回：Some((是否有会话, sessionid 最小剩余秒数))；None=检测不可用（脚本缺失/读取失败，不阻断流程）。
+/// 返回：Some((是否有会话, sessionid 最小剩余秒数))；None=检测不可用（读取失败，不阻断流程）。
 pub(crate) fn check_profile_login_cookie(
-    state: &State<AppState>,
     profile_dir: &std::path::Path,
 ) -> Option<(bool, Option<i64>)> {
-    let script = state.python_dir.join("doubao_chats.py");
-    if !script.exists() {
+    let v = crate::tasks::doubao_chats::check_login_cookie(profile_dir);
+    if !v.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false) {
         return None;
     }
-    let out = std::process::Command::new(&state.python_exe)
-        .args([
-            script.to_string_lossy().as_ref(),
-            "--check-login-cookie",
-            &profile_dir.to_string_lossy(),
-        ])
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("PYTHONUTF8", "1")
-        .creation_flags(0x08000000)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{'))?;
-    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-    let ok = v.get("ok")?.as_bool()?;
-    if !ok {
-        return None;
-    }
-    let has_session = v.get("has_session")?.as_bool()?;
-    let remaining = v.get("sessionid_remaining_sec").and_then(|x| x.as_i64());
-    Some((has_session, remaining))
+    Some((
+        v.get("has_session")?.as_bool()?,
+        v.get("sessionid_remaining_sec").and_then(serde_json::Value::as_i64),
+    ))
 }
 
 /// 豆包客户端 User Data 目录（Live 态，登录 Cookie/uid 检测用）。
@@ -421,7 +401,7 @@ pub(crate) fn detect_guard_uid_strict(state: &State<AppState>) -> String {
     let Some(uid) = detect_uid_from_local_storage(state) else {
         return String::new();
     };
-    match doubao_live_user_data_dir().and_then(|dir| check_profile_login_cookie(state, &dir)) {
+    match doubao_live_user_data_dir().and_then(|dir| check_profile_login_cookie(&dir)) {
         // 有真实登录会话（非游客态）才放行回写
         Some((true, remaining)) if !is_guest_session(remaining) => uid,
         // 确认无登录会话/游客态（或检测不可用）→ 一律不回写账号槽（宁可不备份，不可覆盖错）
@@ -442,44 +422,20 @@ fn is_guest_session(remaining_sec: Option<i64>) -> bool {
     }
 }
 
-/// 探测通用层：对任意 User Data 目录（Live 或快照槽位）跑 --probe-user-data，
-/// 返回最后一行摘要 JSON 的 status（expired / ok / unknown / error / 空）。
+/// 探测通用层：对任意 User Data 目录（Live 或快照槽位）做两段式会话探活
+///（原 doubao_renew.py --probe-user-data，Rust 实现在 tasks/doubao_session::probe_slot_session）。
+/// 返回最后一行摘要的 status（expired / ok / unknown / error / 空）。
 /// 注意：含网络请求，须在 #[tauri::command(async)] 标记的命令中调用，防 UI 冻结。
-fn probe_user_data_session_raw(
-    python_dir: &std::path::Path,
-    python_exe: &str,
-    user_data: &std::path::Path,
-    user_id: &str,
-) -> String {
-    let script = python_dir.join("doubao_renew.py");
-    if !script.exists() {
-        return String::new(); // 探测脚本缺失不阻断（保持旧行为）
-    }
-    let out = match std::process::Command::new(python_exe)
-        .args([
-            script.to_string_lossy().as_ref(),
-            "--probe-user-data",
-            &user_data.to_string_lossy(),
-            "--probe-uid",
-            user_id,
-        ])
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("PYTHONUTF8", "1")
-        .creation_flags(0x08000000)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return String::new(), // 进程启动失败 fail-open
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with('{'))
-        .and_then(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
-        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s.to_string()))
-        .unwrap_or_default()
+fn probe_user_data_session_raw(user_data: &std::path::Path, user_id: &str) -> String {
+    crate::tasks::doubao_session::probe_slot_session(
+        user_data,
+        user_id,
+        crate::tasks::doubao_session::DEFAULT_PROBE_URL,
+    )
+    .get("status")
+    .and_then(serde_json::Value::as_str)
+    .unwrap_or("")
+    .to_string()
 }
 
 /// 切换/一键打开前预检（仅豆包）：目标槽位存储的会话凭证在服务端是否仍有效。
@@ -490,8 +446,6 @@ fn probe_user_data_session_raw(
 /// 判 expired 时中止切换并给出补救指引；探测不可用/无法验证 fail-open 不阻断。
 pub(crate) fn probe_slot_session_alive(
     data_dir: &std::path::Path,
-    python_dir: &std::path::Path,
-    python_exe: &str,
     user_id: &str,
 ) -> Result<(), String> {
     let profiles = data_dir.join("data").join("profiles_doubao");
@@ -503,7 +457,7 @@ pub(crate) fn probe_slot_session_alive(
         let bak = profiles.join(format!("{user_id}.bak"));
         if bak.exists() { bak } else { return Ok(()); } // 无快照 → 交给桥报「无快照」
     };
-    if probe_user_data_session_raw(python_dir, python_exe, &slot, user_id) == "expired" {
+    if probe_user_data_session_raw(&slot, user_id) == "expired" {
         Err(format!(
             "账号 {user_id} 快照里的登录会话已在服务端失效（常见原因：曾在豆包客户端内对该账号\
              退出登录——客户端会调 passport 接口吊销该会话，此前保存的快照随之中毒）。\
@@ -519,11 +473,11 @@ pub(crate) fn probe_slot_session_alive(
 /// 只验证本地 Cookie 存在性不够——会话可能早已被服务端吊销（客户端内退出过/被顶替），
 /// 此时「保存当前登录态」存进去的就是死会话，之后每次切换该账号都未登录（实测 A 槽事故）。
 /// 判 expired 时拒绝保存并给出补救指引；探测不可用/无法验证 fail-open 不阻断。
-pub(crate) fn probe_live_session_alive(state: &State<AppState>, user_id: &str) -> Result<(), String> {
+pub(crate) fn probe_live_session_alive(user_id: &str) -> Result<(), String> {
     let Some(dir) = doubao_live_user_data_dir() else {
         return Ok(()); // Live 目录不存在由 ensure_live_has_login_session 负责报错
     };
-    if probe_user_data_session_raw(&state.python_dir, &state.python_exe, &dir, user_id) == "expired" {
+    if probe_user_data_session_raw(&dir, user_id) == "expired" {
         Err(format!(
             "当前豆包客户端的登录会话已在服务端失效（常见原因：曾在客户端内退出登录该账号，\
              或该会话被新登录顶替）——现在保存只会把死会话存进账号 {user_id} 的快照。\
@@ -536,11 +490,11 @@ pub(crate) fn probe_live_session_alive(state: &State<AppState>, user_id: &str) -
 
 /// 保存前预检：Live profile 必须持有登录会话 Cookie，否则禁止「保存当前登录态」。
 /// 返回 Err(原因) = 无登录会话/检测失败按可用性判断；Ok(()) = 放行。
-pub(crate) fn ensure_live_has_login_session(state: &State<AppState>) -> Result<(), String> {
+pub(crate) fn ensure_live_has_login_session() -> Result<(), String> {
     let Some(dir) = doubao_live_user_data_dir() else {
         return Err("未找到豆包客户端数据目录（%LOCALAPPDATA%\\Doubao\\User Data），请先安装并登录豆包".to_string());
     };
-    match check_profile_login_cookie(state, &dir) {
+    match check_profile_login_cookie(&dir) {
         Some((true, remaining)) if !is_guest_session(remaining) => Ok(()),
         Some((false, _)) => Err(
             "当前豆包客户端未检测到登录会话（Cookies 中无 sessionid/sid_guard）——请先在豆包中登录账号再保存，\
@@ -558,32 +512,16 @@ pub(crate) fn ensure_live_has_login_session(state: &State<AppState>) -> Result<(
     }
 }
 
-/// 调 doubao_chats.py --detect-uid 读客户端 Local Storage leveldb 的 client_device_info.userId。
-/// Python 侧内部已与抓包文件按时间戳比新鲜度（代理开着取抓包、没开取客户端本地记录）。
-/// 脚本缺失/运行失败/超时返回 None（不阻断后续兜底链）。
+/// 读客户端 Local Storage leveldb 的 client_device_info.userId（Rust 实现，原 doubao_chats.py --detect-uid）。
+/// 内部已与抓包文件按时间戳比新鲜度（代理开着取抓包、没开取客户端本地记录）。
+/// 检测失败/无结果返回 None（不阻断后续兜底链）。
 fn detect_uid_from_local_storage(state: &State<AppState>) -> Option<String> {
-    let script = state.python_dir.join("doubao_chats.py");
-    if !script.exists() {
-        return None;
-    }
-    let out = std::process::Command::new(&state.python_exe)
-        .args([script.to_string_lossy().as_ref(), "--detect-uid"])
-        .env("AIWORKDATA_DIR", &state.data_dir)
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("PYTHONUTF8", "1")
-        .creation_flags(0x08000000)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{'))?;
-    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let v = crate::tasks::doubao_chats::detect_uid(&state);
     let uid = v.get("user_id")?.as_str()?.trim().to_string();
     (!uid.is_empty()).then_some(uid)
 }
 
-/// 从代理抓包凭证文件读 uid（device_proxy.py 解析 multi_sids 得到；None = 未抓到/旧格式无此字段）
+/// 从代理抓包凭证文件读 uid（代理 MITM 层解析 multi_sids 得到；None = 未抓到/旧格式无此字段）
 fn read_captured_uid(state: &State<AppState>) -> Option<String> {
     let path = state.data_dir.join("data").join("doubao_captured_credentials.json");
     let raw = std::fs::read_to_string(path).ok()?;
@@ -902,14 +840,14 @@ pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<()
 // ── P4 会员额度 ──────────────────────────────────────────────────────────────
 //
 // 端点现状：豆包会员额度接口为 www.doubao.com 已登录 XHR，社区无公开文档，
-// 须用户抓包（device_proxy.py）固化后填入 settings.doubao_quota_url。
+// 须用户抓包（内置代理）固化后填入 settings.doubao_quota_url。
 // 本命令为框架：凭证（池内明文 sessionid，manual/proxy 来源均可）+ 可配置端点 + 宽容解析，
 // 端点就绪后前端即可展示会员等级 / 到期时间 / 剩余额度条。
 
-/// 查询账号会员额度（调 doubao_quota.py；网络请求可达数秒，async 派发避免阻塞 UI）
+/// 查询账号会员额度（Rust 直调 tasks::doubao_quota，网络请求可达数秒，async 派发避免阻塞 UI）
 #[tauri::command(async)]
 pub fn doubao_quota_fetch(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
-    // uid 会传给脚本并作为额度缓存/运维历史的账号键，入口先做防注入校验
+    // uid 作为额度缓存/运维历史的账号键，入口先做防注入校验
     fs_utils::ensure_uid_safe(user_id.trim())?;
     let url = state
         .settings()
@@ -920,67 +858,31 @@ pub fn doubao_quota_fetch(state: State<AppState>, user_id: String) -> Result<ser
     if !url.starts_with("http") {
         return Err(format!("额度接口地址无效: {url}（需以 http(s):// 开头）"));
     }
-    let script = state.python_dir.join("doubao_quota.py");
-    if !script.exists() {
-        return Err(format!("找不到额度脚本: {}", script.display()));
-    }
-    let out = std::process::Command::new(&state.python_exe)
-        .arg(&script)
-        .args(["--uid", user_id.trim(), "--url", url.as_str()])
-        .env("AIWORKDATA_DIR", &state.data_dir)
-        // 中文 Windows 下 Python 管道输出默认 GBK，必须强制 UTF-8，否则中文错误信息到前端变乱码
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("PYTHONUTF8", "1")
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .output()
-        .map_err(|e| format!("运行额度脚本失败: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // 脚本约定：stdout 最后一行（以 { 开头）为摘要 JSON；错误也以 JSON 摘要输出（ok=false）
-    let summary_line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{'));
-    if let Some(line) = summary_line {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-            let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
-            if ok {
-                // 成功后把解析结果回写账号池（额度缓存），供列表徽标/悬停提示展示
-                if let Some(parsed) = v.get("parsed") {
-                    match update_quota_cache(&state, user_id.trim(), parsed) {
-                        Ok(summary) => {
-                            append_history(
-                                &state,
-                                serde_json::json!({
-                                    "ts": fs_utils::now_ts(),
-                                    "kind": "quota",
-                                    "uid": user_id.trim(),
-                                    "ok": true,
-                                    "level": parsed.get("level"),
-                                    "summary": summary,
-                                    "windows": windows_of_parsed(parsed),
-                                    "source": "app",
-                                }),
-                            );
-                        }
-                        Err(e) => {
-                            fs_utils::app_log(&state.data_dir, &format!("额度缓存回写失败: {e}"));
-                        }
-                    }
-                }
-                return Ok(v);
+    let summary = crate::tasks::doubao_quota::fetch_single(&state, user_id.trim(), &url)?;
+    // 成功后把解析结果回写账号池（额度缓存），供列表徽标/悬停提示展示
+    if let Some(parsed) = summary.get("parsed") {
+        match update_quota_cache(&state, user_id.trim(), parsed) {
+            Ok(quote_summary) => {
+                append_history(
+                    &state,
+                    serde_json::json!({
+                        "ts": fs_utils::now_ts(),
+                        "kind": "quota",
+                        "uid": user_id.trim(),
+                        "ok": true,
+                        "level": parsed.get("level"),
+                        "summary": quote_summary,
+                        "windows": windows_of_parsed(parsed),
+                        "source": "app",
+                    }),
+                );
             }
-            let err = v
-                .get("error")
-                .and_then(|s| s.as_str())
-                .unwrap_or("额度查询失败（脚本未给出原因）")
-                .to_string();
-            return Err(err);
+            Err(e) => {
+                fs_utils::app_log(&state.data_dir, &format!("额度缓存回写失败: {e}"));
+            }
         }
     }
-    let stderr_tail: String = String::from_utf8_lossy(&out.stderr).lines().rev().take(3).collect::<Vec<_>>().join("\n");
-    Err(format!(
-        "额度脚本未输出摘要（exit={:?}）{}",
-        out.status.code(),
-        if stderr_tail.is_empty() { String::new() } else { format!(":\n{stderr_tail}") }
-    ))
+    Ok(summary)
 }
 
 /// 把额度查询解析结果回写账号池（quota_level/expire/summary/checked_at）。
@@ -1005,37 +907,9 @@ fn update_quota_cache(state: &State<AppState>, uid: &str, parsed: &serde_json::V
         .and_then(|e| e.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    // 额度条目 → 一句话摘要，兼容两种条目形态（最多 4 条）：
-    // ① quota/summary 窗口结构：{name, used_percent, exhausted, reset_at} → "当前时段 已用完(9-13 20:32重置)"
-    // ② 宽容结构：{name, total, left, used} → "图片 80/100"
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(items) = parsed.get("items").and_then(|i| i.as_array()) {
-        for it in items.iter().take(4) {
-            let name = it.get("name").and_then(|s| s.as_str()).unwrap_or("额度").to_string();
-            if let Some(pct) = it.get("used_percent").and_then(|p| p.as_f64()) {
-                let state_txt = if it.get("exhausted").and_then(|e| e.as_bool()).unwrap_or(false) || pct >= 100.0 {
-                    "已用完".to_string()
-                } else {
-                    format!("已用 {}%", pct as i64)
-                };
-                let reset = it
-                    .get("reset_at")
-                    .and_then(|r| r.as_str())
-                    .map(|s| format!("（{} 重置）", s.get(5..).unwrap_or(s)))
-                    .unwrap_or_default();
-                parts.push(format!("{name} {state_txt}{reset}"));
-                continue;
-            }
-            let total = fmt_quota_num(it.get("total"));
-            let left = fmt_quota_num(it.get("left"));
-            match (&left, &total) {
-                (Some(l), Some(t)) => parts.push(format!("{name} {l}/{t}")),
-                (None, Some(t)) => parts.push(format!("{name} 总量 {t}")),
-                _ => {}
-            }
-        }
-    }
-    let summary = if parts.is_empty() { None } else { Some(parts.join(" · ")) };
+    // 额度条目 → 一句话摘要（展示口径统一归口 tasks::doubao_quota::summarize_parsed，
+    // 与 CLI 批量巡检 run_batch 完全同构）
+    let summary = crate::tasks::doubao_quota::summarize_parsed(parsed);
     acc.quota_level = level;
     acc.quota_expire_at = expire;
     acc.quota_summary = summary.clone();
@@ -1044,21 +918,9 @@ fn update_quota_cache(state: &State<AppState>, uid: &str, parsed: &serde_json::V
     Ok(summary)
 }
 
-/// 额度数值归一为字符串（数字/字符串均可；None/空 → None）
-fn fmt_quota_num(v: Option<&serde_json::Value>) -> Option<String> {
-    match v {
-        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
-        Some(serde_json::Value::String(s)) => {
-            let s = s.trim();
-            (!s.is_empty()).then(|| s.to_string())
-        }
-        _ => None,
-    }
-}
-
 // ── 运维历史（B2 健康度 / A2 额度趋势的数据源）───────────────────────────────
 // data/doubao_health_history.json：{events: [...]}，滚动保留最近 HISTORY_MAX 条。
-// 事件 schema（与 doubao_quota.py --all 模式同构）：
+// 事件 schema（与 tasks/doubao_quota.rs 批量巡检 run_batch 同构）：
 //   { ts, kind: "keepalive"|"renew"|"quota", ok, uid?, level?, summary, windows?, source? }
 
 const HISTORY_MAX: usize = 400;
@@ -1118,7 +980,7 @@ fn windows_of_parsed(parsed: &serde_json::Value) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-/// 代理自动抓到的豆包会话凭证（device_proxy.py 写 data/doubao_captured_credentials.json）。
+/// 代理自动抓到的豆包会话凭证（代理 MITM 层写 data/doubao_captured_credentials.json）。
 /// 流程：启动代理 → 浏览器走系统代理登录网页版 doubao.com → 代理从 Cookie 中提取
 /// sessionid / sid_guard 落盘 → 本命令读取最新一份，供编辑弹框一键填充。
 #[derive(serde::Serialize, Clone)]
@@ -1271,7 +1133,7 @@ pub fn doubao_account_get_credential(
 }
 
 /// 代理抓包凭证自动回写已入池账号。
-/// 流程：启动代理 → 豆包客户端/网页版流量经过代理 → device_proxy.py 抓到 sessionid/sid_guard
+/// 流程：启动代理 → 豆包客户端/网页版流量经过代理 → 代理 MITM 层抓到 sessionid/sid_guard
 /// 落盘（multi_sids 按该 sessionid 解析出 uid）→ 本命令把凭证写入**该 uid 且必须已入池**的账号。
 /// 目标与凭证同源于抓包文件（自洽）；未入池账号一律跳过、不自动创建（新账号走「保存当前登录态」）。
 /// 返回 Some(说明) = 本次发生了写入（前端据此提示并刷新）；None = 无凭证/无 uid/未入池/内容未变。
@@ -1309,7 +1171,7 @@ pub fn doubao_credential_auto_apply(state: State<AppState>) -> Result<Option<Str
         .to_string();
 
     let mut pool = load_pool(&state);
-    // 目标账号 = 抓包文件自带的 uid（device_proxy.py 用该请求 Cookie 里的 multi_sids
+    // 目标账号 = 抓包文件自带的 uid（代理 MITM 层用该请求 Cookie 里的 multi_sids
     // 按 **同一条 sessionid** 匹配出的主人）——凭证与归属天然自洽，不允许跨来源拼装。
     // 之前目标取 Local Storage/Local State/current_account.txt 等检测链、凭证取抓包文件，
     // 两条链时间窗不一致时会把 A 的 sessionid 写进 B 的账号（实测 908 与 232 的
@@ -1343,75 +1205,35 @@ pub fn doubao_credential_auto_apply(state: State<AppState>) -> Result<Option<Str
     Ok(Some(format!("{uid}（{captured_at} 抓到）")))
 }
 
-/// 运行续期巡检脚本（解密同步 cookie + 探活续期，模式由 sync_only 决定）。
-/// 脚本含网络请求可达数秒，async 派发线程池执行避免阻塞 UI。
+/// 运行续期巡检（解密诊断 cookie + 探活续期，模式由 sync_only 决定；Rust 实现，原 doubao_renew.py）。
+/// 含网络请求可达数秒，async 派发线程池执行避免阻塞 UI。
 #[tauri::command(async)]
 pub fn doubao_renew_run(
     state: State<AppState>,
     sync_only: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    let script = state.python_dir.join("doubao_renew.py");
-    if !script.exists() {
-        return Err(format!("找不到续期脚本: {}", script.display()));
-    }
-    let mut cmd = std::process::Command::new(&state.python_exe);
-    cmd.arg(&script);
-    if sync_only.unwrap_or(false) {
-        cmd.arg("--sync-only");
-    }
-    cmd.env("AIWORKDATA_DIR", &state.data_dir)
-        // 中文 Windows 下 Python 管道输出默认 GBK，必须强制 UTF-8，否则中文日志到前端变乱码
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("PYTHONUTF8", "1")
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let out = cmd
-        .output()
-        .map_err(|e| format!("运行续期脚本失败: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // 脚本约定：stdout 最后一行（以 { 开头）为摘要 JSON；进度/错误日志走 stderr
-    let summary_line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{'));
-    if let Some(line) = summary_line {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-            // 记录运维历史（B2）：巡检摘要一句话化
-            let summary_txt = if v.get("renew").is_some() {
-                let r = &v["renew"];
-                format!(
-                    "有效 {} · 过期 {} · 异常 {} · 跳过 {}",
-                    r.get("ok").and_then(|n| n.as_i64()).unwrap_or(0),
-                    r.get("expired").and_then(|n| n.as_i64()).unwrap_or(0),
-                    r.get("error").and_then(|n| n.as_i64()).unwrap_or(0),
-                    r.get("skipped").and_then(|n| n.as_i64()).unwrap_or(0),
-                )
-            } else {
-                "Cookie 诊断".to_string()
-            };
-            append_history(
-                &state,
-                serde_json::json!({
-                    "ts": fs_utils::now_ts(), "kind": "renew", "ok": true,
-                    "summary": summary_txt, "source": "app",
-                }),
-            );
-            return Ok(v);
-        }
-    }
-    let stderr_tail: String = String::from_utf8_lossy(&out.stderr)
-        .lines()
-        .rev()
-        .take(5)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    Err(format!(
-        "续期脚本未输出摘要（exit={:?}）{}",
-        out.status.code(),
-        if stderr_tail.is_empty() { String::new() } else { format!(":\n{stderr_tail}") }
-    ))
+    let v = crate::tasks::doubao_session::run(&state, sync_only.unwrap_or(false), None)?;
+    // 记录运维历史（B2）：巡检摘要一句话化
+    let summary_txt = if v.get("renew").is_some() {
+        let r = &v["renew"];
+        format!(
+            "有效 {} · 过期 {} · 异常 {} · 跳过 {}",
+            r.get("ok").and_then(|n| n.as_i64()).unwrap_or(0),
+            r.get("expired").and_then(|n| n.as_i64()).unwrap_or(0),
+            r.get("error").and_then(|n| n.as_i64()).unwrap_or(0),
+            r.get("skipped").and_then(|n| n.as_i64()).unwrap_or(0),
+        )
+    } else {
+        "Cookie 诊断".to_string()
+    };
+    append_history(
+        &state,
+        serde_json::json!({
+            "ts": fs_utils::now_ts(), "kind": "renew", "ok": true,
+            "summary": summary_txt, "source": "app",
+        }),
+    );
+    Ok(v)
 }
 
 /// 把计划任务的长命令写入数据目录的 .cmd 启动器，返回启动器路径。
@@ -1525,29 +1347,26 @@ pub fn doubao_renew_task_unregister(state: State<AppState>) -> Result<(), String
     Ok(())
 }
 
-// ── 额度定时巡检（A1/B4）：schtasks 每日调 doubao_quota.py --all ─────────────
-// 脚本自行遍历池内有凭证账号：查额度 → 回写账号池缓存 + 运维历史；应用启动后
+// ── 额度定时巡检（A1/B4）：schtasks 每日调主 exe --task-run doubao-quota ────
+// Rust 任务自行遍历池内有凭证账号：查额度 → 回写账号池缓存 + 运维历史；应用启动后
 // 概述页健康度卡 / 账号页自动查询会读取历史与缓存展示。
 
-/// 注册豆包额度巡检每日计划任务（schtasks 直接调 python + doubao_quota.py --all）
+/// 注册豆包额度巡检每日计划任务（schtasks 直调主 exe CLI 任务模式，原 python doubao_quota.py --all 已 Rust 化）
 #[tauri::command(async)]
 pub fn doubao_quota_task_register(state: State<AppState>, time: String) -> Result<(), String> {
     // 审查修复（命令注入）：同上，弱校验改严格白名单
     crate::commands::misc::validate_hhmm(&time)?;
-    let script = state.python_dir.join("doubao_quota.py");
-    if !script.exists() {
-        return Err(format!("找不到额度脚本: {}", script.display()));
-    }
+    let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
     let data_dir = state.data_dir.to_string_lossy();
     // 命令写入 .cmd 启动器：/TR 261 字符上限，dev 构建绝对路径拼出的命令 273 字符必然超限
     // （详见 write_task_launcher；实测报参数错误 → toast 4s 即逝 → 用户感知"点击注册没有反应"）
+    // CLI 任务模式分支在 Tauri Builder 之前，不启动 GUI、不受单实例插件影响
     let tr = write_task_launcher(
         &state,
         "doubao_quota",
         format!(
-            "set \"AIWORKDATA_DIR={data_dir}\"\r\nset \"PYTHONIOENCODING=utf-8\"\r\n\"{}\" \"{}\" --all",
-            state.python_exe,
-            script.to_string_lossy()
+            "set \"AIWORKDATA_DIR={data_dir}\"\r\n\"{}\" --task-run doubao-quota",
+            exe.to_string_lossy()
         ),
     )?;
     let (ok, _stdout, stderr) = crate::commands::misc::run_schtasks(&[
@@ -1622,7 +1441,7 @@ pub fn doubao_open_as_account(
     // 目标快照登录 Cookie 预检：快照里没有 sessionid/sid_guard = 恢复后必然未登录
     // （此前 908 槽就是被未登录态污染后反复"切换成功但没登录"），直接拦截并告知补救方式；
     // 剩余有效期 <12h = 快照存的是游客会话，同样拦截
-    match check_profile_login_cookie(&state, &slot) {
+    match check_profile_login_cookie(&slot) {
         Some((false, _)) => {
             return Err(format!(
                 "账号 {uid} 的快照中未检测到登录会话（无 sessionid Cookie），恢复后必然未登录。\n\
@@ -1640,12 +1459,7 @@ pub fn doubao_open_as_account(
     // 服务端会话预检：本地 Cookie 存在≠会话在服务端仍有效。曾在客户端内退出登录该账号时
     // passport 会吊销会话（快照文件完好但已"中毒"），恢复后一联网即被强制登出。
     // 探测 expired 时中止并给出补救指引；不可验证 fail-open（见 probe_slot_session_alive）。
-    probe_slot_session_alive(
-        &state.data_dir,
-        &state.python_dir,
-        &state.python_exe,
-        &uid,
-    )?;
+    probe_slot_session_alive(&state.data_dir, &uid)?;
     let bridge = crate::state::resolve_ps_dir().join("trae-switch-bridge.ps1");
     if !bridge.exists() {
         return Err(format!("找不到切换脚本: {}", bridge.display()));
@@ -1963,50 +1777,21 @@ pub fn doubao_chatdata_info(state: State<AppState>, user_id: String) -> Result<s
 
 // ───────────── D2 对话记录导出（API 拉取 → markdown/json） ─────────────
 
-/// 导出豆包对话记录：调用 doubao_chats.py 走官方 API（recent_conv 列表 + chain/single 消息），
+/// 导出豆包对话记录：走官方 IM API（recent_conv 列表 + chain/single 消息；Rust 实现，原 doubao_chats.py --export），
 /// 输出 markdown + json 到 data/exports/。需要账号已录入凭证（sessionid/sid_guard/ttwid）。
 #[tauri::command(async)]
 pub fn doubao_export_chats(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
-    // uid 作为脚本参数（脚本内部按 uid 构造导出路径），入口先做防注入校验
+    // uid 用于构造导出路径，入口先做防注入校验
     fs_utils::ensure_uid_safe(user_id.trim())?;
-    let script = state.python_dir.join("doubao_chats.py");
-    if !script.exists() {
-        return Err(format!("找不到对话导出脚本: {}", script.display()));
+    let v = crate::tasks::doubao_chats::export_account(&state, user_id.trim(), 50, 10)?;
+    if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+        let convs = v.get("conversations").and_then(|n| n.as_i64()).unwrap_or(0);
+        append_history(&state, serde_json::json!({
+            "ts": fs_utils::now_ts(), "kind": "chats", "ok": true,
+            "uid": user_id, "summary": format!("导出对话 {convs} 个"), "source": "app",
+        }));
     }
-    let out = std::process::Command::new(&state.python_exe)
-        .args([script.to_string_lossy().as_ref(), "--export", "--uid", user_id.as_str()].iter())
-        .env("AIWORKDATA_DIR", &state.data_dir)
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("PYTHONUTF8", "1")
-        .creation_flags(0x08000000)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| format!("运行对话导出脚本失败: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let summary_line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{'));
-    if let Some(line) = summary_line {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-            if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
-                let convs = v.get("conversations").and_then(|n| n.as_i64()).unwrap_or(0);
-                append_history(&state, serde_json::json!({
-                    "ts": fs_utils::now_ts(), "kind": "chats", "ok": true,
-                    "uid": user_id, "summary": format!("导出对话 {convs} 个"), "source": "app",
-                }));
-            }
-            return Ok(v);
-        }
-    }
-    let stderr_tail: String = String::from_utf8_lossy(&out.stderr)
-        .lines()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    Err(format!("对话导出失败：{}", stderr_tail))
+    Ok(v)
 }
 
 #[cfg(test)]

@@ -1,14 +1,12 @@
 //! WorkBuddy 共享底层（原 workbuddy.rs 机械拆分）：路径常量、账号池/凭证库/设置读写、
-//! 字段提取、脚本启动、续期互斥锁、会话 uid 防护、CLI 设置回滚等被多域复用的辅助。
+//! 字段提取、进程检测、续期互斥锁、会话 uid 防护、CLI 设置回滚等被多域复用的辅助。
 //! 函数逻辑零改动，仅将跨子模块引用项提升为 `pub(super)`。
 
 use sha2::{Digest, Sha256};
-use std::io::{BufRead, BufReader};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -332,120 +330,6 @@ pub(super) fn wb_renew_locks(
     LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-// ── M4 python 脚本管线（NDJSON 事件）───────────────────────────────────────
-
-/// 脚本退出等待：轮询间隔 500ms；超时上限 15 分钟——签到脚本含重试轮次、网络/验证码
-/// 等待的合理上限，超过即判定 python 挂死，kill 兜底，防止轮次锁被永久持有（审查 P0）
-const WB_WAIT_POLL: Duration = Duration::from_millis(500);
-const WB_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-
-/// 轮次等待超时判定（纯函数便于单测）：累计等待达到上限即判超时
-fn wb_wait_timed_out(elapsed: Duration) -> bool {
-    elapsed >= WB_WAIT_TIMEOUT
-}
-
-/// 启动 python 脚本并把 stdout 逐行 emit 为 NDJSON 事件；done 行附带完成事件。
-/// `round`：签到/成长全局轮次锁 guard，移入等待线程持有至脚本退出（含超时 kill 兜底）。
-pub(super) fn spawn_wb_script(
-    app: AppHandle,
-    state: &State<AppState>,
-    script: &str,
-    args: &[String],
-    event: &str,
-    round: tokio::sync::MutexGuard<'static, ()>,
-) -> Result<(), String> {
-    let script_path = state.python_dir.join(script);
-    if !script_path.exists() {
-        return Err(format!("找不到脚本: {}", script_path.display()));
-    }
-    let mut cmd = Command::new(&state.python_exe);
-    cmd.arg(&script_path)
-        .args(args)
-        .creation_flags(0x08000000)
-        .env("AIWORKDATA_DIR", &state.data_dir)
-        .env("PYTHONIOENCODING", "utf-8")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("启动脚本失败: {e}"))?;
-    let stdout = child.stdout.take().ok_or("脚本无输出")?;
-    let stderr = child.stderr.take();
-    let app2 = app.clone();
-    let ev = event.to_string();
-    let data_dir = state.data_dir.clone();
-    let data_dir2 = data_dir.clone();
-
-    // stderr 独立线程读取（审查 P2，写法对齐 doubao.rs）：与 stdout 循环并行消费管道，
-    // 防止 stderr 缓冲区写满使子进程阻塞、而父线程仍卡在等 stdout 的互锁死锁；
-    // 同时落日志保留排查线索
-    if let Some(stderr) = stderr {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().flatten() {
-                fs_utils::app_log(&data_dir, &format!("[wb-script] {line}"));
-            }
-        });
-    }
-
-    // stdout 循环照旧：逐行 emit，EOF（子进程 stdout 关闭）后向等待线程发信号，
-    // 保证 exit 事件仍晚于全部数据行发射
-    let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            let l = line.trim().to_string();
-            if l.is_empty() {
-                continue;
-            }
-            // done 行同时发独立 done 事件（前端据 "type":"done" 归约即可，无需额外事件名）
-            let _ = app2.emit(&ev, &l);
-        }
-        let _ = eof_tx.send(());
-    });
-
-    // 等待线程：try_wait 每 500ms 轮询，累计超 15 分钟仍不退出 → kill 兜底并回收
-    // （python 挂死时原 child.wait() 无超时会使轮次锁永久持有、功能假死，审查 P0）；
-    // 轮次锁 guard 在此线程持有至子进程确定退出，RAII 防泄漏
-    let app3 = app.clone();
-    let ev2 = event.to_string();
-    std::thread::spawn(move || {
-        let _round_guard = round;
-        let started = std::time::Instant::now();
-        let mut timed_out = false;
-        let status: std::io::Result<std::process::ExitStatus> = loop {
-            match child.try_wait() {
-                Ok(Some(s)) => break Ok(s),
-                Ok(None) => {
-                    if wb_wait_timed_out(started.elapsed()) {
-                        timed_out = true;
-                        let _ = child.kill();
-                        // kill 后回收；try_wait 极端竞态未及终态时以阻塞 wait 兜底
-                        break match child.try_wait().ok().flatten() {
-                            Some(s) => Ok(s),
-                            None => child.wait(),
-                        };
-                    }
-                    std::thread::sleep(WB_WAIT_POLL);
-                }
-                Err(e) => break Err(e),
-            }
-        };
-        // 等全部 stdout 行 emit 完再发退出事件（正常路径/超时 kill 后管道均会关闭，
-        // EOF 信号立即到达；孙进程继承句柄等边缘导致 EOF 延迟时短超时兜底，不阻塞解锁）
-        let _ = eof_rx.recv_timeout(Duration::from_secs(2));
-        if timed_out {
-            fs_utils::app_log(
-                &data_dir2,
-                &format!(
-                    "[wb-script] {ev2} 脚本超过 {:?} 未退出，已强制结束（轮次锁释放）",
-                    WB_WAIT_TIMEOUT
-                ),
-            );
-        }
-        let _ = app3.emit(&ev2, format!("{{\"type\":\"exit\",\"ok\":{}}}", status.map(|s| s.success()).unwrap_or(false)));
-    });
-    Ok(())
-}
-
 // ── CLI settings.json 回滚（审查 P2 原子写）────────────────────────────────
 
 /// 回滚 settings.json 到写入前原文（审查 P2 原子写）：
@@ -501,18 +385,4 @@ pub(super) fn wb_chat_uid_guard(state: &AppState, user_id: &str) -> Result<(), S
         return Err(format!("账号不在池中: {user_id}"));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wb_wait_timed_out_boundary() {
-        // 未达上限：继续轮询；恰好达到/超过上限：判超时（kill 兜底，轮次锁可释放）
-        assert!(!wb_wait_timed_out(Duration::ZERO));
-        assert!(!wb_wait_timed_out(WB_WAIT_TIMEOUT - Duration::from_millis(1)));
-        assert!(wb_wait_timed_out(WB_WAIT_TIMEOUT));
-        assert!(wb_wait_timed_out(WB_WAIT_TIMEOUT * 2));
-    }
 }

@@ -1,17 +1,18 @@
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::Path;
 use std::sync::mpsc::Sender;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use serde::Deserialize;
 use crate::fs_utils;
+use crate::models::RawAccount;
 use crate::state::AppState;
 use crate::commands::accounts::{build_account_views, resolve_user_ids};
-use crate::python::spawn_script;
+use crate::tasks::trae_checkin;
 
 /// 签到运行防重入锁（应用级）：页面手动签到 / 托盘签到 / 静默签到共用，
 /// 占用期间 try_lock 失败即拒绝新的签到请求。
-/// 使用 tokio::sync::Mutex：其 Guard 为 Send，可在工作线程内持有到子进程结束
+/// 使用 tokio::sync::Mutex：其 Guard 为 Send，可在工作线程内持有到全部轮次结束
 pub struct CheckinGuard(pub tokio::sync::Mutex<()>);
 
 #[derive(Deserialize)]
@@ -37,10 +38,81 @@ struct RoundOutcome {
     error_types: std::collections::HashMap<String, String>,
 }
 
-/// 一轮签到的子进程句柄（含解密临时账号文件路径，消费结束后删除）
-struct RoundProc {
-    child: std::process::Child,
-    tmp_accounts: PathBuf,
+/// 准备一轮候选账号：vault 解密仅内存传递（原 python 方案需写解密临时文件用后即删，
+/// Rust 直调后彻底消除明文落盘窗口），按本轮候选 uid 过滤。
+fn prepare_round(state: &AppState, uids: &[String]) -> Result<Vec<RawAccount>, String> {
+    let accounts = crate::vault::load_accounts(state);
+    let set: std::collections::HashSet<&str> = uids.iter().map(|s| s.as_str()).collect();
+    let filtered: Vec<RawAccount> = accounts
+        .accounts
+        .into_iter()
+        .filter(|a| a.user_id.as_deref().is_some_and(|u| set.contains(u)))
+        .collect();
+    if filtered.is_empty() {
+        return Err("候选账号均无可用凭据".into());
+    }
+    Ok(filtered)
+}
+
+/// 执行一轮签到（tasks::trae_checkin 直调，不再经 python 子进程）：
+/// account 事件登记 per-uid 状态/失败类型（重试筛选用）并转发 emit，其余事件原样转发；
+/// 全量事件落盘日志。轮次自身的 done 事件不转发——最终 done 由调用方在各轮汇总后统一发
+/// （避免重复计数），单账号失败不中断整轮。
+fn execute_round(
+    app: &AppHandle,
+    state: &AppState,
+    accounts: &[RawAccount],
+    retry: u32,
+    log_path: &Path,
+) -> RoundOutcome {
+    let mut outcome = RoundOutcome::default();
+    trae_checkin::run_round(state, accounts, retry, &mut |ev| {
+        let t = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if t == "account" {
+            // 记录 per-uid 状态（重试轮结果覆盖旧状态）
+            let uid = ev
+                .get("user_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let st = match ev.get("status").and_then(|x| x.as_str()).unwrap_or("") {
+                "success" => "success",
+                "already" => "already",
+                _ => "fail",
+            };
+            if !uid.is_empty() {
+                outcome.statuses.insert(uid.clone(), st);
+                // 保留失败类型供重试筛选：SessionDead（JWT 被服务端吊销）为
+                // 永久失效，重试必然再 401，不进重试轮白等 30+90s
+                if st == "fail" {
+                    if let Some(et) = ev.get("error_type").and_then(|x| x.as_str()) {
+                        if !et.is_empty() {
+                            outcome.error_types.insert(uid.clone(), et.to_string());
+                        }
+                    }
+                } else {
+                    outcome.error_types.remove(&uid);
+                }
+            }
+        }
+        // done 事件不转发：由调用方汇总后统一发（避免重复计数）
+        if t != "done" {
+            let _ = app.emit("checkin-progress", ev);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            let _ = writeln!(
+                f,
+                "[{}] {}",
+                fs_utils::now_ts(),
+                serde_json::to_string(ev).unwrap_or_default()
+            );
+        }
+    });
+    outcome
 }
 
 #[tauri::command]
@@ -71,128 +143,8 @@ pub fn start_checkin_core(
         let st = app2.state::<AppState>();
         run_checkin_worker(&app2, &st, opts, notify_done, tx);
     });
-    // 等待启动阶段结果（抢锁 + 筛选 + 拉起子进程），通常毫秒级
+    // 等待启动阶段结果（抢锁 + 筛选 + 候选凭据准备），通常毫秒级
     rx.recv().unwrap_or_else(|_| Err("签到工作线程异常退出".into()))
-}
-
-/// 拉起一轮签到子进程：构建参数（含凭据解密临时文件），失败时清理临时文件
-fn spawn_round(state: &AppState, uids: &[String]) -> Result<RoundProc, String> {
-    let retry = state.settings().retry.max(0) as u32;
-    let mut args = vec!["--json-stream".to_string()];
-    args.push("--accounts".to_string());
-    args.push(uids.join(","));
-    if retry > 0 {
-        args.push("--retry".to_string());
-        args.push(retry.to_string());
-    }
-
-    // 凭据解密：checkin_accounts.json 只存占位，实际 jwt 在 Stronghold vault 中。
-    // 每轮为本轮候选账号生成解密临时文件（--accounts-file），用后即删。
-    let tmp_accounts = crate::vault::write_temp_accounts(state, uids)
-        .map_err(|e| format!("生成签到凭据临时文件失败: {e}"))?;
-    args.push("--accounts-file".to_string());
-    args.push(tmp_accounts.to_string_lossy().to_string());
-
-    let child = match spawn_script(state, "auto_checkin.py", &args, true) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp_accounts);
-            return Err(e);
-        }
-    };
-    Ok(RoundProc { child, tmp_accounts })
-}
-
-/// 消费一轮子进程输出：NDJSON 解析 -> 事件 emit + 日志追加。
-/// 脚本自身的 done 事件不转发——最终 done 由调用方在各轮汇总后统一发（避免重复计数）。
-fn consume_round(app: &AppHandle, mut proc: RoundProc, log_path: &Path) -> RoundOutcome {
-    let mut outcome = RoundOutcome::default();
-    let stdout = proc.child.stdout.take();
-    let stderr = proc.child.stderr.take();
-
-    // stderr 线程：防止管道缓冲区写满导致子进程死锁（无需防重入锁）
-    if let Some(stderr) = stderr {
-        let log_path2 = log_path.to_path_buf();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(l) = line {
-                    let l = format!("[stderr] {}", l.trim());
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log_path2)
-                    {
-                        let _ = writeln!(f, "[{}] {}", crate::fs_utils::now_ts(), l);
-                    }
-                }
-            }
-        });
-    }
-
-    if let Some(stdout) = stdout {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                let l = l.trim().to_string();
-                if l.is_empty() {
-                    continue;
-                }
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
-                    match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-                        "start" | "account" => {
-                            if v.get("type").and_then(|t| t.as_str()) == Some("account") {
-                                // 记录 per-uid 状态（重试轮结果覆盖旧状态）
-                                let uid = v
-                                    .get("user_id")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let st = match v.get("status").and_then(|x| x.as_str()).unwrap_or("") {
-                                    "success" => "success",
-                                    "already" => "already",
-                                    _ => "fail",
-                                };
-                                if !uid.is_empty() {
-                                    outcome.statuses.insert(uid.clone(), st);
-                                    // 保留失败类型供重试筛选：SessionDead（JWT 被服务端吊销）为
-                                    // 永久失效，重试必然再 401，不进重试轮白等 30+90s
-                                    if st == "fail" {
-                                        if let Some(et) = v.get("error_type").and_then(|x| x.as_str()) {
-                                            if !et.is_empty() {
-                                                outcome.error_types.insert(uid.clone(), et.to_string());
-                                            }
-                                        }
-                                    } else {
-                                        outcome.error_types.remove(&uid);
-                                    }
-                                }
-                            }
-                            let _ = app.emit("checkin-progress", &v);
-                        }
-                        // done 事件不转发：由调用方汇总后统一发（避免重复计数）
-                        "done" => {}
-                        // 其余未知/扩展类型事件原样转发 payload 给前端，不再静默丢弃
-                        // （脚本侧新增事件类型时前端可渐进消费，本地日志仍全量落盘）
-                        _ => {
-                            let _ = app.emit("checkin-progress", &v);
-                        }
-                    }
-                }
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(log_path)
-                {
-                    let _ = writeln!(f, "[{}] {}", crate::fs_utils::now_ts(), l);
-                }
-            }
-        }
-    }
-    let _ = proc.child.wait();
-    // 清理解密临时账号文件（无论本轮成败）
-    let _ = std::fs::remove_file(&proc.tmp_accounts);
-    outcome
 }
 
 /// 发送最终汇总 done 事件（checkin-progress + checkin-done），并按需发系统通知
@@ -347,8 +299,8 @@ fn run_checkin_worker(
                 })
                 .collect()
         };
-    // 过滤后为空（全部已签/过期/冷却中）时不启动脚本：
-    // 脚本在无 --accounts 参数时会回退为签全部账号，会绕过跳过规则并造成重复签到风险。
+    // 过滤后为空（全部已签/过期/冷却中）时不启动签到轮：
+    // 空轮直调会签不到任何候选（vault 中无对应凭据账号时报错），且避免无意义执行。
     // 直接向前端 emit 空轮次事件，UI 显示 0/0/0 的完成态。
     if uids.is_empty() {
         crate::fs_utils::app_log(
@@ -380,31 +332,32 @@ fn run_checkin_worker(
         let _ = std::fs::create_dir_all(p);
     }
 
-    // 第 0 轮（全量）先拉起子进程，成功后才向调用方报「已启动」
-    let proc = match spawn_round(state, &uids) {
-        Ok(p) => p,
+    // 第 0 轮（全量）：先在内存准备候选凭据，成功后才向调用方报「已启动」
+    let retry = state.settings().retry.max(0) as u32;
+    let accounts = match prepare_round(state, &uids) {
+        Ok(a) => a,
         Err(e) => {
             let _ = tx.send(Err(e));
             return; // held 在此自动释放
         }
     };
     let total_all = uids.len();
-    // 主轮 start：候选 pending、跳过账号带原因（scope 内全集），先于 Python 事件发出
+    // 主轮 start：候选 pending、跳过账号带原因（scope 内全集），先于轮次事件发出
     let _ = app.emit(
         "checkin-progress",
         serde_json::json!({ "type": "start", "total": total_all, "accounts": accounts_payload(None) }),
     );
     crate::fs_utils::app_log(&state.data_dir, &format!("签到已启动: {} 个账号", total_all));
-    // 启动阶段完成，通知调用方（页面/托盘只关心是否成功拉起）
+    // 启动阶段完成，通知调用方（页面/托盘只关心是否成功启动）
     let _ = tx.send(Ok(()));
 
     // 汇总各轮 per-uid 最终状态：初始全部置 fail，实际结果逐轮覆盖；
-    // 保证 ok + already + failed == total_all（脚本崩溃/丢事件的账号按失败计）
+    // 保证 ok + already + failed == total_all（异常退出/丢事件的账号按失败计）
     let mut final_status: std::collections::HashMap<String, &'static str> = uids
         .iter()
         .map(|u| (u.clone(), "fail"))
         .collect();
-    let outcome = consume_round(app, proc, &log_path);
+    let outcome = execute_round(app, state, &accounts, retry, &log_path);
     // 跨轮失败类型登记（重试轮覆盖旧值），供重试筛选排除 SessionDead 等永久失效账号
     let mut round_error_types: std::collections::HashMap<String, String> = outcome.error_types;
     for (uid, st) in outcome.statuses {
@@ -440,8 +393,9 @@ fn run_checkin_worker(
             }),
         );
         std::thread::sleep(std::time::Duration::from_secs(delay));
-        match spawn_round(state, &failed_uids) {
-            Ok(p) => {
+        // 重试轮：候选凭据在内存重新解密过滤（失败账号可能凭据已失效，保持一致性）
+        match prepare_round(state, &failed_uids) {
+            Ok(accs) => {
                 // 重试轮 start：候选置 pending，其余行沿用上轮最终状态/跳过原因，
                 // 列表跨轮连续（不会把已签账号重置成「等待中」）
                 let _ = app.emit(
@@ -451,7 +405,7 @@ fn run_checkin_worker(
                         "accounts": accounts_payload(Some(&final_status))
                     }),
                 );
-                let o = consume_round(app, p, &log_path);
+                let o = execute_round(app, state, &accs, retry, &log_path);
                 // 重试轮结果覆盖对应 uid 的旧状态：非 fail 同步清除旧失败类型登记
                 for (uid, st) in o.statuses {
                     final_status.insert(uid.clone(), st);
@@ -464,10 +418,10 @@ fn run_checkin_worker(
                 }
             }
             Err(e) => {
-                // 重试轮拉起失败：保持原 fail 状态，继续后续轮次
+                // 重试轮凭据准备失败：保持原 fail 状态，继续后续轮次
                 crate::fs_utils::app_log(
                     &state.data_dir,
-                    &format!("签到第 {round} 轮重试拉起失败: {e}"),
+                    &format!("签到第 {round} 轮重试准备失败: {e}"),
                 );
             }
         }

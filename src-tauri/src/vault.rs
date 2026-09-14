@@ -9,14 +9,14 @@
 //!   读：JSON 明文优先（更新鲜，如 MITM 新捕获）→ 否则从 vault 回填；
 //!   写：非空凭据先写入 vault 并落盘快照 → JSON 占位化；
 //!   vault 写失败时仅保存占位化 JSON 并返回 Err（禁止明文 jwt/refresh_token 落盘）；
-//! - Python 签到脚本通过 `write_temp_accounts` 获取解密临时文件（用后即删；
-//!   文件落在应用数据目录而非全局 %TEMP%，启动时统一清理残留）。
+//! - Rust 签到直调后凭据全程内存传递（原 Python 脚本方案需写解密临时文件，已移除；
+//!   启动清理逻辑保留，兜底清理旧版本残留的临时凭据文件）。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
 use crate::fs_utils;
-use crate::models::{AccountsFile, RawAccount};
+use crate::models::AccountsFile;
 use crate::state::AppState;
 use tauri_plugin_stronghold::stronghold::Stronghold;
 
@@ -41,7 +41,7 @@ static VAULT: Mutex<Option<Stronghold>> = Mutex::new(None);
 // ---------------- DPAPI（Windows 数据保护 API） ----------------
 
 #[cfg(windows)]
-mod dpapi {
+pub(crate) mod dpapi {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
         CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
@@ -373,29 +373,7 @@ pub fn migrate_on_startup(state: &AppState) {
     }
 }
 
-/// 为 Python 签到脚本生成解密临时账号文件（仅含候选账号），返回路径；调用方用后必须删除。
-/// 文件写入应用数据目录（而非全局 %TEMP%），避免明文凭据散落系统临时区；残留由启动清理兜底。
-pub fn write_temp_accounts(state: &AppState, uids: &[String]) -> Result<PathBuf, String> {
-    let accounts = load_accounts(state);
-    let set: std::collections::HashSet<&str> = uids.iter().map(|s| s.as_str()).collect();
-    let filtered: Vec<RawAccount> = accounts
-        .accounts
-        .into_iter()
-        .filter(|a| a.user_id.as_deref().map_or(false, |u| set.contains(u)))
-        .collect();
-    if filtered.is_empty() {
-        return Err("候选账号均无可用凭据".into());
-    }
-    let path = state.data_dir.join(format!(
-        "{}{}.json",
-        TEMP_ACCOUNTS_PREFIX,
-        chrono::Local::now().timestamp_millis()
-    ));
-    fs_utils::write_json(&path, &AccountsFile { accounts: filtered })?;
-    Ok(path)
-}
-
-/// 清理目录下残留的临时凭据文件（按前缀匹配，覆盖 write_json 的 .tmp 半成品），返回删除数量
+/// 清理目录下残留的临时凭据文件（按前缀匹配，覆盖 write_json 的 .tmp 半成品），返回数量
 fn cleanup_temp_in(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -430,6 +408,7 @@ pub fn cleanup_temp_accounts(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::RawAccount;
 
     #[test]
     fn merge_entry_覆盖非空字段并保留旧值() {

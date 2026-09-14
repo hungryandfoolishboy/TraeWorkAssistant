@@ -3,7 +3,7 @@ name = "ai-work-assistant"
 version = "3.4.5"
 description = "AI Work 助手 - 多账号签到与管理桌面端"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.85"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -26,15 +26,34 @@ chrono = { version = "0.4", features = ["serde"] }
 ureq = { version = "2", features = ["json"] }
 urlencoding = "2"
 axum = "0.7"
-tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "macros"] }
+tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "rt-multi-thread", "time", "macros"] }
 tokio-stream = "0.1"
 bytes = "1"
 sha2 = "0.10"
+# 豆包 Chromium cookie v10 解密（AES-256-GCM，doubao_session 诊断/探活兜底）
+aes-gcm = "0.10"
 # 读 Trae 应用的 state.vscdb（SQLite）——自动发现当前登录账号的 Cloud-IDE uid
 rusqlite = { version = "0.32", features = ["bundled"] }
+# device_proxy Rust 化（P4）：以 hyper 1.x 协议栈自建 MITM 代理（参考 hudsucker internal.rs，
+# 因其非拦截 CONNECT 隧道硬编码直连、无法透传用户 VPN 上游），flate2 用于日志 gzip/deflate 解压
+hyper = { version = "1", features = ["client", "server", "http1"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["client-legacy", "server", "server-auto", "http1", "tokio", "service"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "tls12", "webpki-tokio"] }
+tokio-rustls = { version = "0.26", features = ["logging", "tls12"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+hyper-tungstenite = "0.19"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+time = "0.3"
+futures-util = "0.3"
+regex = "1"
+flate2 = "1"
+# upstream.rs：UpstreamConnector 实现 tower::Service<Uri>（hyper legacy Client 连接器接口）
+tower-service = "0.3"
+webpki-roots = "0.26"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 
 # dev/test 构建对依赖开优化：Stronghold 快照加密派生等在未优化下极慢（写一次 ~100s）
 [profile.dev.package."*"]

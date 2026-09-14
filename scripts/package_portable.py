@@ -6,8 +6,7 @@
 内容布局（与 Tauri 安装包一致，exe 直接读取同目录 resources/）：
   AI Work 助手/               ← 顶层目录用产品名（APP 显示名称）
     ai-work-assistant.exe     ← 主程序名取 tauri.conf.json 的 mainBinaryName
-    resources/python/          (来自 src-python/)
-    resources/ps/              (来自 src-ps/)
+    resources/ps/              (来自 src-ps/；python 资源目录已随 Rust 化移除)
 """
 import json
 import os
@@ -83,7 +82,7 @@ def main():
         version = m.group(1)
     binary_name = conf.get("mainBinaryName") or "ai-work-assistant"
     resources = conf["bundle"]["resources"]
-    # resources 形如 {"../src-python/": "python/", "../src-ps/": "ps/"}
+    # resources 形如 {"../src-ps/": "ps/"}（python 资源已随 Rust 化移除）
     abs_res = {}
     for src_rel, dest in resources.items():
         src_abs = os.path.normpath(os.path.join(SRC_TAURI, src_rel))

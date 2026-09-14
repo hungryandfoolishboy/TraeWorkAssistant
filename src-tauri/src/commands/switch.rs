@@ -52,12 +52,7 @@ pub fn switch_account(
     // 实测不对称现象根因：2026-09-09 A 槽探测 code=710012001（expired）、B 槽 code=0（ok）。
     // 提前拦截给出补救指引，避免白切一场；探测不可用 fail-open 不阻断（见函数内实现）。
     if is_doubao {
-        crate::commands::doubao::probe_slot_session_alive(
-            &state.data_dir,
-            &state.python_dir,
-            &state.python_exe,
-            &user_id,
-        )?;
+        crate::commands::doubao::probe_slot_session_alive(&state.data_dir, &user_id)?;
     } else if is_trae && !skip_jwt_probe.unwrap_or(false) {
         // TRAE（TraeWork/Trae）：切换前 JWT 服务端预检（issue #9）——目标账号 JWT 被服务端
         // 吊销时本地快照仍完好，切换恢复后 IDE 一联网即被登出，用户感知为「切换了但没反应」。
@@ -239,13 +234,13 @@ pub fn save_current_login(
 
     // 保存前预检（仅豆包）：Live profile 必须持有登录会话 Cookie。没有 = 客户端当前未登录，
     // 保存只会把未登录状态存进账号槽（实测 908 槽被未登录态覆盖后"切换成功但永远没登录"），
-    // 直接拒绝并告知补救方式。客户端此时仍在运行，Cookies 被锁由 python 复制到临时目录读取。
+    // 直接拒绝并告知补救方式。客户端此时仍在运行，Cookies 被锁由 Rust 复制到临时目录读取。
     if target_app.as_deref() == Some("Doubao") {
-        crate::commands::doubao::ensure_live_has_login_session(&state)?;
+        crate::commands::doubao::ensure_live_has_login_session()?;
         // 服务端会话预检：本地 Cookie 存在≠会话有效。会话可能早已被服务端吊销
         // （客户端内退出过/被新登录顶替），存进去就是死会话，之后每次切换该账号都未登录
         //（实测 A 槽事故：20:43 保存的快照当时已是/随后被吊销的死会话）。expired 拒绝保存。
-        crate::commands::doubao::probe_live_session_alive(&state, &user_id)?;
+        crate::commands::doubao::probe_live_session_alive(&user_id)?;
     }
 
     fs_utils::app_log(&state.data_dir, &format!("开始保存当前登录态: user_id={user_id}"));

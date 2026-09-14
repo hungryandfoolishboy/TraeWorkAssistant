@@ -4,8 +4,6 @@
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::os::windows::process::CommandExt;
-use std::process::Command;
 use tauri::{AppHandle, State};
 
 use crate::fs_utils;
@@ -18,36 +16,9 @@ use super::common::{as_str, auth_file_path_of, load_pool, save_pool, token_store
 #[tauri::command(async)]
 pub fn workbuddy_credits_fetch(app: AppHandle, state: State<AppState>, user_id: Option<String>, fresh: Option<bool>) -> Result<serde_json::Value, String> {
     let _ = &app; // 预留：wb-credits-updated 事件随批次2趋势图启用
-    let mut args: Vec<String> = Vec::new();
-    if let Some(uid) = &user_id {
-        args.push("--uid".into());
-        args.push(uid.clone());
-    }
-    if fresh.unwrap_or(false) {
-        args.push("--fresh".into());
-    }
-    let script_path = state.python_dir.join("workbuddy_credits.py");
-    if !script_path.exists() {
-        return Err(format!("找不到脚本: {}", script_path.display()));
-    }
-    let out = Command::new(&state.python_exe)
-        .arg(&script_path)
-        .args(&args)
-        .creation_flags(0x08000000)
-        .env("AIWORKDATA_DIR", &state.data_dir)
-        .env("PYTHONIOENCODING", "utf-8")
-        .output()
-        .map_err(|e| format!("积分查询失败: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // 取末行 JSON（脚本可能输出告警行）
-    let parsed = stdout
-        .lines()
-        .rev()
-        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
-        .ok_or_else(|| format!("积分查询输出无法解析: {}", stdout.trim().chars().take(200).collect::<String>()))?;
-    if parsed.get("ok") != Some(&serde_json::json!(true)) {
-        return Err("积分查询失败（详见脚本输出）".into());
-    }
+    // Rust 直调 tasks::wb_credits（原 python workbuddy_credits.py 移植）；
+    // 失败以 Err 返回，成功恒为 {"ok":true,"cached":bool,"accounts":[...]}（消费契约见 tasks/wb_credits.rs 模块注释）
+    let parsed = crate::tasks::wb_credits::fetch_credits(&state, user_id.as_deref(), fresh.unwrap_or(false))?;
     // 回写账号池余额缓存（列表/概述展示）
     if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
         let mut pool = load_pool(&state);

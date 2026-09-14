@@ -575,7 +575,7 @@ export interface DoubaoAccountView {
   last_keepalive_at: string | null;
 }
 
-/** doubao_renew.py 摘要 JSON（P3 巡检/诊断结果） */
+/** 续期巡检摘要 JSON（Rust tasks/doubao_session.rs，原 doubao_renew.py） */
 export interface DoubaoRenewSummary {
   mode: 'full' | 'diagnose';
   finished_at: string;
@@ -589,7 +589,7 @@ export interface DoubaoRenewSummary {
 /** 豆包切换/保存的目标应用参数（与 switch_account / save_current_login 的 target_app 对齐） */
 export type DoubaoTargetApp = 'Doubao';
 
-/** 代理自动抓到的豆包会话凭证（device_proxy.py 写 doubao_captured_credentials.json，Rust doubao.rs 透传） */
+/** 代理自动抓到的豆包会话凭证（代理 MITM 层写 doubao_captured_credentials.json，Rust doubao.rs 透传） */
 export interface DoubaoCapturedCredential {
   session_id: string;
   sid_guard: string;
@@ -615,7 +615,7 @@ export interface DoubaoChatdataInfo {
   backed_at?: string | null;
 }
 
-/** D2：对话记录导出结果（doubao_chats.py stdout 末行 JSON） */
+/** D2：对话记录导出结果（Rust tasks/doubao_chats.rs，原 doubao_chats.py stdout 末行 JSON） */
 export interface DoubaoExportResult {
   ok: boolean;
   conversations: number;
@@ -624,7 +624,7 @@ export interface DoubaoExportResult {
   json_path: string;
 }
 
-/** doubao_quota.py 摘要 JSON（会员额度查询结果；字段由宽容解析尽力得到，均可为 null） */
+/** 会员额度查询摘要 JSON（字段由宽容解析尽力得到，均可为 null） */
 export interface DoubaoQuotaResult {
   ok: boolean;
   http_status: number;
@@ -975,7 +975,7 @@ export interface WbUsageFallback {
   fetched_at_ms: number;
 }
 
-/** 积分包（workbuddy_credits.py 宽容解析输出） */
+/** 积分包（tasks/wb_credits.rs 宽容解析输出） */
 export interface WbCreditPackage {
   name: string;
   remaining: number;
