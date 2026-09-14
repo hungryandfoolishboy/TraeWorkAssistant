@@ -16,8 +16,9 @@ import type {
 
 /**
  * Buddy · 资源调度（unified-api-gateway-design §6.2，Phase 3）
- * 页内仅保留 Buddy 资源级内容：积分体系说明 / 池指标行 / 左列（资源开关（Buddy 独有）+
- * 账号池选择，窄列上下排布）/ 右列 模型目录（Buddy，wb_model_catalog 同步），同行左右两列。
+ * 页内仅保留 Buddy 资源级内容：积分体系说明 / 池指标行 /
+ * 左列（资源开关 + 调度参数合并面板，共用「保存」）/ 右列（账号池选择 + 模型目录（Buddy）上下排布），
+ * 同行左右两列各占 1/2。
  * 网关级功能（服务启停 / 使用方式 / 生态接入 / WB 用量统计）已全部迁至
  * 全局 API 管理弹窗（左侧栏 KeyRound 图标），页内不再出现网关级内容。
  */
@@ -292,16 +293,15 @@ export default function BuddyApiService() {
         />
       </div>
 
-      {/* 资源开关 + 账号池选择（左列）｜模型目录（Buddy）（右列），同行两列各占 1/2 */}
+      {/* 资源开关 + 调度参数（左列，合并面板）｜账号池选择 + 模型目录（右列），同行两列各占 1/2 */}
       <div className="mt-4 grid grid-cols-12 items-start gap-4">
-        {/* 左列：资源开关 + 账号池选择（上下排布） */}
-        <div className="col-span-6 space-y-4">
-          {/* 资源开关卡（Buddy 独有） */}
+        {/* 左列：资源开关 + 调度参数（合并为一个面板，共用「保存」，两者本就随 poolSet 一并落盘） */}
+        <div className="col-span-6">
           <div className="card p-4">
             <div className="mb-3 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <ToggleLeft size={16} className="text-brand-500" />
-                <span className="text-sm font-medium">资源开关</span>
+                <span className="text-sm font-medium">资源开关与调度参数</span>
               </div>
               <button className="btn-outline" onClick={() => void saveFlags()} disabled={saving}>
                 {saving ? <Spinner /> : <Save size={15} />} 保存
@@ -333,52 +333,56 @@ export default function BuddyApiService() {
                 </label>
               ))}
             </div>
-            <p className="mt-2 text-xs text-slate-400 dark:text-zinc-500">
+
+            {/* 调度参数（F-76②/③/F-77：数值热参数，与资源开关同面板，保存即热生效） */}
+            <div className="mt-4 border-t border-slate-100 pt-3 dark:border-zinc-800">
+              <div className="mb-2 flex items-center gap-2">
+                <Gauge size={15} className="text-brand-500" />
+                <span className="text-sm font-medium">调度参数</span>
+                <span className="text-xs text-slate-400">保存即热生效 · 0 表示关闭/不限</span>
+              </div>
+              <div className="space-y-3">
+                {WB_PARAM_FIELDS.map((item) => (
+                  <div key={item.key} className="rounded-md px-1.5 py-1.5">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-xs text-slate-700 dark:text-zinc-200">{item.label}</span>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          className="w-24 rounded-md border border-slate-200 bg-transparent px-2 py-1 text-right text-xs tabular-nums focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+                          min={item.min}
+                          max={item.max}
+                          step={item.step}
+                          value={wbParams[item.key]}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            setWbParams((prev) => ({
+                              ...prev,
+                              [item.key]: Number.isFinite(v)
+                                ? Math.min(item.max, Math.max(item.min, v))
+                                : prev[item.key],
+                            }));
+                          }}
+                        />
+                        <span className="w-8 shrink-0 text-[11px] text-slate-400">{item.unit}</span>
+                      </div>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                      {item.desc}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <p className="mt-3 text-xs text-slate-400 dark:text-zinc-500">
               保存后需重启 API 服务生效；Trae 池的调度策略与分组筛选在 Trae「资源调度」页配置，本页不改动。
             </p>
           </div>
+        </div>
 
-          {/* 调度参数卡（F-76②/③/F-77：数值热参数，保存即热生效） */}
-          <div className="card p-4">
-            <div className="mb-3 flex items-center gap-2">
-              <Gauge size={16} className="text-brand-500" />
-              <span className="text-sm font-medium">调度参数</span>
-              <span className="text-xs text-slate-400">保存即热生效 · 0 表示关闭/不限</span>
-            </div>
-            <div className="space-y-3">
-              {WB_PARAM_FIELDS.map((item) => (
-                <div key={item.key} className="rounded-md px-1.5 py-1.5">
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-xs text-slate-700 dark:text-zinc-200">{item.label}</span>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="number"
-                        className="w-24 rounded-md border border-slate-200 bg-transparent px-2 py-1 text-right text-xs tabular-nums focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
-                        min={item.min}
-                        max={item.max}
-                        step={item.step}
-                        value={wbParams[item.key]}
-                        onChange={(e) => {
-                          const v = Number(e.target.value);
-                          setWbParams((prev) => ({
-                            ...prev,
-                            [item.key]: Number.isFinite(v)
-                              ? Math.min(item.max, Math.max(item.min, v))
-                              : prev[item.key],
-                          }));
-                        }}
-                      />
-                      <span className="w-8 shrink-0 text-[11px] text-slate-400">{item.unit}</span>
-                    </div>
-                  </div>
-                  <p className="mt-1 text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
-                    {item.desc}
-                  </p>
-                </div>
-              ))}
-            </div>
-          </div>
-
+        {/* 右列：账号池选择（上）+ 模型目录（Buddy）（下），上下排布 */}
+        <div className="col-span-6 space-y-4">
           {/* 账号池选择卡（现有 WB 池状态卡功能保留迁移） */}
           <div className="card p-4">
             <div className="mb-3 flex items-center gap-2">
@@ -415,69 +419,69 @@ export default function BuddyApiService() {
               </div>
             )}
           </div>
-        </div>
 
-        {/* 右列：模型目录（Buddy）卡（现有目录同步能力保留） */}
-        <div className="card col-span-6 p-4">
-          <div className="mb-3 flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Coins size={16} className="text-amber-500" />
-              <span className="text-sm font-medium">模型目录（Buddy）</span>
-              <span className="text-xs text-slate-400">{catalog.length} 个模型</span>
+          {/* 模型目录（Buddy）卡（现有目录同步能力保留） */}
+          <div className="card p-4">
+            <div className="mb-3 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Coins size={16} className="text-amber-500" />
+                <span className="text-sm font-medium">模型目录（Buddy）</span>
+                <span className="text-xs text-slate-400">{catalog.length} 个模型</span>
+              </div>
+              <button className="btn-outline" onClick={() => void syncCatalog()} disabled={syncing}>
+                <RefreshCw size={14} className={syncing ? 'animate-spin' : ''} />
+                {syncing ? '同步中…' : '同步目录'}
+              </button>
             </div>
-            <button className="btn-outline" onClick={() => void syncCatalog()} disabled={syncing}>
-              <RefreshCw size={14} className={syncing ? 'animate-spin' : ''} />
-              {syncing ? '同步中…' : '同步目录'}
-            </button>
-          </div>
-          <p className="mb-3 text-xs text-slate-400">
-            从 Buddy 上游模型目录接口拉取并替换 wb_model_catalog.json（倍率/思考档位/图片模态以服务端为准）；
-            网关启动时也会自动同步一次。
-          </p>
-          {catalog.length === 0 ? (
-            <p className="py-4 text-center text-xs text-slate-400">暂无目录数据：点击「同步目录」拉取（需至少一个含凭证的 WB 账号）。</p>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[560px] text-sm">
-                <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
-                  <tr>
-                    <th className="px-3 py-2 text-left">模型 ID</th>
-                    <th className="px-3 py-2 text-left">展示名</th>
-                    <th className="px-3 py-2 text-right">积分倍率</th>
-                    <th className="px-3 py-2 text-left">思考档位</th>
-                    <th className="px-3 py-2 text-right">上下文</th>
-                    <th className="px-3 py-2 text-center">图片支持</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {catalog.map((m) => (
-                    <tr key={m.id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
-                      <td className="px-3 py-2 font-mono text-xs">{m.id}</td>
-                      <td className="px-3 py-2">{m.display || '—'}</td>
-                      <td className="px-3 py-2 text-right tabular-nums text-amber-600 dark:text-amber-400">{m.rate.toFixed(2)}</td>
-                      <td className="px-3 py-2 text-xs text-slate-500">
-                        {m.effort_override
-                          ? `${m.effort_override}（修正）`
-                          : m.supported_efforts.length > 0
-                            ? m.supported_efforts.join(' / ')
-                            : '—'}
-                      </td>
-                      <td className="px-3 py-2 text-right tabular-nums text-xs text-slate-500">
-                        {(m.context_length / 1000).toFixed(0)}k
-                      </td>
-                      <td className="px-3 py-2 text-center text-xs">
-                        {m.supports_image ? (
-                          <span className="font-semibold text-emerald-600 dark:text-emerald-400">✓</span>
-                        ) : (
-                          <span className="text-slate-400 dark:text-zinc-500">✗</span>
-                        )}
-                      </td>
+            <p className="mb-3 text-xs text-slate-400">
+              从 Buddy 上游模型目录接口拉取并替换 wb_model_catalog.json（倍率/思考档位/图片模态以服务端为准）；
+              网关启动时也会自动同步一次。
+            </p>
+            {catalog.length === 0 ? (
+              <p className="py-4 text-center text-xs text-slate-400">暂无目录数据：点击「同步目录」拉取（需至少一个含凭证的 WB 账号）。</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[560px] text-sm">
+                  <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
+                    <tr>
+                      <th className="px-3 py-2 text-left">模型 ID</th>
+                      <th className="px-3 py-2 text-left">展示名</th>
+                      <th className="px-3 py-2 text-right">积分倍率</th>
+                      <th className="px-3 py-2 text-left">思考档位</th>
+                      <th className="px-3 py-2 text-right">上下文</th>
+                      <th className="px-3 py-2 text-center">图片支持</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+                  </thead>
+                  <tbody>
+                    {catalog.map((m) => (
+                      <tr key={m.id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
+                        <td className="px-3 py-2 font-mono text-xs">{m.id}</td>
+                        <td className="px-3 py-2">{m.display || '—'}</td>
+                        <td className="px-3 py-2 text-right tabular-nums text-amber-600 dark:text-amber-400">{m.rate.toFixed(2)}</td>
+                        <td className="px-3 py-2 text-xs text-slate-500">
+                          {m.effort_override
+                            ? `${m.effort_override}（修正）`
+                            : m.supported_efforts.length > 0
+                              ? m.supported_efforts.join(' / ')
+                              : '—'}
+                        </td>
+                        <td className="px-3 py-2 text-right tabular-nums text-xs text-slate-500">
+                          {(m.context_length / 1000).toFixed(0)}k
+                        </td>
+                        <td className="px-3 py-2 text-center text-xs">
+                          {m.supports_image ? (
+                            <span className="font-semibold text-emerald-600 dark:text-emerald-400">✓</span>
+                          ) : (
+                            <span className="text-slate-400 dark:text-zinc-500">✗</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
