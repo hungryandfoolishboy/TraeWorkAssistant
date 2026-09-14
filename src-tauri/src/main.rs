@@ -9,6 +9,7 @@ mod jwt;
 mod models;
 mod notify;
 mod state;
+mod store;
 mod switcher;
 mod tasks;
 mod vault;
@@ -296,6 +297,12 @@ fn main() {
 
             // 敏感数据迁移：checkin_accounts.json 明文 jwt/refresh_token → Stronghold vault（幂等，失败不阻断启动）
             vault::migrate_on_startup(&state);
+
+            // 数据存储层 SQLite 化（docs/sqllite-storage-plan.md）：旧 JSON 导入 aiwork.sqlite
+            // 并移入 data/backup/（幂等；失败不阻断启动，下次启动重试）
+            if let Some(summary) = store::migrate::migrate_on_startup(&state.data_dir) {
+                fs_utils::app_log(&state.data_dir, &summary);
+            }
 
             fs_utils::app_log(
                 &state.data_dir,

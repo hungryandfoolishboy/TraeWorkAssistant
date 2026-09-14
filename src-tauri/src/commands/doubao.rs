@@ -71,9 +71,9 @@ pub struct DoubaoAccount {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
-struct DoubaoAccountPool {
+pub(crate) struct DoubaoAccountPool {
     #[serde(default)]
-    accounts: Vec<DoubaoAccount>,
+    pub(crate) accounts: Vec<DoubaoAccount>,
     /// 最近一次 KeepAlive 保活时间（池级：保活由豆包客户端对当前登录会话统一滑动续期）
     #[serde(default)]
     pub last_keepalive_at: Option<String>,
