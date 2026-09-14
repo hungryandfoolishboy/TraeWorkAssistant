@@ -181,8 +181,16 @@ fn status_check(
         };
     };
     let code = data.get("code").and_then(Value::as_i64);
-    let checked_in = data.get("checked_in").map(py_truthy);
-    let credits = int_candidate(data.get("credits").unwrap_or(&Value::Null));
+    // 宽容解析（对齐 main 分支 12d051e 修复，F-49 dig 同口径）：checked_in / credits
+    // 可能被 data 信封包裹，此前只读顶层，字段被包裹时恒为 None → 已签账号被判
+    // 「未签」重复 claim、余额拿不到 → delta 联动失败，前端显示「积分+0」。
+    // code 保持顶层口径（不深挖以免误伤嵌套业务对象里的通用错误码）。
+    let checked_in = match find_payload_field(&data, "checked_in") {
+        Some(v) if v.is_boolean() => v.as_bool(),
+        Some(v) => v.as_f64().map(|f| f != 0.0),
+        None => None,
+    };
+    let credits = find_payload_field(&data, "credits").and_then(as_int_tolerant);
     let msg = data.get("message").and_then(Value::as_str).unwrap_or("").to_string();
     if code != Some(0) {
         return StatusOutcome {
@@ -328,47 +336,79 @@ fn clear_cooldown(state: &AppState, uid: &str) {
 
 // ── 积分归属三层兜底（纯函数，便于单测）────────────────────────────────────
 
-/// python bool() 语义（0/""/null/false → false，其余 true）
-fn py_truthy(v: &Value) -> bool {
-    match v {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map_or(true, |f| f != 0.0),
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(_) => true,
-    }
-}
-
-/// 宽容整数取数（对齐 python int/整值 float/纯数字串，排除 bool 与负值）
-fn int_candidate(v: &Value) -> Option<i64> {
+/// 宽容数值归一（对齐 python `_as_int`）：int / 整值 float / 纯数字串 → i64；
+/// bool / 小数 / 非数字串 / null → None。负整数保留（由调用方按语义排除）。
+fn as_int_tolerant(v: &Value) -> Option<i64> {
     match v {
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                (i >= 0).then_some(i)
+                Some(i)
             } else {
                 let f = n.as_f64()?;
-                (f >= 0.0 && f.fract() == 0.0).then_some(f as i64)
+                (f.fract() == 0.0).then_some(f as i64)
             }
         }
-        Value::String(s) => s.trim().parse::<i64>().ok().filter(|i| *i >= 0),
+        Value::String(s) => {
+            let t = s.trim();
+            if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+                t.parse::<i64>().ok()
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
 
+// ── 响应宽容解析（信封字段下钻，对齐 python 12d051e / Rust F-49 dig 口径）──
+// 官方响应的业务字段可能被 data/result/resp/response/info 等信封键包裹。
+// 此前 status_check 只读顶层 checked_in/credits、parse_claim_reward 只下钻一层
+// data，字段被包裹时恒取不到 → 已签账号被判「未签」、余额拿不到、delta 解析
+// 失败，前端联动显示「积分+0」。
+
+/// 信封包裹键（外层 → 内层依次下钻）
+const PAYLOAD_WRAPPER_KEYS: [&str; 5] = ["data", "result", "resp", "response", "info"];
+/// 下钻限深（防异常嵌套），对齐 F-49 dig 上限
+const UNWRAP_MAX_DEPTH: usize = 8;
+
+fn unwrap_walk<'a>(obj: &'a Value, depth: usize, scopes: &mut Vec<&'a Value>) {
+    let Some(map) = obj.as_object() else { return };
+    if depth > UNWRAP_MAX_DEPTH {
+        return;
+    }
+    scopes.push(obj);
+    for k in PAYLOAD_WRAPPER_KEYS {
+        if let Some(child) = map.get(k).filter(|v| v.is_object()) {
+            unwrap_walk(child, depth + 1, scopes);
+        }
+    }
+}
+
+/// 沿信封包裹键递归下钻，返回 [最外层, …, 最内层业务对象]（限深，纯函数；
+/// serde_json Value 无环，无需去重）。
+fn unwrap_scopes(data: &Value) -> Vec<&Value> {
+    let mut scopes = Vec::new();
+    unwrap_walk(data, 0, &mut scopes);
+    scopes
+}
+
+/// 在各层 scope 查找 key（外层优先，保持顶层字段口径），命中即返回原始值。
+fn find_payload_field<'a>(data: &'a Value, key: &str) -> Option<&'a Value> {
+    unwrap_scopes(data).into_iter().find_map(|s| s.get(key))
+}
+
 /// 从 claim 响应 JSON 中提取本次签到奖励值（纯函数）。
-/// 依次在 data 层与顶层查找候选奖励字段，仅接受整数型数值；无可用字段返回 None。
+/// 候选字段按「内层业务对象优先于顶层」在各信封层查找，仅接受正整数型数值
+///（int / 整值 float / 数字串），排除 bool 与非正值；0 值占位字段（如奖励未发放
+/// 时的 credits:0）跳过并继续向后查找，避免挡住真实奖励字段；无可用字段返回 None。
 fn parse_claim_reward(data: Option<&Value>) -> Option<i64> {
     let d = data?;
-    let mut scopes: Vec<&Value> = Vec::with_capacity(2);
-    if let Some(nested) = d.get("data").filter(|v| v.is_object()) {
-        scopes.push(nested);
-    }
-    scopes.push(d);
+    let mut scopes = unwrap_scopes(d);
+    scopes.reverse(); // 内层业务对象优先于顶层兜底（与原「data 层优先」口径一致）
     for scope in scopes {
         for key in CLAIM_REWARD_KEYS {
-            if let Some(val) = scope.get(key) {
-                if let Some(n) = int_candidate(val) {
+            if let Some(n) = scope.get(key).and_then(as_int_tolerant) {
+                if n > 0 {
                     return Some(n);
                 }
             }
@@ -706,21 +746,51 @@ mod tests {
     }
 
     #[test]
-    fn int_candidate_宽容整数语义() {
-        assert_eq!(int_candidate(&json!(12)), Some(12));
-        assert_eq!(int_candidate(&json!(12.0)), Some(12));
-        assert_eq!(int_candidate(&json!("30")), Some(30));
-        assert_eq!(int_candidate(&json!(true)), None);
-        assert_eq!(int_candidate(&json!(-5)), None);
-        assert_eq!(int_candidate(&json!(null)), None);
+    fn as_int_tolerant_宽容归一() {
+        assert_eq!(as_int_tolerant(&json!(5)), Some(5));
+        assert_eq!(as_int_tolerant(&json!(2.0)), Some(2));
+        assert_eq!(as_int_tolerant(&json!("15")), Some(15));
+        assert_eq!(as_int_tolerant(&json!(true)), None);
+        assert_eq!(as_int_tolerant(&json!(false)), None);
+        assert_eq!(as_int_tolerant(&json!(-5)), Some(-5)); // 归一不拦负值，由调用方按语义排除
+        assert_eq!(as_int_tolerant(&json!(1.5)), None);
+        assert_eq!(as_int_tolerant(&json!("abc")), None);
+        assert_eq!(as_int_tolerant(&json!(null)), None);
     }
 
     #[test]
-    fn py_truthy_对齐_python_bool() {
-        assert!(!py_truthy(&json!(0)));
-        assert!(py_truthy(&json!(1)));
-        assert!(!py_truthy(&json!("")));
-        assert!(!py_truthy(&json!(null)));
-        assert!(py_truthy(&json!("0"))); // python bool("0") == True
+    fn unwrap_scopes_与_find_field_信封下钻() {
+        // 外层优先：顶层 credits 命中，不深挖内层
+        let payload = json!({"code": 0, "data": {"result": {"credits": 99}}, "credits": 1});
+        assert_eq!(find_payload_field(&payload, "credits"), Some(&json!(1)));
+        // 字段被包裹时沿 data/result 下钻命中
+        let deep = json!({"data": {"result": {"credits": 42}}});
+        assert_eq!(find_payload_field(&deep, "credits"), Some(&json!(42)));
+        // 不存在的字段 / 非 dict 输入
+        assert_eq!(find_payload_field(&json!({"other": 1}), "credits"), None);
+        assert_eq!(find_payload_field(&json!(null), "credits"), None);
+    }
+
+    #[test]
+    fn parse_claim_reward_零值跳过与多层嵌套() {
+        // credits:0 占位不挡住后面的真实奖励字段
+        assert_eq!(
+            parse_claim_reward(Some(&json!({"code": 0, "data": {"credits": 0, "reward": 12}}))),
+            Some(12)
+        );
+        // 多层信封：data.data.reward 也能命中
+        assert_eq!(
+            parse_claim_reward(Some(&json!({"code": 0, "data": {"data": {"reward": 9}}}))),
+            Some(9)
+        );
+        // 内层优先于顶层
+        assert_eq!(
+            parse_claim_reward(Some(&json!({"code": 0, "data": {"delta": 7}, "credits": 99}))),
+            Some(7)
+        );
+        // 全部候选字段均为 0 → 无奖励
+        assert_eq!(parse_claim_reward(Some(&json!({"code": 0, "data": {"credits": 0}}))), None);
+        // 0 值不再被当作有效奖励（旧行为会返回 0，delta 联动显示「积分+0」）
+        assert_eq!(parse_claim_reward(Some(&json!({"code": 0, "data": {"amount": 0}}))), None);
     }
 }
