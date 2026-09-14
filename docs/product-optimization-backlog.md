@@ -1,8 +1,9 @@
 # 产品优化需求清单（全应用统一待办）
 
-> **文档版本**: v2.0 · 2026-09-13
+> **文档版本**: v2.1 · 2026-09-14
 > **定位**: 全项目**唯一待办依据**——所有未实施的优化与需求项均在此登记，每条含需求概述 / 实现路径 / 参考开源项目。
 > **v2.0 变更**: ① 合并删除五份分析文档——`docs/tmp/`（trae-account-switch-data-migration-analysis / doubao-api-feasibility / oss-ecosystem-value-analysis）、`work-credit-pool-design.md`（完整并入 §W-01）、`unified-api-gateway-design.md`（已实施，要点并入 tech-framework.md）；② WorkBuddy 蓝本（原 workbuddy-product-design.md）批次 1~5 已全部完成，其机会项 F-41/F-42/F-52/F-66 转入本文；③ 新增 F-67~F-73、E-01~E-03 共 10 项（源自上述分析文档中的未实现价值点）；④ 原 F-44（TRAE 多实例并行）改号 **F-67**，消除与 WorkBuddy 蓝本 F-44（会话备份，已完成）的编号冲突。
+> **v2.1 变更**: 新增 **F-74 Trae OAuth 授权闭环补全**（源自 issue #10 用户反馈：OAuth 登录撞 SSL + 回调无监听，现状为"半实现"——详见条目）。
 > **原则**: 接口层独立模块 + 失败明示 + 不硬编码奖励数额；仅管理本人合法持有的账号；借鉴开源遵循 learn-the-design, write-our-own-code。
 
 ---
@@ -12,6 +13,7 @@
 | 编号 | 功能点 | 应用域 | 优先级 | 预估 | 状态 |
 |---|---|---|---|---|---|
 | F-68 | Trae 项目列表/最近打开跨账号保留 | Trae 生态 | **P1** | 1~2 天 | 待开发（方案已论证） |
+| F-74 | Trae OAuth 授权闭环补全（回环监听 + 代理豁免 + code 交换） | Trae 生态 | **P1** | 1~2 天（批次1）/ 3~4 天（全链路） | 半实现（缺口清单已盘清，源自 issue #10） |
 | F-24-余 | 豆包会员额度端点抓包固化 | 豆包 | **P1** | 0.5~1 天（含抓包） | 框架已完成，仅剩前置 |
 | F-38 | Trae → DSH 引导（不自研） | Trae 生态 | **P1** | ≈0（装即用） | 待开发 |
 | E-01 | 豆包对话网关（OpenAI 兼容 doubao provider） | 豆包/网关 | **P2** | 8~12 天（含 E-02） | 待开发（方案 B 已论证，含探测实验前置） |
@@ -46,6 +48,24 @@
   3. 操作前对 `state.vscdb` 做一次性 `.bak` 备份，失败回滚；全程在 Trae 未运行窗口期执行（切换流程本就先关闭，天然满足）。
 - **参考开源项目**：无直接同类实现（自研分析）；SQLite 处理参照本项目 `doubao_chats.py` 既有模式。
 - **验收**：双账号各建若干项目后互切，项目列表与最近打开完整保留；账号分区键零改动。
+
+### F-74 Trae OAuth 授权闭环补全（P1，半实现——源自 issue #10）
+
+- **背景（issue #10，2026-09-13）**：用户走 OAuth 登录报 `ERR_CERT_AUTHORITY_INVALID`（www.trae.cn）且回调无法到达，WorkBuddy 侧正常。根因有二：① 本软件 MITM 代理运行时会把系统代理指向 `127.0.0.1:8899`，浏览器访问 OAuth 登录页被解密，自签 CA 未被信任即撞 SSL；② redirect_uri 指向的 `127.0.0.1:17388` **本机没有任何进程在监听**，浏览器跳转后只是"无法访问"页，需用户手动复制地址栏 URL 粘贴回来——链路从未真正闭环。
+- **现状盘点（代码已实现的部分，勿重复造）**：`src-tauri/src/commands/oauth.rs` 已有 `oauth_get_login_url`（state CSRF + machine_id/device_id 生成）、`oauth_parse_callback`（宽容字段解析）、`exchange_token`（`api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken`）、`get_user_info`、`oauth_login`（vault 加密落库 + 分组）；`accounts.rs::refresh_jwt_impl` 已有 refresh_token → 新 JWT 续期（含冷却自动解冻）；前端 `OAuthLoginModal.tsx` 三步向导（打开登录页 → **手动粘贴回调 URL** → 落库）。Buddy 侧另有完整先例可对照（`workbuddy_oauth_login`：后端开浏览器 + 轮询 + 自动入池，F-50）。
+- **缺口清单（"还缺什么"的准确答案）**：
+  1. **本机回环监听器缺失**——`127.0.0.1:17388/authorize` 无人监听，OAuth 回调只能靠人肉复制 URL，这是"未打通"的核心；
+  2. **登录链路无代理豁免**——OAuth 页在系统浏览器打开，系统代理被 MITM 端口占用时 `www.trae.cn` 流量被解密，CA 未信任即报 SSL（issue #10 直接根因）；
+  3. **code 交换分支未实现**——`oauth_parse_callback` 注释自述"或可能带 code 参数需要交换"，但回调只认 `refreshToken` 参数，若上游改为标准 `code` 授权码回调则整条链路失效；
+  4. **client_secret 为占位符 `"-"`**——ExchangeToken 是否强校验 secret 未验证，需经 MITM 抓包固化真实参数（与 F-24-余 同方法）；
+  5. **设备标识不一致**——登录 URL 的 machine_id/device_id 每次随机生成，与 `device_map.json` 的账号稳定伪设备不对齐，OAuth 换发的 JWT 绑定设备与签到用设备不同，存在被服务端判定异动/顶替的风控隐患；
+  6. **refresh_token 生命周期管理缺位**——无 expires_at / 失败计数 / 轮换旧值失效的显式标记（Buddy 侧 `refresh_token_expires_at` 已有先例），轮换失败后账号只能等签到 401 才暴露。
+- **实现路径**：
+  1. **批次 1（1~2 天，闭环主件）**：Rust 侧新增 `oauth_loopback.rs`——axum（已有依赖，零新增 crate）在本机 `127.0.0.1:17388` 起短生命周期 HTTP server（仅在 OAuth 流程期间监听，完成即关），GET /authorize 收到回调 → 自动调 `oauth_login` 落库 → 向浏览器返回"登录成功，可关闭此页"静态页；`OAuthLoginModal` 改为监听 `oauth-login-done` 事件自动收尾，手动粘贴 URL 降级为兜底步骤；
+  2. **批次 2（0.5 天，代理豁免）**：发起 OAuth 前检测系统代理是否指向本软件 MITM 端口，登录页域名（`www.trae.cn` / `api.trae.cn` / 授权回调）加入 `device_proxy.py` 直连白名单（PAC/bypass 列表），并在 UI 明示"OAuth 登录不走 MITM 代理"；根治形态（内嵌 WebView + 独立代理配置）留作后续增强；
+  3. **批次 3（1 天，健壮性）**：`oauth_parse_callback` 增加 `code` → token 交换分支；MITM 抓包固化 ExchangeToken 真实参数（client_secret 校验行为、refresh_token 轮换语义）；machine_id/device_id 改为从 `device_map.json` 按账号稳定读取；refresh_token 生命周期字段对齐 Buddy 侧（expires_at / 失败计数 / 失效标记）。
+- **参考开源项目**：`dingminhua/dsh-connect-trae`（loopback shim 接收回调的成熟形态，F-38 已引）；本项目 Buddy 侧 `workbuddy_oauth_login`（后端开浏览器 + 轮询 + 自动入池，直接对照实现）；`BlueChonk/trae-credential-reverse-engineering`（token 刷新签名情报，见 F-70，批次 3 联动核对）。
+- **验收**：MITM 代理运行中（复现 issue #10 环境）发起 OAuth 登录 → 浏览器完成授权 → 应用自动弹出"账号已添加"，全程无需手动复制 URL；粘贴回调 URL 兜底路径保留可用；登录页不再出现证书告警；OAuth 账号的签到/续期与 MITM 捕获账号行为一致。
 
 ### F-24-余 豆包会员额度端点抓包固化（P1，框架已完成）
 
@@ -223,10 +243,11 @@
 ## 五、建议排序
 
 1. **F-68 项目列表跨账号保留** —— 1~2 天，切换体验的显性痛点，方案已论证零风险
-2. **F-24-余 豆包额度端点固化** —— 半天抓包点亮已建好的框架
-3. **F-38 DSH 引导页** —— 成本≈0，随手带上
-4. **E-01/E-02 豆包网关**（批次 0 探测先行）—— 8~12 天，豆包积分资产化主路径
-5. **W-01 Work 积分接入** —— 有实现可抄（solo_work_lite），未决项 1/3 与 F-67 共享多实例底座，建议 F-67 调研后并行
-6. **F-70 tc 凭证直读** —— 情报核对 0.5 天先行，解密落地 2~3 天
-7. F-69 / E-03 / F-41 / F-42 / F-66 —— 按需启动
-8. F-52 / F-71 / F-72 / F-73 —— 远期留档，随生态演进评估
+2. **F-74 OAuth 授权闭环补全** —— 批次 1+2 约 2 天，已有用户卡在此处（issue #10），批次 3 与 F-24-余 抓包同批做
+3. **F-24-余 豆包额度端点固化** —— 半天抓包点亮已建好的框架
+4. **F-38 DSH 引导页** —— 成本≈0，随手带上
+5. **E-01/E-02 豆包网关**（批次 0 探测先行）—— 8~12 天，豆包积分资产化主路径
+6. **W-01 Work 积分接入** —— 有实现可抄（solo_work_lite），未决项 1/3 与 F-67 共享多实例底座，建议 F-67 调研后并行
+7. **F-70 tc 凭证直读** —— 情报核对 0.5 天先行，解密落地 2~3 天
+8. F-69 / E-03 / F-41 / F-42 / F-66 —— 按需启动
+9. F-52 / F-71 / F-72 / F-73 —— 远期留档，随生态演进评估
