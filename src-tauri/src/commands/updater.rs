@@ -1,12 +1,12 @@
 // ---------------- 应用自更新（检查 / 下载 / 安装，两步确认制） ----------------
 //
-// 数据源：GitHub Releases（api.github.com）。资产命名约定（见 scripts/rename_release.py）：
+// 数据源：GitHub Releases（api.github.com）。资产命名约定（见 scripts/rename_release.mjs）：
 //   AI Work 助手_<ver>_x64-setup.exe   ← NSIS 安装包（首选，支持原地升级 + 老版迁移钩子）
 //   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（备选；仅同 identifier 的 3.x 间可原地升级）
 //
 // 流程（下载与安装拆分，UI 两处确认）：
 //   update_check       解析最新 release 并与 CARGO_PKG_VERSION 比较；同时解析发布校验清单
-//                      latest.json（scripts/rename_release.py 生成随 Release 上传）取安装包 SHA256，
+//                      latest.json（scripts/rename_release.mjs 生成随 Release 上传）取安装包 SHA256，
 //                      清单存在即 fail-closed（缺失/损坏/版本不符均阻止自动更新），无清单回退正文约定行；
 //   update_download    下载资产到临时目录（emit update-download-progress），完成后与发布方
 //                      SHA256 比对（不匹配即删除并报错），返回文件路径由前端确认后再安装；
@@ -23,7 +23,7 @@ const RELEASES_API: &str =
     "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
 const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases";
 
-/// 发布校验清单资产名（scripts/rename_release.py 生成，随 Release 上传）：
+/// 发布校验清单资产名（scripts/rename_release.mjs 生成，随 Release 上传）：
 /// `{ "version": "x.y.z", "assets": { "<资产文件名>": "<sha256hex>" } }`
 const MANIFEST_ASSET: &str = "latest.json";
 
@@ -186,7 +186,7 @@ fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
 
 // ---------------- 发布校验清单（latest.json） ----------------
 
-/// 发布校验清单结构（scripts/rename_release.py 生成并随 Release 上传）
+/// 发布校验清单结构（scripts/rename_release.mjs 生成并随 Release 上传）
 #[derive(serde::Deserialize)]
 struct UpdateManifest {
     version: String,

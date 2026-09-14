@@ -55,11 +55,11 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 npm install
 npm run tauri dev      # 开发模式
 npm run tauri build    # 打包（msi + nsis）
-python scripts/rename_release.py   # 安装包统一输出到 release/，命名 AI Work 助手_<版本>_x64*
-python scripts/package_portable.py # 便携版 zip（AI Work 助手_<版本>_x64_portable.zip）
+node scripts/rename_release.mjs     # 安装包统一输出到 release/，命名 AI Work 助手_<版本>_x64*
+node scripts/package_portable.mjs   # 便携版 zip（AI Work 助手_<版本>_x64_portable.zip）
 ```
 
-前置：Node.js 18+、Rust 1.75+、Python 3.9+、WebView2 Runtime、VS Build Tools (C++)
+前置：Node.js 18+、Rust 1.75+、WebView2 Runtime、VS Build Tools (C++)
 
 ## 从老版本升级
 

@@ -10,13 +10,13 @@
 |---|---|---|
 | UI | React 18 + TypeScript 5 + Vite 5 + Tailwind 3 + Zustand 4 + Recharts 2 + lucide-react | Web 技术栈还原设计稿；Zustand 单一状态源；Recharts 图表 |
 | 外壳 | Tauri 2.x（Rust 1.75+ MSVC） | 包体 8~15MB（远小于 Electron），可调用系统 API（注册表/证书/计划任务/DPAPI） |
-| 核心逻辑 | Python 3.9+（仅标准库 + cryptography） | 复用已验证的签到/代理/豆包脚本逻辑，可热更 |
+| 核心逻辑 | Rust（`src-tauri/src/tasks/` 直调模块） | 原 Python 脚本已全部重写为 Rust 后台任务（trae_checkin / wb_* / doubao_* / device_proxy），无子进程、无解释器依赖 |
 | 登录态切换 | PowerShell 5.1+（`trae-switch-bridge.ps1`，四应用档案表驱动） | 复用备份/恢复/设备标识重置逻辑，系统自带 |
 | API 网关 | Rust axum（内嵌，复用 Tauri tokio runtime） | OpenAI / Anthropic 双协议端点 + SSE 转换 + 账号池调度，无独立进程 |
 | HTTP 客户端 | ureq（同步）+ `spawn_blocking` 包装 | 双 Client 设计：短请求 120s 超时 / 流式仅 ResponseHeaderTimeout 120s，共享连接池 |
 | 加密 | tauri-plugin-stronghold + windows-sys(DPAPI) | jwt/refresh_token 入 vault，主密码经 DPAPI 仅本机当前用户可解 |
-| 测试 | cargo test + Python unittest + vitest | Rust 30 用例 / Python 纯函数 / 前端 `src/lib/format.test.ts` |
-| 打包 | Tauri Bundler → MSI / NSIS（自定义模板） | 含 Python 运行时与 PS 脚本；产物经 `scripts/rename_release.py` 输出中文命名到 release/ |
+| 测试 | cargo test + vitest | Rust 310 用例（tasks/device_proxy 纯函数） / 前端 `src/lib/format.test.ts` |
+| 打包 | Tauri Bundler → MSI / NSIS（自定义模板） | 含 PS 脚本（Python 运行时已移除，全 Rust）；产物经 `scripts/rename_release.mjs` 输出中文命名到 release/ |
 
 **不采用**：Electron（体积过大）、WPF/WinUI（样式成本高）、PyQt（视觉不达要求）、React Router/Redux（依赖最小原则）。
 
@@ -38,7 +38,7 @@ Bridge        Tauri Commands（src-tauri/src/commands/）
  └─ api_server                axum 网关：Trae 池（routes/pool/payload/sse/auth/models_sync/usage/api_logger）
                               + WB 池（wb_route/wb_payload/wb_sse/wb_upstream/wb_responses/wb_images/wb_sticky/wb_toolexec/wb_catalog/wb_model_route）
                               + 三池调度（dispatch/unified_catalog/custom_models/custom_route/retry/api_keys/gateway_settings）
-Python Core   auto_checkin.py / device_proxy.py / doubao_*.py（renew/quota/chats）/ workbuddy_*.py（checkin/credits/common/ui_click）
+Rust Tasks    tasks/（trae_checkin / wb_checkin / wb_common / wb_credits / ui_click / doubao_session / doubao_quota / doubao_chats）+ device_proxy/（MITM 代理模块）
 PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy + SnapshotLayout）
 ```
 
@@ -66,7 +66,7 @@ PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy
 | 文件 | 说明 |
 |---|---|
 | `conf/app_settings.json` | Settings 全字段（snake_case） |
-| `conf/vault.stronghold` + `conf/vault_key.bin` | jwt/refresh_token 权威存储（按 uid 键）+ DPAPI 加密的 vault 主密码；JSON 落盘占位化，Python 签到走临时解密文件（用后即删） |
+| `conf/vault.stronghold` + `conf/vault_key.bin` | jwt/refresh_token 权威存储（按 uid 键）+ DPAPI 加密的 vault 主密码；JSON 落盘占位化，签到/网关在 Rust 内存中临时解密（无落盘子进程） |
 | `data/checkin_accounts.json` | 账号 + JWT（敏感字段 vault 化后为占位） |
 | `data/device_map.json` | user_id → 虚拟设备身份（`rand_digits(n, seed=user_id)` 稳定派生） |
 | `data/groups.json` | 分组 + membership |
@@ -104,10 +104,12 @@ PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy
 
 ## 5. 进程与子进程契约
 
-### 5.1 `auto_checkin.py`
+### 5.1 `tasks/trae_checkin.rs`（批量签到，Rust 直调）
 
-- 参数（向后兼容）：`--json-stream`（NDJSON）、`--accounts UID1,UID2`、`--scope all|group:<id>`、`--accounts-file`（vault 临时解密文件）。
-- NDJSON 示例：
+- 入口 `checkin_start(opts)`：`opts: { scope: all|group:<id>, user_ids?, skip_checked_in, skip_expired }`；vault 解密在内存中完成（无子进程、无临时文件）。
+- 进度经 `checkin-progress` 事件下发，事件载荷（原 NDJSON 行结构）保持向后兼容：
+
+```json
 
 ```json
 {"type":"start","total":6}
@@ -118,9 +120,9 @@ PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy
 
 - `status` ∈ `already|success|fail`；每次签到追加 `{date, user_id, credits, delta}` 入 `credits_history.json`。
 
-### 5.2 `device_proxy.py`
+### 5.2 `device_proxy/`（MITM 代理模块）
 
-- env：`AIWORKDATA_DIR`、`PROXY_PORT`（默认 8899）、`AUTO_CAPTURE_JWT=1`、可选 `UPSTREAM_PROXY[_USER/_PASS]`（http/socks5）。
+- 配置：`AIWORKDATA_DIR` 决定数据根目录；端口经 `proxy_start(port)` 直传（默认 8899）；上游代理经 `ProxyConfig.upstream` 直传（http/socks5，含认证字段）；`AUTO_CAPTURE_JWT=1` 语义由模块内常量承接。
 - MITM 捕获 `trae.cn`/`trae.com.cn` 带 `Cloud-IDE-JWT` 的请求写回账号库（exp 防降级）；`mchost.guru` 解密记录对话摘要；WebSocket 隧道转发不记录内容。
 - 结构化日志 `logs/proxy_req_YYYY-MM-DD.log` 供 `proxy_logs_list/detail` 查询。
 - 同时承担豆包凭证抓包（doubao.com Cookie sessionid/sid_guard/ttwid 落盘供回写）。
@@ -204,23 +206,20 @@ event:error         流内错误（code:1005 → PlanLimit 等）
 | Node.js | ≥ 18（建议 22） | `node -v` |
 | Rust | ≥ 1.77 stable（MSVC，edition 2021） | `rustc --version` |
 | VS Build Tools | 「使用 C++ 的桌面开发」+ Windows SDK | 链接错误多因缺失此项 |
-| Python | ≥ 3.9（打包时内嵌，运行期自动探测；内嵌不可用回退系统解释器） | `python --version` |
 | WebView2 | Win11 自带 / Win10 装 Evergreen Bootstrapper | — |
 
 ```powershell
 npm install
 npm run tauri dev      # 开发模式（Vite 5173 + Rust 热重载；勿裸 npm run dev，白屏）
 npm run tauri build    # 打包 MSI + NSIS → src-tauri/target/release/bundle/
-python scripts/rename_release.py    # 产物输出 release/，中文命名
-python scripts/package_portable.py  # 便携版 zip
+node scripts/rename_release.mjs    # 产物输出 release/，中文命名
+node scripts/package_portable.mjs  # 便携版 zip
 ```
 
-测试：`cargo test`（Rust）、`python src-python/tests/test_auto_checkin.py`（Python）、`npm run test`（vitest 前端）。
+测试：`cargo test`（Rust）、`npm run test`（vitest 前端）。
 
 ### 7.2 打包注意
 
-- `src-python/` 打进 `resources/python/`：**Python 侧改动在正式版必须重新 `tauri build`**（dev 模式直读源码即生效）。
-- `src-python/` 严禁混入 Python 运行时文件（python.exe/Lib 等）；解释器统一 `import encodings` 自举验证。
 - NSIS 用自定义模板 `build-assets/installer.nsi`（升级安装默认直接覆盖）；`installer-hooks.nsh` 处理旧品牌静默卸载（需 UTF-8 BOM）。
 - 升级 Tauri CLI 后如 NSIS 构建报错，需从对应版本 tag 重新同步模板。
 
@@ -231,22 +230,20 @@ python scripts/package_portable.py  # 便携版 zip
 | `cargo build` 链接失败 / 找不到 link.exe | 未装 VS Build Tools C++ 工作负载 | 装「使用 C++ 的桌面开发」+ SDK，确认 MSVC 目标 |
 | 启动白屏 / `invoke` 不存在 | 浏览器直开 5173，未走 Tauri 外壳 | 用 `npm run tauri dev` |
 | 代理捕获不到 JWT | 未装 CA 或 Trae 未走代理 | 一键安装证书（UAC）→ 启动代理 → 看日志 listening |
-| 开代理后部分网站打不开 | 系统代理被改写 | v2.4.3 起自动串联已有代理为上游；Python 改动需重新打包 |
+| 开代理后部分网站打不开 | 系统代理被改写 | v2.4.3 起自动串联已有代理为上游 |
 | 停代理后 VPN 失效 | 旧版只置 0 未还原 | 已改为原样还原 ProxyEnable/ProxyServer/ProxyOverride |
 | 计划任务输出乱码 / Access Denied | schtasks GBK / `/RL HIGHEST` | 统一走 `misc.rs::run_schtasks()`（chcp 65001）；不加 /RL HIGHEST |
-| 打包后报缺脚本/Python | resources 未包含或混入运行时 | 检查 `bundle.resources`；解释器自举回退兜底 |
 
 ## 8. 风险与应对
 
 | 风险 | 等级 | 应对 |
 |---|---|---|
-| 上游升级导致接口/路径变化 | 高 | 核心逻辑留在可热更的 Python/PS；`dig()` 宽容解析；接口层独立模块 |
+| 上游升级导致接口/路径变化 | 高 | `dig()` 宽容解析；接口层独立模块（Rust 单测锁定解析行为，随发版整体交付） |
 | 上游启用证书固定 | 高 | 降级：OAuth 登录获取可续期凭据（refresh_token 13 天自动续期） |
 | 安全软件拦截 CA/代理 | 中 | 白名单指引 + 代码签名 |
 | 多账号触发风控 | 中 | 免责声明 + 签到间隔随机抖动 + 冷却状态机 |
 | 凭证明文泄露 | 中 | vault + DPAPI；UI 掩码；账号池文件 .gitignore；导出提醒备份 vault |
 | UAC 拒绝 | 低 | 明确提示 + 手动步骤 |
-| Python 运行时残缺 | 低 | 自举验证 + 系统解释器回退 |
 
 ## 9. 附录 B：WorkBuddy / CodeBuddy 协议参考（原 workbuddy-product-design.md 精华归并）
 
