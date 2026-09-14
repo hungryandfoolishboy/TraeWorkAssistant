@@ -20,8 +20,20 @@ pub fn workbuddy_credits_fetch(app: AppHandle, state: State<AppState>, user_id: 
     // 失败以 Err 返回，成功恒为 {"ok":true,"cached":bool,"accounts":[...]}（消费契约见 tasks/wb_credits.rs 模块注释）
     let parsed = crate::tasks::wb_credits::fetch_credits(&state, user_id.as_deref(), fresh.unwrap_or(false))?;
     // 回写账号池余额缓存（列表/概述展示）
+    write_back_pool_balances(&state, &parsed);
+    // 会员套餐回填（仅 edition_type 为空的账号，见 backfill_edition_from_payment_type）
+    backfill_edition_from_payment_type(&state);
+    // 每日余额快照（F-27 数据源）：非缓存命中时追加，按日去重，cap 365 天
+    if parsed.get("cached") != Some(&serde_json::json!(true)) {
+        append_credits_snapshot(&state, &parsed);
+    }
+    Ok(parsed)
+}
+
+/// 将积分查询结果中的余额回写账号池缓存（列表/概述展示；命令与调度器快照任务共用）
+fn write_back_pool_balances(state: &AppState, parsed: &Value) {
     if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
-        let mut pool = load_pool(&state);
+        let mut pool = load_pool(state);
         for acc in accounts {
             let uid = acc.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
             let bal = acc.get("balance").and_then(|v| v.as_f64());
@@ -30,14 +42,22 @@ pub fn workbuddy_credits_fetch(app: AppHandle, state: State<AppState>, user_id: 
                 a.credits_fetched_at = acc.get("fetched_at").and_then(|v| v.as_str()).map(|s| s.to_string());
             }
         }
-        let _ = save_pool(&state, &pool);
+        let _ = save_pool(state, &pool);
     }
-    // 会员套餐回填（仅 edition_type 为空的账号，见 backfill_edition_from_payment_type）
-    backfill_edition_from_payment_type(&state);
-    // 每日余额快照（F-27 数据源）：非缓存命中时追加，按日去重，cap 365 天
-    if parsed.get("cached") != Some(&serde_json::json!(true)) {
-        append_credits_snapshot(&state, &parsed);
-    }
+}
+
+/// 每日积分余额快照任务（调度器 `wb-credits-snapshot`；补齐近 7 日用量时序的关键）：
+/// 强制刷新全部账号积分 → 回写池余额 → 追加当日快照（同日覆盖）。
+/// 此前快照仅在「打开积分页且非缓存命中」时写入，应用内调度器到点自动建快照，
+/// 差分序列不再因未打开页面而断档。
+pub(crate) fn wb_credits_snapshot_task(state: &AppState) -> Result<Value, String> {
+    let parsed = crate::tasks::wb_credits::fetch_credits(state, None, true)?;
+    write_back_pool_balances(state, &parsed);
+    append_credits_snapshot(state, &parsed);
+    fs_utils::app_log(
+        &state.data_dir,
+        "workbuddy: 每日积分余额快照已写入（应用内调度器 wb-credits-snapshot）",
+    );
     Ok(parsed)
 }
 
@@ -362,6 +382,26 @@ pub fn workbuddy_usage_official(
         Err(msg.to_string())
     };
 
+    // 核心：拉取 + 聚合（拆出供全账号聚合命令 workbuddy_usage_official_all 复用）
+    let payload = match usage_official_fetch(&acct_id, &token, &domain) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let _ = fs_utils::write_json(&cache_path, &payload);
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "workbuddy: 官方用量刷新（{acct_id}，{} 行）",
+            payload.get("request_count_total").and_then(Value::as_u64).unwrap_or(0)
+        ),
+    );
+    Ok(payload)
+}
+
+/// 官方用量核心（拉取近 31 天分页明细 + 聚合，缓存逻辑留在命令层）。
+/// 拆出供单账号命令 `workbuddy_usage_official` 与全账号聚合命令
+/// `workbuddy_usage_official_all`（Buddy 积分看板近 7 日趋势数据源）复用。
+fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serde_json::Value, String> {
     // 区域路由（T4.5/F-36，§5.2）：Global 账号（domain 含 workbuddy.ai）billing
     // 全走 www.workbuddy.ai；CN 账号维持既有 workbuddy.cn 网关。
     let base = if domain.contains("workbuddy.ai") {
@@ -401,21 +441,21 @@ pub fn workbuddy_usage_official(
         let v: serde_json::Value = match resp {
             Ok(r) => r.into_json().unwrap_or_default(),
             Err(ureq::Error::Status(code, _)) => {
-                return fail(&format!("官方用量请求失败（HTTP {code}）：请检查凭证有效期"));
+                return Err(format!("官方用量请求失败（HTTP {code}）：请检查凭证有效期"));
             }
-            Err(e) => return fail(&format!("官方用量请求失败: {e}")),
+            Err(e) => return Err(format!("官方用量请求失败: {e}")),
         };
         let code = v.get("code").and_then(Value::as_i64).unwrap_or(0);
         if code != 0 && code != 200 {
-            return fail(&format!("官方用量请求失败（code={code}）"));
+            return Err(format!("官方用量请求失败（code={code}）"));
         }
         let data = match v.get("data") {
             Some(d) => d,
-            None => return fail("官方响应格式无效"),
+            None => return Err("官方响应格式无效".into()),
         };
         let items = match data.get("data").and_then(Value::as_array) {
             Some(a) => a,
-            None => return fail("官方响应格式无效"),
+            None => return Err("官方响应格式无效".into()),
         };
         reported_total = reported_total.max(
             data.get("total")
@@ -509,7 +549,7 @@ pub fn workbuddy_usage_official(
         }));
     }
 
-    let payload = serde_json::json!({
+    Ok(serde_json::json!({
         "status": "complete",
         "account_id": acct_id,
         "domain": base,
@@ -524,11 +564,134 @@ pub fn workbuddy_usage_official(
         },
         "daily": daily_out,
         "models": models_out,
+    }))
+}
+
+/// 全账号官方用量聚合（Buddy 积分看板「近 7 日积分消耗」主数据源）：
+/// 遍历账号池全部有凭证账号，逐个拉取官方用量明细后按日求和（31 天零填充）。
+/// 此前看板用快照差分（usageFallback）作唯一数据源——快照只在打开积分页且非缓存
+/// 命中时写入，未打开应用的日子无快照，7 日趋势只剩「昨天」一格。
+/// 单账号失败跳过（accounts_ok 计数），全部失败才报错并回退过期缓存（stale）。
+/// 聚合结果缓存 10 分钟（跨账号全量拉取代价高，避免看板每次刷新都打满分页请求）。
+#[tauri::command(async)]
+pub fn workbuddy_usage_official_all(state: State<AppState>) -> Result<serde_json::Value, String> {
+    let cache_path = state.data_dir.join("data").join("workbuddy_usage_official_all_cache.json");
+    let cached_val: Option<Value> = {
+        let c: Value = fs_utils::read_json(&cache_path);
+        (c.get("status").is_some()).then_some(c)
+    };
+    if let Some(cached) = &cached_val {
+        let fetched = cached.get("fetched_at_ms").and_then(Value::as_i64).unwrap_or(0);
+        if chrono::Utc::now().timestamp_millis() - fetched < 10 * 60_000 {
+            return Ok(cached.clone());
+        }
+    }
+    let fail = |msg: &str| -> Result<Value, String> {
+        if let Some(c) = &cached_val {
+            let mut stale = c.clone();
+            stale["stale"] = serde_json::json!(true);
+            stale["stale_reason"] = serde_json::json!(msg);
+            return Ok(stale);
+        }
+        Err(msg.to_string())
+    };
+
+    // 枚举有凭证账号：账号池优先，token store 补充（按 id 去重）
+    let store: Value = fs_utils::read_json(&token_store_path(&state));
+    let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
+    let pick = |id: &str| -> Option<(String, String, String)> {
+        let rec = tokens.get(id)?;
+        let token = as_str(fs_utils::dig(&rec, &["access_token"]))?;
+        if token.is_empty() {
+            return None;
+        }
+        let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
+        Some((id.to_string(), token, domain))
+    };
+    let pool = load_pool(&state);
+    let mut list: Vec<(String, String, String)> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for a in &pool.accounts {
+        if let Some(t) = pick(&a.id) {
+            if seen_ids.insert(a.id.clone()) {
+                list.push(t);
+            }
+        }
+    }
+    for id in tokens.keys() {
+        if let Some(t) = pick(id) {
+            if seen_ids.insert(id.clone()) {
+                list.push(t);
+            }
+        }
+    }
+    if list.is_empty() {
+        return Err("无可用账号凭证（请先在账号管理导入/扫码入池并续期）".into());
+    }
+
+    // 逐账号拉取 + 按日聚合（单账号失败跳过，不让一个失效凭证拖垮整板趋势）
+    let mut daily_credits: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut ok = 0usize;
+    let mut req_total = 0u64;
+    for (id, token, domain) in &list {
+        if let Ok(p) = usage_official_fetch(id, token, domain) {
+            ok += 1;
+            req_total += p.get("request_count_total").and_then(Value::as_u64).unwrap_or(0);
+            for row in p.get("daily").and_then(Value::as_array).into_iter().flatten() {
+                let Some(date) = row.get("date").and_then(Value::as_str) else { continue };
+                let Some(u) = row.get("usage").and_then(Value::as_f64) else { continue };
+                *daily_credits.entry(date.to_string()).or_insert(0.0) += u;
+            }
+        }
+    }
+    if ok == 0 {
+        return fail("全部账号官方用量拉取失败（凭证可能已失效，请续期后重试）");
+    }
+
+    // 31 天零填充输出（汇总口径与单账号命令一致）
+    use chrono::Datelike;
+    let today = chrono::Local::now().date_naive();
+    let start = today - chrono::Duration::days(30);
+    let mut usage_today = 0.0f64;
+    let mut usage_week = 0.0f64;
+    let mut usage_month = 0.0f64;
+    let mut daily_out: Vec<Value> = vec![];
+    for i in (0..=30).rev() {
+        let d = today - chrono::Duration::days(i);
+        let key = d.format("%Y-%m-%d").to_string();
+        let u = daily_credits.get(&key).copied().unwrap_or(0.0);
+        if i == 0 {
+            usage_today = u;
+        }
+        if i < 7 {
+            usage_week += u;
+        }
+        if d.year() == today.year() && d.month() == today.month() {
+            usage_month += u;
+        }
+        daily_out.push(serde_json::json!({ "date": key, "usage": u }));
+    }
+
+    let payload = serde_json::json!({
+        "status": "complete",
+        "source": "official_all",
+        "accounts_total": list.len(),
+        "accounts_ok": ok,
+        "range_start": start.format("%Y-%m-%d").to_string(),
+        "range_end": today.format("%Y-%m-%d").to_string(),
+        "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
+        "request_count_total": req_total,
+        "summary": {
+            "usage_today": usage_today,
+            "usage_7days": usage_week,
+            "usage_this_month": usage_month,
+        },
+        "daily": daily_out,
     });
     let _ = fs_utils::write_json(&cache_path, &payload);
     fs_utils::app_log(
         &state.data_dir,
-        &format!("workbuddy: 官方用量刷新（{acct_id}，{}/{} 行）", seen.len(), reported_total),
+        &format!("workbuddy: 全账号官方用量聚合（{ok}/{} 账号，{} 行）", list.len(), req_total),
     );
     Ok(payload)
 }

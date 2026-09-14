@@ -17,6 +17,7 @@
 pub mod doubao_chats;
 pub mod doubao_quota;
 pub mod doubao_session;
+pub mod scheduler;
 pub mod trae_checkin;
 pub mod ui_click;
 pub mod wb_checkin;

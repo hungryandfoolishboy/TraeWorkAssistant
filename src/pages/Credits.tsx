@@ -351,16 +351,24 @@ export default function Credits() {
     0,
   );
 
-  // 到期日历（F-13 批次 2 补挂 Trae 侧）：token（JWT）+ 积分包 + 会员三类，均 Unix 秒
+  // 到期日历（F-13 批次 2 补挂 Trae 侧）：积分包 + 会员两类，均 Unix 秒。
+  // 修复：此前混入 JWT token（登录凭证）到期条目——JWT 通常当日/次日到期，
+  // 按到期时间升序恒排在最前，导致「前几个都是 token 而非积分」；且凭证到期
+  // 与积分无关，已从本日历移除（凭证生命周期在环境配置页查看）。
+  // 「剩余 X / 总 Y」：X = 账号当前可用积分，Y = 本周期积分包 credits_limit 合计。
   const expiryItems = useMemo<ExpiryItem[]>(
     () =>
       accounts.flatMap((a) => {
         const items: ExpiryItem[] = [];
-        if (a.jwt_exp_timestamp != null) {
-          items.push({ key: `${a.user_id}-jwt`, label: a.name, kind: 'token', expire_ts: a.jwt_exp_timestamp });
-        }
         if (a.credits_expire_at != null) {
-          items.push({ key: `${a.user_id}-credits`, label: a.name, kind: '积分包', expire_ts: a.credits_expire_at, note: `剩余 ${fmtCredits(a.remaining_credits ?? 0)} 积分` });
+          const totalTxt = a.total_credits != null ? ` / 总 ${fmtCredits(a.total_credits)}` : '';
+          items.push({
+            key: `${a.user_id}-credits`,
+            label: a.name,
+            kind: '积分包',
+            expire_ts: a.credits_expire_at,
+            note: `剩余 ${fmtCredits(a.remaining_credits ?? 0)}${totalTxt} 积分`,
+          });
         }
         if (a.membership_expire != null) {
           items.push({
@@ -669,7 +677,7 @@ export default function Credits() {
       {/* 积分到期日历（F-13） */}
       <div className="mt-5 card p-4">
         <h3 className="mb-3 font-medium">积分到期日历</h3>
-        <ExpiryCalendar items={expiryItems} emptyHint="暂无到期项：待账号完成签到/积分查询后展示 token、积分包与会员到期时间。" />
+        <ExpiryCalendar items={expiryItems} emptyHint="暂无到期项：待账号完成签到/积分查询后展示积分包与会员到期时间。" />
       </div>
     </div>
   );

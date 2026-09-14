@@ -278,8 +278,10 @@ fn main() {
             commands::workbuddy::workbuddy_env_reset,
             commands::workbuddy::workbuddy_usage_official,
             commands::workbuddy::workbuddy_usage_fallback,
+            commands::workbuddy::workbuddy_usage_official_all,
             commands::workbuddy::workbuddy_activity_info,
             commands::workbuddy_stats::workbuddy_token_stats,
+            tasks::scheduler::scheduler_status,
         ])
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -522,6 +524,10 @@ fn main() {
             // CodeBuddy CLI 五重防护自动轮换（F-59）：独立后台线程按检查间隔执行，
             // 开关关闭时空转；decide_target 纯函数判定，切号写 ~/.codebuddy/settings.json
             commands::workbuddy::start_cli_rotate_thread();
+
+            // 应用内定时调度器（Rust 原生方案，补充 Windows schtasks）：
+            // 每日签到/巡检/续期到点补跑 + 积分余额每日快照（新增任务，补齐近 7 日消耗时序）
+            tasks::scheduler::start(app.handle().clone());
 
             Ok(())
         })

@@ -67,6 +67,8 @@ export interface AccountView {
   general_credits: number | null;
   /** Work 积分（product_id == 209）剩余 */
   work_credits: number | null;
+  /** 本周期积分包总额度（credits_limit 合计；到期日历「剩余 X / 总 Y」口径） */
+  total_credits?: number | null;
   /** 套餐身份（Free / Lite / Pro ...，来自 ide_user_pay_status 缓存） */
   pay_identity?: string | null;
   /** 会员套餐到期时间（Unix 秒，来自 ent_usage 会员包） */
@@ -1004,6 +1006,23 @@ export interface WbUsageOfficial {
   summary: { usage_today: number; usage_7days: number; usage_this_month: number };
   daily: { date: string; usage: number; models: WbUsageModelPoint[] }[];
   models: WbUsageModelPoint[];
+}
+
+/** 全账号官方用量聚合（Buddy 积分看板近 7 日消耗主数据源；31 天零填充） */
+export interface WbUsageOfficialAll {
+  status: 'complete';
+  source: 'official_all';
+  accounts_total: number;
+  accounts_ok: number;
+  range_start: string;
+  range_end: string;
+  fetched_at_ms: number;
+  request_count_total: number;
+  /** F-59 同款 stale-on-error：全部账号拉取失败时回退的过期聚合缓存 */
+  stale?: boolean;
+  stale_reason?: string;
+  summary: { usage_today: number; usage_7days: number; usage_this_month: number };
+  daily: { date: string; usage: number }[];
 }
 
 /** 活动信息三端点聚合（F-51）：banner（公开）+ 付费类型 + 用量提醒 */

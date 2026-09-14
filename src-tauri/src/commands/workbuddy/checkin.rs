@@ -32,10 +32,16 @@ static WB_ROUND_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 
 /// 入口尝试获取轮次锁；guard 移交工作线程并持有至轮次结束
 ///（RAII：正常结束与 panic 展开均可靠释放，防泄漏）。
-fn try_acquire_wb_round() -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
+/// pub(crate)：应用内调度器（tasks/scheduler.rs）到点跑签到轮次时同样抢锁互斥。
+pub(crate) fn try_acquire_wb_round() -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
     WB_ROUND_LOCK
         .try_lock()
         .map_err(|_| "已有签到/成长任务在执行中，请等待当前轮次完成".to_string())
+}
+
+/// WB 自动签到开关（应用内调度器 wb-checkin 任务的启用判定，与启动补签同源设置）
+pub(crate) fn wb_auto_checkin_enabled(state: &AppState) -> bool {
+    load_settings(state).auto_checkin
 }
 
 /// NDJSON 事件转发（原 python 管线同款：emit 序列化 JSON 字符串，前端逐行 JSON.parse）

@@ -789,6 +789,8 @@ struct CreditStats {
     general: f64,
     /// Work 积分剩余
     work: f64,
+    /// 本周期积分包总额度（有效积分包 credits_limit 合计；到期日历「剩余 X / 总 Y」）
+    total_limit: f64,
     /// 最近一个仍未用完且未过期的积分包过期时间（Unix 秒）
     earliest_expire: Option<i64>,
     /// 各日期新开积分包额度聚合（键=北京时间日期）：
@@ -928,6 +930,7 @@ fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, S
     let mut total: f64 = 0.0;
     let mut general: f64 = 0.0;
     let mut work: f64 = 0.0;
+    let mut total_limit: f64 = 0.0;
     let mut earliest_expire: Option<i64> = None;
     let mut pack_earned_daily: std::collections::BTreeMap<String, f64> = Default::default();
     let mut membership_expire: Option<i64> = None;
@@ -977,6 +980,8 @@ fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, S
                 .unwrap_or(0.0);
             let remaining = (limit - used).max(0.0);
             total += remaining;
+            // 本周期总额度：与剩余同口径（有 credits_limit 的包）求和
+            total_limit += limit;
 
             // product_id == 209 → Work 积分，其余归入通用积分
             let product_id = pack
@@ -1031,6 +1036,7 @@ fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, S
         total: r2(total),
         general: r2(general),
         work: r2(work),
+        total_limit: r2(total_limit),
         earliest_expire,
         pack_earned_daily,
         membership_expire,
@@ -1140,6 +1146,7 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
     rc.credits.insert(user_id.clone(), stats.total);
     rc.general.insert(user_id.clone(), stats.general);
     rc.work.insert(user_id.clone(), stats.work);
+    rc.total_limit.insert(user_id.clone(), stats.total_limit);
     if let Some(exp) = stats.earliest_expire {
         rc.expire_times.insert(user_id.clone(), exp);
     }
@@ -1197,6 +1204,7 @@ pub fn refresh_remaining_credits_impl(state: &AppState) -> Result<usize, String>
                 rc.credits.insert(uid.clone(), stats.total);
                 rc.general.insert(uid.clone(), stats.general);
                 rc.work.insert(uid.clone(), stats.work);
+                rc.total_limit.insert(uid.clone(), stats.total_limit);
                 if let Some(exp) = stats.earliest_expire {
                     rc.expire_times.insert(uid.clone(), exp);
                 }
@@ -1756,6 +1764,7 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
             credits_expire_at: rc.expire_times.get(&uid).copied(),
             general_credits: rc.general.get(&uid).copied(),
             work_credits: rc.work.get(&uid).copied(),
+            total_credits: rc.total_limit.get(&uid).copied(),
             pay_identity: pay
                 .statuses
                 .get(&uid)

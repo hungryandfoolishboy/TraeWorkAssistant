@@ -17,7 +17,14 @@ import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { useIsDark } from '../../lib/useIsDark';
 import { withMinDelay } from '../../lib/delay';
-import type { WbCreditsResult, WbCreditAccount, WbCreditPackage, WbUsageFallback } from '../../types';
+import type { WbCreditsResult, WbCreditAccount, WbCreditPackage } from '../../types';
+
+/** 近 7 日消耗趋势数据（归一化：官方全账号聚合 → 快照差分回退） */
+interface UsageTrend {
+  daily: { date: string; usage: number }[];
+  source: string;
+  stale?: boolean;
+}
 
 /**
  * buddy-credits 积分看板（§3.7.4，F-20/F-22/F-56/F-57/F-58/F-25，对齐 Trae 积分看板）：
@@ -27,7 +34,7 @@ export default function BuddyCredits() {
   const pushToast = useAppStore((s) => s.pushToast);
   const isDark = useIsDark();
   const [result, setResult] = useState<WbCreditsResult | null>(null);
-  const [usage, setUsage] = useState<WbUsageFallback | null>(null);
+  const [usage, setUsage] = useState<UsageTrend | null>(null);
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState<'credits' | 'stats'>('credits');
 
@@ -47,11 +54,17 @@ export default function BuddyCredits() {
       } finally {
         setLoading(false);
       }
-      // 用量快照（本地推导，失败静默隐藏趋势卡）
+      // 近 7 日消耗数据源：优先全账号官方用量聚合（31 天逐日完整，不再只有昨天）；
+      // 失败回退本地快照差分（依赖每日快照任务积累时序，缺天为已知局限）
       api.workbuddy
-        .usageFallback()
-        .then(setUsage)
-        .catch(() => setUsage(null));
+        .usageOfficialAll()
+        .then((r) => setUsage({ daily: r.daily, source: '官方用量明细', stale: r.stale }))
+        .catch(() =>
+          api.workbuddy
+            .usageFallback()
+            .then((r) => setUsage({ daily: r.daily, source: '本地快照推导', stale: false }))
+            .catch(() => setUsage(null)),
+        );
       // eslint-disable-next-line react-hooks/exhaustive-deps
     },
     [],
@@ -145,7 +158,7 @@ export default function BuddyCredits() {
                     <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#f59e0b' }} />
                     消耗积分
                   </span>
-                  <span>本地用量快照推导</span>
+                  <span>{usage.source}{usage.stale ? '（历史缓存回退）' : ''}</span>
                 </div>
               </div>
               <div className="h-56">
@@ -243,14 +256,17 @@ export default function BuddyCredits() {
           <div className="mt-5 card p-4">
             <h3 className="mb-3 font-medium">积分包到期日历</h3>
             <ExpiryCalendar
-              items={allPackages.map(({ acc, pkg }) => ({
-                key: `${acc.user_id}-${pkg.name}-${pkg.expire_ts ?? 0}`,
-                label: `${acc.name} · ${pkg.name}`,
-                kind: '积分包',
-                expire_ts: pkg.expire_ts,
-                note: `剩余 ${pkg.remaining.toFixed(2)} / ${(pkg.total ?? 0).toFixed(2)}`,
-              }))}
-              emptyHint="暂无积分包：待账号录入凭证并完成积分查询后展示到期时间。"
+              items={allPackages
+                // 剩余积分为 0 的包（已用完）无到期提醒价值，过滤不展示
+                .filter(({ pkg }) => pkg.remaining > 0)
+                .map(({ acc, pkg }) => ({
+                  key: `${acc.user_id}-${pkg.name}-${pkg.expire_ts ?? 0}`,
+                  label: `${acc.name} · ${pkg.name}`,
+                  kind: '积分包',
+                  expire_ts: pkg.expire_ts,
+                  note: `剩余 ${pkg.remaining.toFixed(2)} / ${(pkg.total ?? 0).toFixed(2)}`,
+                }))}
+              emptyHint="暂无剩余积分的积分包：待账号录入凭证并完成积分查询后展示到期时间。"
             />
           </div>
         </>

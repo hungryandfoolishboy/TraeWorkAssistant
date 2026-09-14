@@ -65,6 +65,7 @@ import type {
   WbResetResult,
   WbTokenStats,
   WbUsageOfficial,
+  WbUsageOfficialAll,
   WbUsageFallback,
   WbActivityInfo,
   WbPoolImportResult,
@@ -356,6 +357,8 @@ export const api = {
     // 注意：Rust 端参数名为 refresh（Option<bool>），key 必须写 refresh；此前误写 fresh 被静默忽略导致「刷新」永远走缓存
     usageOfficial: (userId?: string, fresh?: boolean) =>
       invoke<WbUsageOfficial>('workbuddy_usage_official', { userId: userId ?? null, refresh: fresh ?? null }),
+    /** 全账号官方用量聚合（近 7 日积分消耗主数据源；31 天零填充） */
+    usageOfficialAll: () => invoke<WbUsageOfficialAll>('workbuddy_usage_official_all'),
     usageFallback: () => invoke<WbUsageFallback>('workbuddy_usage_fallback'),
     // fresh=true 强制重扫（跳过 10 分钟结果缓存；按文件增量缓存仍生效）
     tokenStats: (fresh?: boolean) =>

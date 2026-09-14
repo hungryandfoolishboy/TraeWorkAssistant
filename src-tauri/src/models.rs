@@ -25,6 +25,9 @@ pub struct AccountView {
     /// Work 积分（product_id == 209）剩余
     #[serde(default)]
     pub work_credits: Option<f64>,
+    /// 本周期积分包总额度（有效积分包 credits_limit 合计，到期日历「剩余 X / 总 Y」口径）
+    #[serde(default)]
+    pub total_credits: Option<f64>,
     /// 套餐身份（Free / Lite / Pro ...，来自 ide_user_pay_status 缓存）
     #[serde(default)]
     pub pay_identity: Option<String>,
@@ -281,6 +284,9 @@ pub struct RemainingCreditsFile {
     /// Work 积分（product_id == 209）剩余缓存
     #[serde(default)]
     pub work: HashMap<String, f64>,
+    /// 本周期积分包总额度缓存（credits_limit 合计；到期日历「剩余 X / 总 Y」数据源）
+    #[serde(default)]
+    pub total_limit: HashMap<String, f64>,
     /// 会员套餐到期时间缓存（Unix 秒，来自 ent_usage 会员包 end_time）
     #[serde(default)]
     pub membership_expire: HashMap<String, i64>,
