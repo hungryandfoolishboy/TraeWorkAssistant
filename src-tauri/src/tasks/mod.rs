@@ -76,6 +76,10 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         // TRAE 本地登录态捕获（原 device_proxy.py --capture-local 兜底迁移）：
         // MITM 抓不到鉴权头时，解密 TRAE 本地 Cookies + 扫描 leveldb 提取 Cloud-IDE-JWT 写回
         "trae-capture-local" => crate::device_proxy::local_capture::capture_from_local(state),
+        // 刷新全部账号剩余积分：按积分包 CycleStartTime 归日口径重算 credits_daily
+        // 快照（今日 earned + API 可见历史修正），无需启动 GUI
+        "refresh-credits" => crate::commands::accounts::refresh_remaining_credits_impl(state)
+            .map(|n| serde_json::json!({ "refreshed": n, "snapshot": "credits_daily.json" })),
         other => {
             eprintln!("未知任务: {other}");
             println!("{}", serde_json::json!({"ok": false, "error": format!("未知任务: {other}")}));

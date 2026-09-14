@@ -1158,10 +1158,18 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
 }
 
 /// 刷新所有账号的剩余积分（批量请求 API），返回成功数量。
+/// 刷新所有账号剩余积分（管理页/积分页刷新按钮入口）。
 /// 同时执行自动解冻：签到成功且有积分（credits > 0）且冷却类型非 SessionDead → 清除冷却。
 #[tauri::command(async)]
 pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String> {
-    let accounts = crate::vault::load_accounts(&state);
+    refresh_remaining_credits_impl(&state)
+}
+
+/// 刷新实现（供 Tauri 命令与 `--task-run refresh-credits` CLI 任务共用）：
+/// 逐账号查询积分包 → 回写 remaining_credits.json → 按 CycleStartTime 归日口径
+/// 重算 credits_daily.json 快照（今日 earned + API 可见历史修正）。
+pub fn refresh_remaining_credits_impl(state: &AppState) -> Result<usize, String> {
+    let accounts = crate::vault::load_accounts(state);
     let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
     let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
     let mut ok_count = 0usize;
@@ -1237,7 +1245,7 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
     fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
 
     // 记录每日积分快照（total / earned / consumed）
-    record_daily_snapshot(&state, &rc, &pack_earned_daily);
+    record_daily_snapshot(state, &rc, &pack_earned_daily);
 
     if thawed_count > 0 {
         cd.updated_at = Some(fs_utils::now_iso());
@@ -1257,7 +1265,7 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
 /// - consumed 优先取 Trae Work 用量接口今日合计（usage_history.json 的 credits_float，
 ///   实际消耗口径，见 commands/usage_history.rs）；无接口数据时由余额式推算
 fn record_daily_snapshot(
-    state: &State<AppState>,
+    state: &AppState,
     rc: &RemainingCreditsFile,
     pack_earned_daily: &std::collections::BTreeMap<String, f64>,
 ) {
