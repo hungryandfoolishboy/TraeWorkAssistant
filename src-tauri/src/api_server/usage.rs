@@ -58,6 +58,53 @@ impl Counter {
     }
 }
 
+/// 延迟样本（F-76 TTFT 分维统计）：滚动保留最近 N 条总耗时与首字耗时样本，
+/// 供用量页计算 P50/P95/最大值——均值会被少数超长请求拉偏，分位数才能区分
+/// 「普遍慢」与「少数超大请求慢」。样本仅存数值（8 字节/条），量级可忽略
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct LatencyAgg {
+    /// 总耗时样本（毫秒，含失败请求）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub total_ms: Vec<u64>,
+    /// 首字耗时（TTFT）样本（毫秒，仅流式成功请求）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ttfb_ms: Vec<u64>,
+}
+
+impl LatencyAgg {
+    /// 追加总耗时样本（超过容量丢最旧）
+    fn push_total(&mut self, ms: u64, cap: usize) {
+        if self.total_ms.len() >= cap {
+            self.total_ms.remove(0);
+        }
+        self.total_ms.push(ms);
+    }
+
+    /// 追加 TTFT 样本（超过容量丢最旧）
+    fn push_ttfb(&mut self, ms: u64, cap: usize) {
+        if self.ttfb_ms.len() >= cap {
+            self.ttfb_ms.remove(0);
+        }
+        self.ttfb_ms.push(ms);
+    }
+}
+
+/// 单日样本容量（天级/模型级）：个人使用频率下 512/256 条足够覆盖全天高峰
+const SAMPLE_CAP_DAY: usize = 512;
+const SAMPLE_CAP_MODEL: usize = 256;
+
+/// 分位数（P50/P95 等）：空样本返回 None；索引取 ceil(p%·n)-1（最近邻上取整，
+/// 与常见监控口径一致）
+fn percentile(samples: &[u64], p: f64) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut v = samples.to_vec();
+    v.sort_unstable();
+    let idx = (((p / 100.0) * v.len() as f64).ceil() as usize).saturating_sub(1);
+    Some(v[idx.min(v.len() - 1)])
+}
+
 /// 单日统计：汇总 + 分维度计数
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct DayStats {
@@ -88,10 +135,16 @@ pub struct DayStats {
     /// 按 API Key 统计 token 用量：(prompt, completion)
     #[serde(default)]
     pub key_tokens: HashMap<String, (u64, u64)>,
+    /// 天级延迟样本（F-76：P50/P95/最大值 + TTFT）
+    #[serde(default)]
+    pub latency: LatencyAgg,
+    /// 按模型延迟样本（F-76：按模型分桶的分位数统计）
+    #[serde(default)]
+    pub model_latency: HashMap<String, LatencyAgg>,
 }
 
 impl DayStats {
-    /// 记录一次请求
+    /// 记录一次请求（`ttfb_ms`：流式请求的首字耗时，非流式/未知传 None）
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
@@ -103,6 +156,7 @@ impl DayStats {
         duration_ms: u64,
         prompt_tokens: u64,
         completion_tokens: u64,
+        ttfb_ms: Option<u64>,
     ) {
         self.total.add(ok);
         if is_stream {
@@ -116,6 +170,14 @@ impl DayStats {
         self.models.entry(model.to_string()).or_default().add(ok);
         self.accounts.entry(uid.to_string()).or_default().add(ok);
         self.keys.entry(key_id.to_string()).or_default().add(ok);
+        // 延迟样本（F-76）：总耗时全量采样，TTFT 仅在有值时采样
+        self.latency.push_total(duration_ms, SAMPLE_CAP_DAY);
+        let m = self.model_latency.entry(model.to_string()).or_default();
+        m.push_total(duration_ms, SAMPLE_CAP_MODEL);
+        if let Some(t) = ttfb_ms {
+            self.latency.push_ttfb(t, SAMPLE_CAP_DAY);
+            m.push_ttfb(t, SAMPLE_CAP_MODEL);
+        }
         // 按 Key 的 token 用量记账（审查修复：原实现（含参考分支）遗漏此写入，
         // 导致前端 Key 表「今日已用(次/tok)」的 token 部分恒为空）
         {
@@ -157,8 +219,8 @@ impl UsageFile {
         }
     }
 
-    /// 记录一次请求并返回是否需要写盘（总是 true，留给调用方统一处理）
-    /// `is_wb`：WB 上游路由的请求记入 wb_days 桶，与 Trae 侧分账
+    /// 记录一次请求（无 TTFT 的简写，仅测试用；生产路径一律走 record_ttfb/record_in）
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
@@ -172,9 +234,31 @@ impl UsageFile {
         prompt_tokens: u64,
         completion_tokens: u64,
     ) {
-        self.record_in(
+        self.record_ttfb(
+            is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, None,
+        );
+    }
+
+    /// 记录一次请求（带 TTFT，F-76）：流式路径已知首字耗时时使用
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_ttfb(
+        &mut self,
+        is_wb: bool,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+    ) {
+        self.record_in_ttfb(
             if is_wb { UsageBucket::Wb } else { UsageBucket::Trae },
-            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, ttfb_ms,
         );
     }
 
@@ -192,9 +276,31 @@ impl UsageFile {
         prompt_tokens: u64,
         completion_tokens: u64,
     ) {
+        self.record_in_ttfb(
+            bucket, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, None,
+        );
+    }
+
+    /// 按桶记录一次请求（带 TTFT，F-76）
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_in_ttfb(
+        &mut self,
+        bucket: UsageBucket,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+    ) {
         let day = self.bucket_mut(bucket).entry(today_key()).or_default();
         day.record(
-            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, ttfb_ms,
         );
     }
 
@@ -264,6 +370,37 @@ pub struct KeyTokenView {
     pub completion_tokens: u64,
 }
 
+/// 按模型的延迟分位视图（F-76：P50/P95/最大值 + TTFT 分桶）
+#[derive(Serialize, Clone)]
+pub struct ModelLatencyView {
+    pub model: String,
+    /// 样本数（总耗时）
+    pub samples: usize,
+    pub p50_duration_ms: Option<u64>,
+    pub p95_duration_ms: Option<u64>,
+    pub max_duration_ms: Option<u64>,
+    pub avg_ttfb_ms: Option<u64>,
+    pub p95_ttfb_ms: Option<u64>,
+}
+
+impl ModelLatencyView {
+    fn from_agg(model: &str, agg: &LatencyAgg) -> Self {
+        Self {
+            model: model.to_string(),
+            samples: agg.total_ms.len(),
+            p50_duration_ms: percentile(&agg.total_ms, 50.0),
+            p95_duration_ms: percentile(&agg.total_ms, 95.0),
+            max_duration_ms: agg.total_ms.iter().copied().max(),
+            avg_ttfb_ms: if agg.ttfb_ms.is_empty() {
+                None
+            } else {
+                Some(agg.ttfb_ms.iter().sum::<u64>() / agg.ttfb_ms.len() as u64)
+            },
+            p95_ttfb_ms: percentile(&agg.ttfb_ms, 95.0),
+        }
+    }
+}
+
 /// 单日统计视图
 #[derive(Serialize, Clone)]
 pub struct UsageDayView {
@@ -276,11 +413,21 @@ pub struct UsageDayView {
     pub completion_tokens: u64,
     /// 平均耗时（毫秒），无请求时为 0
     pub avg_duration_ms: u64,
+    /// 总耗时 P50/P95/最大值（F-76；样本不足时为 None）
+    pub p50_duration_ms: Option<u64>,
+    pub p95_duration_ms: Option<u64>,
+    pub max_duration_ms: Option<u64>,
+    /// 首字延迟（TTFT）均值 / P95 / 样本数（F-76；仅流式成功请求有样本）
+    pub avg_ttfb_ms: Option<u64>,
+    pub p95_ttfb_ms: Option<u64>,
+    pub ttfb_samples: usize,
     pub models: Vec<CounterView>,
     pub accounts: Vec<CounterView>,
     pub keys: Vec<CounterView>,
     /// 按 Key 的 token 用量（与 keys 对应）
     pub key_tokens: Vec<KeyTokenView>,
+    /// 按模型的延迟分位（F-76，按请求数降序）
+    pub model_latency: Vec<ModelLatencyView>,
 }
 
 impl UsageDayView {
@@ -309,6 +456,12 @@ impl UsageDayView {
                 .cmp(&(a.prompt_tokens + a.completion_tokens))
                 .then(a.name.cmp(&b.name))
         });
+        let mut model_latency: Vec<ModelLatencyView> = d
+            .model_latency
+            .iter()
+            .map(|(k, agg)| ModelLatencyView::from_agg(k, agg))
+            .collect();
+        model_latency.sort_by(|a, b| b.samples.cmp(&a.samples).then(a.model.cmp(&b.model)));
         Self {
             date: date.to_string(),
             total_requests: d.total.requests,
@@ -322,10 +475,21 @@ impl UsageDayView {
             } else {
                 0
             },
+            p50_duration_ms: percentile(&d.latency.total_ms, 50.0),
+            p95_duration_ms: percentile(&d.latency.total_ms, 95.0),
+            max_duration_ms: d.latency.total_ms.iter().copied().max(),
+            avg_ttfb_ms: if d.latency.ttfb_ms.is_empty() {
+                None
+            } else {
+                Some(d.latency.ttfb_ms.iter().sum::<u64>() / d.latency.ttfb_ms.len() as u64)
+            },
+            p95_ttfb_ms: percentile(&d.latency.ttfb_ms, 95.0),
+            ttfb_samples: d.latency.ttfb_ms.len(),
             models,
             accounts,
             keys,
             key_tokens,
+            model_latency,
         }
     }
 }
@@ -391,6 +555,39 @@ mod tests {
         // 平均耗时 = (100+300+50)/3 = 150
         let view = UsageDayView::from_day(&today, d);
         assert_eq!(view.avg_duration_ms, 150);
+    }
+
+    #[test]
+    fn latency_percentiles_and_ttfb() {
+        let mut f = UsageFile::default();
+        // 5 个请求：100/200/300/400/5000ms（5000 模拟少数超大请求拉偏均值）；
+        // 前两个流式请求带 TTFT 80/120ms
+        f.record_ttfb(false, "m1", "u1", "k", true, true, 100, 0, 0, Some(80));
+        f.record_ttfb(false, "m1", "u1", "k", true, true, 200, 0, 0, Some(120));
+        f.record(false, "m1", "u1", "k", true, true, 300, 0, 0);
+        f.record(false, "m1", "u1", "k", true, true, 400, 0, 0);
+        f.record(false, "m1", "u1", "k", true, true, 5000, 0, 0);
+        let today = today_key();
+        let d = f.days.get(&today).expect("当日统计应存在");
+        assert_eq!(d.latency.total_ms.len(), 5);
+        assert_eq!(d.latency.ttfb_ms, vec![80, 120]);
+        assert_eq!(d.model_latency.get("m1").unwrap().total_ms.len(), 5);
+        let view = UsageDayView::from_day(&today, d);
+        // 排序后 [100,200,300,400,5000]：P50=300（ceil(0.5*5)=3 → 索引 2），
+        // P95=5000（ceil(0.95*5)=5 → 索引 4）
+        assert_eq!(view.p50_duration_ms, Some(300));
+        assert_eq!(view.p95_duration_ms, Some(5000));
+        assert_eq!(view.max_duration_ms, Some(5000));
+        assert_eq!(view.avg_ttfb_ms, Some(100));
+        assert_eq!(view.p95_ttfb_ms, Some(120));
+        assert_eq!(view.ttfb_samples, 2);
+        let ml = view
+            .model_latency
+            .iter()
+            .find(|m| m.model == "m1")
+            .expect("模型延迟分桶应存在");
+        assert_eq!(ml.p50_duration_ms, Some(300));
+        assert_eq!(ml.p95_ttfb_ms, Some(120));
     }
 
     #[test]

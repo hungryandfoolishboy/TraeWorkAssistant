@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn 完整性校验_损坏current中止() {
         let _guard = crate::switcher::test_io_lock();
-        let mut sess = session("integrity");
+        let sess = session("integrity");
         let sink = QuietSink;
         let slot = sess.prof.profiles_dir.join("123");
         let ldb = slot.join("Default").join("Local Storage").join("leveldb");
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn 备份恢复round_trip含meta与活跃profile修复() {
         let _guard = crate::switcher::test_io_lock();
-        let mut sess = session("roundtrip");
+        let sess = session("roundtrip");
         let sink = QuietSink;
         let ud = sess.prof.data_dir.clone();
         // Live：Default Profile + Local State 指向快照外的 "Profile 9"

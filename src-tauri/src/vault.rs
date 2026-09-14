@@ -447,6 +447,9 @@ mod tests {
                     added_at: Some("t".into()),
                     updated_at: Some("t".into()),
                     dc_id: None,
+                    refresh_token_expires_at: None,
+                    refresh_token_fails: 0,
+                    refresh_token_invalid: false,
                 },
                 // 无 uid 的账号不占位（vault 无法按 uid 键存储）
                 RawAccount {
@@ -457,6 +460,9 @@ mod tests {
                     added_at: None,
                     updated_at: None,
                     dc_id: None,
+                    refresh_token_expires_at: None,
+                    refresh_token_fails: 0,
+                    refresh_token_invalid: false,
                 },
             ],
         };

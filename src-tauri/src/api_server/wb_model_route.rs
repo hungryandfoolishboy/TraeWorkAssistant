@@ -259,6 +259,53 @@ pub fn is_background_task(body: &serde_json::Value) -> bool {
     total_chars <= 512
 }
 
+// ==================== F-76④ 长上下文降档 ====================
+
+/// 长上下文阈值（token 粗估）：观测请求均值 ~44.5k，取 2 倍以上并取整为 100k
+pub const LONGCTX_TOKEN_THRESHOLD: u64 = 100_000;
+
+/// 输入 token 粗估（F-76④）：消息文本总字符数 / 4（中英混合经验折算）。
+/// 仅用于超阈值提示与降档路由判定，不做精确计费
+pub fn estimate_input_tokens(body: &serde_json::Value) -> u64 {
+    let total_chars: u64 = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|msg| match msg.get("content") {
+                    Some(serde_json::Value::String(s)) => s.chars().count() as u64,
+                    Some(serde_json::Value::Array(blocks)) => blocks
+                        .iter()
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .map(|t| t.chars().count() as u64)
+                        .sum(),
+                    _ => 0,
+                })
+                .sum()
+        })
+        .unwrap_or(0);
+    total_chars / 4
+}
+
+/// flash 档模型（F-76④长上下文降档目标）：id 含 "flash" 中最低倍率者；
+/// 目录无 flash 档时回退全局最低倍率（与 wb_bg_downgrade 同族降档语义）
+pub fn flash_catalog_model(catalog: &[super::wb_catalog::WbModel]) -> Option<String> {
+    let pick_min = |c: &[&super::wb_catalog::WbModel]| {
+        c.iter()
+            .min_by(|a, b| a.rate.partial_cmp(&b.rate).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|m| m.id.clone())
+    };
+    let flash: Vec<&super::wb_catalog::WbModel> = catalog
+        .iter()
+        .filter(|m| m.id.to_lowercase().contains("flash"))
+        .collect();
+    if flash.is_empty() {
+        cheapest_catalog_model(catalog)
+    } else {
+        pick_min(&flash)
+    }
+}
+
 /// 注入 effort 提示（T5.2 路由结果 → 请求体）：body 已带 reasoning_effort 时不覆盖
 pub fn inject_effort_hint(body: &[u8], hint: &Option<String>) -> Vec<u8> {
     let Some(h) = hint.as_deref().filter(|s| !s.trim().is_empty()) else {
@@ -464,5 +511,36 @@ mod tests {
         assert!(cfg.aliases.contains_key("claude-x"));
         assert!(!cfg.aliases.contains_key("gpt-4o"), "新路径存在时不再回退旧路径");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ==================== F-76④ 长上下文降档 ====================
+
+    #[test]
+    fn estimate_input_tokens_chars_over_four() {
+        // 4 字符 ≈ 1 token：字符串 content 与 blocks content 均计入
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "x".repeat(400)},
+                {"role": "assistant", "content": [{"type": "text", "text": "y".repeat(200)}]},
+            ]
+        });
+        assert_eq!(estimate_input_tokens(&body), 150);
+        assert_eq!(estimate_input_tokens(&json!({})), 0);
+        assert_eq!(estimate_input_tokens(&json!({"messages": "bad"})), 0);
+    }
+
+    #[test]
+    fn flash_catalog_model_prefers_cheapest_flash() {
+        fn m(id: &str, rate: f64) -> super::super::wb_catalog::WbModel {
+            serde_json::from_value(json!({"id": id, "rate": rate})).unwrap()
+        }
+        // flash 档中最低倍率者胜
+        let cat = vec![m("glm-5.3", 1.0), m("glm-5.3-flash", 0.5), m("glm-4-flash", 0.2)];
+        assert_eq!(flash_catalog_model(&cat).as_deref(), Some("glm-4-flash"));
+        // 无 flash 档 → 回退全局最低倍率
+        let cat2 = vec![m("glm-5.3", 1.0), m("glm-5.2", 0.8)];
+        assert_eq!(flash_catalog_model(&cat2).as_deref(), Some("glm-5.2"));
+        // 空目录 → None
+        assert_eq!(flash_catalog_model(&[]), None);
     }
 }

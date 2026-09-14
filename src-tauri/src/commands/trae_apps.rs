@@ -489,6 +489,9 @@ pub fn apps_account_add(
         updated_at: Some(fs_utils::now_iso()),
         // 预留记录账户中心 id（仅当发现结果置信时传入；实测该值设备级恒定，不作账号区分）
         dc_id: dc_id.filter(|s| !s.trim().is_empty()),
+        refresh_token_expires_at: None,
+        refresh_token_fails: 0,
+        refresh_token_invalid: false,
     });
     crate::vault::save_accounts(&state, &mut accounts)?;
     fs_utils::app_log(

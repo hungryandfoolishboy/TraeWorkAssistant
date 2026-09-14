@@ -271,6 +271,12 @@ pub fn resolve_target(
                 && wb_model_route::is_background_task(body)
             {
                 wb_model_route::cheapest_catalog_model(&catalog).unwrap_or_else(|| r.model.clone())
+            } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+                // F-76④ 长上下文降档：输入粗估超阈值（默认 100k token）→ flash 档模型
+                && wb_model_route::estimate_input_tokens(body)
+                    >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
+            {
+                wb_model_route::flash_catalog_model(&catalog).unwrap_or_else(|| r.model.clone())
             } else {
                 r.model.clone()
             };
@@ -512,8 +518,10 @@ fn effort_for(pool: TargetPool, sources: &ModelSources) -> Option<String> {
 
 // ==================== 会话池粘性（§4.4，内存态） ====================
 
-/// 池粘性 TTL（秒）：软粘防抖动，重启即清不落盘
-pub const POOL_STICKY_TTL_SECS: i64 = 60;
+// 池粘性 TTL 兜底值（秒）：软粘防抖动，重启即清不落盘；
+// 实际 TTL 读 ApiSharedState.pool_sticky_ttl_secs（F-76② 可配置，默认 300s
+// ——上游对同上下文有 prefill 缓存收益，粘性命中 = 缓存命中）
+// （默认值由 default_pool_sticky_ttl_secs() 提供，无需独立常量）
 
 /// 取出池粘性绑定（命中后移除过期项；命中项由调用方决定是否续期）
 fn take_sticky(state: &Arc<ApiSharedState>, key: &str) -> Option<TargetPool> {
@@ -524,12 +532,16 @@ fn take_sticky(state: &Arc<ApiSharedState>, key: &str) -> Option<TargetPool> {
     map.get(key).map(|(p, _)| *p)
 }
 
-/// 记录/续期池粘性绑定
+/// 记录/续期池粘性绑定（TTL 取可配置值，F-76②）
 fn record_sticky(state: &Arc<ApiSharedState>, key: &str, pool: TargetPool) {
+    let ttl = state
+        .pool_sticky_ttl_secs
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1) as i64;
     let mut map = state.pool_sticky.lock().unwrap_or_else(|e| e.into_inner());
     map.insert(
         key.to_string(),
-        (pool, now_ts() + POOL_STICKY_TTL_SECS),
+        (pool, now_ts() + ttl),
     );
 }
 
@@ -613,6 +625,10 @@ mod tests {
             wb_default_thinking: AtomicBool::new(false),
             wb_tool_exec: AtomicBool::new(false),
             wb_bg_downgrade: AtomicBool::new(false),
+            wb_longctx_downgrade: AtomicBool::new(false),
+            wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            account_concurrency_limit: std::sync::atomic::AtomicU32::new(0),
+            pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(HashMap::new()),
             default_model: "deepseek-v4-flash".into(),

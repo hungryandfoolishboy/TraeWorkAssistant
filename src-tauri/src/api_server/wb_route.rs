@@ -15,6 +15,7 @@
 //! 消费上游直到 EOF——usage 完整记账，等效 `_drain_upstream`。
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -141,6 +142,169 @@ pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
     ErrKind::Server
 }
 
+// ==================== F-76③ 慢请求竞速对冲（取号侧编排） ====================
+
+/// 对冲账号在途计数租约（F-76③/F-77，P0 泄漏修复）：
+/// 构造即 +1（竞速窗口占用），Drop 即 -1——建连失败（闭包内 `?` 提前返回）、
+/// 双败（`lines_with_first_byte_hedged` Err 路径内 Drop）、竞速胜出
+/// （随 `RaceOutcome.hedge` 移交调用方，`settle_hedge` 落定后 Drop）三类
+/// 退出路径均恰好释放一次，杜绝计数泄漏导致的账号永久 busy。
+struct HedgeLease {
+    /// 对冲账号 uid（日志 / guard 重绑定位）
+    uid: String,
+    /// 该账号在途计数句柄（与 `wb_pool.inflight_handle(uid)` 同一 Arc）
+    counter: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl HedgeLease {
+    fn acquire(state: &ApiSharedState, uid: &str) -> Self {
+        let counter = state.wb_pool.inflight_handle(uid);
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { uid: uid.to_string(), counter }
+    }
+}
+
+impl Drop for HedgeLease {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 首字竞速胜者信息：生效账号（主/对冲接管者）+ 对冲计数租约
+struct RaceWin {
+    lines: Box<dyn Iterator<Item = String> + Send>,
+    /// 生效账号 uid（对冲接管时为对冲账号）
+    uid: String,
+    /// 对冲侧计数租约（None = 未触发对冲；Some = 竞速已定，待 settle 释放）
+    hedge: Option<HedgeLease>,
+    /// 对冲接管（对冲请求先出首字）
+    takeover: bool,
+}
+
+/// 首字竞速（F-76③）：对冲关闭（阈值 0）时与纯首字超时语义完全一致；开启时
+/// 主请求首字超阈值 → 从池内取第二账号（走同一 busy 过滤/负载因子——主账号已
+/// inflight 天然让位，受 F-77 并发上限约束）发对冲请求，先出首字者胜。
+/// 对冲账号取号时在途计数 +1 由 `HedgeLease` RAII 管理全生命周期；
+/// 接管时 guard 重绑到对冲账号（流计数随流存续）。
+#[allow(clippy::too_many_arguments)]
+fn race_first_byte(
+    state: &Arc<ApiSharedState>,
+    primary_uid: &str,
+    converted: &[u8],
+    reader: Box<dyn Read + Send>,
+    tried: &HashSet<String>,
+    allowed: Option<&HashSet<String>>,
+    dedicated: Option<&str>,
+) -> Result<RaceWin, ()> {
+    let hedge_ms = state.wb_hedge_threshold_ms.load(std::sync::atomic::Ordering::Relaxed);
+    if hedge_ms == 0 {
+        return wb_upstream::lines_with_first_byte_timeout(reader).map(|lines| RaceWin {
+            lines,
+            uid: primary_uid.to_string(),
+            hedge: None,
+            takeover: false,
+        });
+    }
+    let state2 = state.clone();
+    let tried2 = tried.clone();
+    let allowed2 = allowed.cloned();
+    let dedicated2 = dedicated.map(str::to_string);
+    let body = converted.to_vec();
+    let spawn_backup = move || -> Option<(Box<dyn Read + Send>, HedgeLease)> {
+        let (picked2, ev) = state2
+            .wb_pool
+            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref())?;
+        // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
+        if let Some(ev) = ev {
+            state2.logger.log_sched_event(&ev);
+        }
+        // 租约先于建连获取：建连失败（下行 `?`）时随闭包局部变量 Drop 自动 -1
+        let lease = HedgeLease::acquire(&state2, &picked2.uid);
+        let creds2 = WbCreds {
+            id: picked2.uid.clone(),
+            uid: picked2.uid.clone(),
+            name: String::new(),
+            token: picked2.jwt.clone(),
+            domain: picked2.domain.clone(),
+            enterprise_id: picked2.enterprise_id.clone(),
+            global_region: picked2.global_region,
+        };
+        let reader2 = wb_upstream::make_wb_request(&creds2, &body).ok()?;
+        Some((reader2, lease))
+    };
+    match wb_upstream::lines_with_first_byte_hedged(reader, hedge_ms, spawn_backup) {
+        Ok(out) => {
+            let uid = if out.takeover {
+                out.hedge
+                    .as_ref()
+                    .map(|l| l.uid.clone())
+                    .unwrap_or_else(|| primary_uid.to_string())
+            } else {
+                primary_uid.to_string()
+            };
+            Ok(RaceWin { uid, lines: out.lines, hedge: out.hedge, takeover: out.takeover })
+        }
+        Err(()) => Err(()),
+    }
+}
+
+/// 竞速结束后处理对冲计数与日志（F-76③/F-77）：
+/// - 释放对冲账号竞速窗口的在途占用（租约 Drop，-1 恰好一次）；
+/// - 接管时 guard 重绑到对冲账号（原账号解绑 -1、对冲账号 +1，流计数随流存续）；
+/// - [SCHED] 日志记录 hedge_takeover / hedge_lost。
+fn settle_hedge(
+    state: &ApiSharedState,
+    win: &mut RaceWin,
+    mut guard: InflightGuard,
+    primary_uid: &str,
+) -> InflightGuard {
+    // take 移交所有权：本函数返回前 Drop（竞速窗口计数 -1 恰好一次）
+    let Some(lease) = win.hedge.take() else {
+        return guard;
+    };
+    let hedge_uid = lease.uid.as_str();
+    if win.takeover {
+        state.logger.log_sched_event(&format!(
+            "hedge_takeover primary={} hedge={}",
+            primary_uid, hedge_uid
+        ));
+        guard = guard.bind_account(lease.counter.clone());
+    } else {
+        state.logger.log_sched_event(&format!(
+            "hedge_lost primary={} hedge={}",
+            primary_uid, hedge_uid
+        ));
+    }
+    drop(lease); // 释放竞速窗口占用（接管路径先重绑流计数再释放，语义与原实现一致）
+    guard
+}
+
+/// 长上下文提示（F-76④）：输入粗估超阈值时返回 (token 估算, 降档开关状态)
+fn longctx_estimate(state: &ApiSharedState, peek: &Value) -> Option<(u64, bool)> {
+    let t = super::wb_model_route::estimate_input_tokens(peek);
+    if t < super::wb_model_route::LONGCTX_TOKEN_THRESHOLD {
+        return None;
+    }
+    Some((
+        t,
+        state
+            .wb_longctx_downgrade
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
+/// 上下文过大提示日志（F-76④：仅标注不做真裁剪）
+fn log_longctx_hint(state: &ApiSharedState, peek: &Value, model: &str) {
+    if let Some((tokens, downgrade)) = longctx_estimate(state, peek) {
+        state.logger.log_sched_event(&format!(
+            "longctx_hint model={} tokens≈{}k downgrade={}",
+            model,
+            tokens / 1000,
+            downgrade
+        ));
+    }
+}
+
 // ==================== 流式入口 ====================
 
 pub fn wb_stream_chat(
@@ -155,8 +319,8 @@ pub fn wb_stream_chat(
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::task::spawn_blocking(move || {
-        // inflight guard 随后台任务存续至流结束（§4.5，客户端断连由 Drop 兜底）
-        let _inflight = guard;
+        // inflight guard 随后台任务存续至流结束（§4.5，客户端断连由 Drop 兜底）；
+        // 取号后经 bind_account 维护账号级在途计数（F-77），流结束 Drop 配对释放
         let chat_id = match proto {
             Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
             Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
@@ -189,7 +353,7 @@ pub fn wb_stream_chat(
             });
         }
 
-        run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts);
+        run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard);
         done.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
@@ -217,9 +381,12 @@ fn run_wb_stream(
     chat_id: &str,
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     start_ts: Instant,
+    mut guard: InflightGuard,
 ) {
     let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
     let sticky_key = SessionKey::from_body(&peek);
+    // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
+    log_longctx_hint(state, &peek, model);
     let templates = load_templates(state);
     let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -260,10 +427,20 @@ fn run_wb_stream(
         .as_ref()
         .map(|(_, c)| c.clone())
         .unwrap_or_default();
-    // 首选：粘性 > 专一绑定 > 调度策略
+    // 首选：粘性 > 专一绑定 > 调度策略（F-77④：粘性账号 busy 且有空闲候选时让位）
     let mut first_pick: Option<PickedAccount> = sticky0
         .as_ref()
-        .and_then(|(u, _)| state.wb_pool.pick_by_uid(u))
+        .and_then(|(u, _)| {
+            state
+                .wb_pool
+                .pick_sticky_yield(u, allowed_set.as_ref())
+                .map(|(p, ev)| {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                })
+        })
         .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid)));
 
     let mut tried: HashSet<String> = HashSet::new();
@@ -273,8 +450,14 @@ fn run_wb_stream(
         // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
         let picked = match first_pick.take() {
             Some(p) => p,
-            None => match state.wb_pool.pick_excluding_constrained(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
-                Some(p) => p,
+            None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
+                Some((p, ev)) => {
+                    // F-77⑤ 可观测：busy_yield / busy_fallback 调度事件
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     state.record_usage(true, model, "none", key_id, false, true, duration_ms, 0, 0);
@@ -292,6 +475,8 @@ fn run_wb_stream(
         };
         tried.insert(picked.uid.clone());
         *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+        // F-77 账号级在途计数：取号即绑定（重试换号时 bind_account 自动解绑旧账号）
+        guard = guard.bind_account(state.wb_pool.inflight_handle(&picked.uid));
 
         // 上游会话 id：粘性命中复用，否则新生成（成功后绑定）
         let is_sticky_hit = sticky_uid.as_deref() == Some(picked.uid.as_str()) && !sticky_conv.is_empty();
@@ -322,9 +507,19 @@ fn run_wb_stream(
             let ttfb_start = Instant::now();
             match wb_upstream::make_wb_request(&creds, &converted) {
                 Ok(reader) => {
-                    // 首字超时 10s（T2.7/F-34）：超时视为上游故障 → 换号
-                    let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
-                        Ok(l) => l,
+                    // 首字超时 10s（T2.7/F-34）：超时视为上游故障 → 换号；
+                    // F-76③ 慢请求竞速对冲：首字超阈值时向第二账号发对冲请求，
+                    // 先出首字者胜（对冲关闭时与纯首字超时语义一致）
+                    let mut win = match race_first_byte(
+                        state,
+                        &picked.uid,
+                        &converted,
+                        reader,
+                        &tried,
+                        allowed_set.as_ref(),
+                        dedicated.as_deref(),
+                    ) {
+                        Ok(w) => w,
                         Err(()) => {
                             state.wb_pool.note_error(&picked.uid, ErrKind::Server);
                             note_model_failure(state, model);
@@ -332,8 +527,11 @@ fn run_wb_stream(
                         }
                     };
                     let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
+                    // 对冲计数落定 + guard 重绑（接管时生效账号 = 对冲账号）
+                    guard = settle_hedge(state, &mut win, guard, &picked.uid);
+                    let win_uid = win.uid.as_str();
                     let (error_info, sent_any, failed_inline, usage) =
-                        wb_sse::stream_forward_ex(lines, tx, proto, chat_id, model);
+                        wb_sse::stream_forward_ex(win.lines, tx, proto, chat_id, model);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
                         let (pt, ct) = usage
@@ -345,23 +543,27 @@ fn run_wb_stream(
                                 )
                             })
                             .unwrap_or((0, 0));
-                        state.record_usage(true, model, &picked.uid, key_id, error_info.is_none() && !failed_inline, true, duration_ms, pt, ct);
+                        // F-76① TTFT 入账：用量页 P50/P95/TTFT 分位统计
+                        state.record_usage_ttfb(
+                            true, model, win_uid, key_id, error_info.is_none() && !failed_inline,
+                            true, duration_ms, pt, ct, Some(ttfb_ms),
+                        );
                     }
                     match error_info {
                         Some((code, msg)) => {
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
-                                state.wb_pool.note_error(&picked.uid, kind);
+                                state.wb_pool.note_error(win_uid, kind);
                                 note_model_failure(state, model);
                                 *safe_lock(&state.last_error) =
-                                    Some(format!("wb uid={} code={} msg={}", picked.uid, code, msg));
+                                    Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
                             }
                             if !sent_any {
                                 // 流未开始：错误不下发，允许换号重试
                                 break;
                             }
                             state.logger.log_request_ttfb(
-                                "buddy", "POST", "/v2/chat/completions", model, true, 200, &picked.uid,
+                                "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                 duration_ms, Some(ttfb_ms), Some(&msg),
                             );
                             return; // 已有数据流出：就地收尾
@@ -373,18 +575,18 @@ fn run_wb_stream(
                                 // 粘性会话；亦不 note_error——错误已原样给到客户端，内容类
                                 // 失败计入冷却会造成账号过度冷却
                                 state.logger.log_request_ttfb(
-                                    "buddy", "POST", "/v2/chat/completions", model, true, 200, &picked.uid,
+                                    "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), Some("流内失败已透传客户端"),
                                 );
                                 return;
                             }
-                            state.wb_pool.note_success(&picked.uid);
+                            state.wb_pool.note_success(win_uid);
                             clear_model_failure(state, model);
                             // 绑定粘性会话（Mutex 内 re-check 防 TOCTOU）
-                            state.wb_sticky.bind(&sticky_key, &picked.uid, &conv_id, now_ts());
+                            state.wb_sticky.bind(&sticky_key, win_uid, &conv_id, now_ts());
                             state.wb_sticky.save(&state.data_dir);
                             state.logger.log_request_ttfb(
-                                "buddy", "POST", "/v2/chat/completions", model, true, 200, &picked.uid,
+                                "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                 duration_ms, Some(ttfb_ms), None,
                             );
                             return;
@@ -462,10 +664,12 @@ pub async fn wb_aggregate_chat(
 ) -> Response {
     let model_out = model.clone();
     let result = tokio::task::spawn_blocking(move || {
-        // inflight guard 随后台任务存续至聚合完成（§4.5）
-        let _inflight = guard;
+        // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
+        let mut guard = guard;
         let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
         let sticky_key = SessionKey::from_body(&peek);
+        // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
+        log_longctx_hint(&state, &peek, &model);
         let templates = load_templates(&state);
         let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -506,7 +710,17 @@ pub async fn wb_aggregate_chat(
             .unwrap_or_default();
         let mut first_pick: Option<PickedAccount> = sticky0
             .as_ref()
-            .and_then(|(u, _)| state.wb_pool.pick_by_uid(u))
+            .and_then(|(u, _)| {
+                state
+                    .wb_pool
+                    .pick_sticky_yield(u, allowed_set.as_ref())
+                    .map(|(p, ev)| {
+                        if let Some(ev) = ev {
+                            state.logger.log_sched_event(&ev);
+                        }
+                        p
+                    })
+            })
             .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid)));
 
         let mut tried: HashSet<String> = HashSet::new();
@@ -515,8 +729,13 @@ pub async fn wb_aggregate_chat(
         loop {
             let picked = match first_pick.take() {
                 Some(p) => p,
-                None => match state.wb_pool.pick_excluding_constrained(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
-                    Some(p) => p,
+                None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
+                    Some((p, ev)) => {
+                        if let Some(ev) = ev {
+                            state.logger.log_sched_event(&ev);
+                        }
+                        p
+                    }
                     None => {
                         state.record_usage(true, &model, "none", &key_id, false, stream,
                             start_ts.elapsed().as_millis() as u64, 0, 0);
@@ -526,6 +745,8 @@ pub async fn wb_aggregate_chat(
             };
             tried.insert(picked.uid.clone());
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+            // F-77 账号级在途计数：取号即绑定
+            guard = guard.bind_account(state.wb_pool.inflight_handle(&picked.uid));
 
             let is_sticky_hit =
                 sticky_uid.as_deref() == Some(picked.uid.as_str()) && !sticky_conv.is_empty();
@@ -553,19 +774,32 @@ pub async fn wb_aggregate_chat(
 
             let mut same_attempt: u32 = 0;
             loop {
+                let ttfb_start = Instant::now();
                 match wb_upstream::make_wb_request(&creds, &converted) {
                     Ok(reader) => {
-                        // 首字超时：非流式聚合同样适用（上游只回 SSE）
-                        let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
-                            Ok(l) => l,
+                        // 首字超时：非流式聚合同样适用（上游只回 SSE）；
+                        // F-76③ 慢请求竞速对冲（对冲关闭时与纯首字超时语义一致）
+                        let mut win = match race_first_byte(
+                            &state,
+                            &picked.uid,
+                            &converted,
+                            reader,
+                            &tried,
+                            allowed_set.as_ref(),
+                            dedicated.as_deref(),
+                        ) {
+                            Ok(w) => w,
                             Err(()) => {
                                 state.wb_pool.note_error(&picked.uid, ErrKind::Server);
                                 note_model_failure(&state, &model);
                                 break;
                             }
                         };
+                        let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
+                        guard = settle_hedge(&state, &mut win, guard, &picked.uid);
+                        let win_uid = win.uid.as_str();
                         let (resp, error_info) =
-                            wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()));
+                            wb_sse::aggregate(win.lines, &format!("chatcmpl-{}", now_ts()));
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         match (resp, error_info) {
                             (Some(mut r), None) => {
@@ -574,40 +808,41 @@ pub async fn wb_aggregate_chat(
                                     u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                                     u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                                 )).unwrap_or((0, 0));
-                                state.record_usage(true, &model, &picked.uid, &key_id, true, stream, duration_ms, pt, ct);
-                                state.wb_pool.note_success(&picked.uid);
+                                // F-76① TTFT 入账
+                                state.record_usage_ttfb(true, &model, win_uid, &key_id, true, stream, duration_ms, pt, ct, Some(ttfb_ms));
+                                state.wb_pool.note_success(win_uid);
                                 clear_model_failure(&state, &model);
-                                state.wb_sticky.bind(&sticky_key, &picked.uid, &conv_id, now_ts());
+                                state.wb_sticky.bind(&sticky_key, win_uid, &conv_id, now_ts());
                                 state.wb_sticky.save(&state.data_dir);
-                                state.logger.log_request(
-                                    "buddy", "POST", "/v2/chat/completions", &model, stream, 200, &picked.uid,
-                                    duration_ms, None,
+                                state.logger.log_request_ttfb(
+                                    "buddy", "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
+                                    duration_ms, Some(ttfb_ms), None,
                                 );
                                 return Ok(r);
                             }
                             (None, Some((code, msg))) => {
                                 let kind = classify_wb_error(code, &msg);
                                 if kind != ErrKind::None {
-                                    state.wb_pool.note_error(&picked.uid, kind);
+                                    state.wb_pool.note_error(win_uid, kind);
                                     note_model_failure(&state, &model);
                                 }
                                 *safe_lock(&state.last_error) =
-                                    Some(format!("wb uid={} code={} msg={}", picked.uid, code, msg));
-                                state.record_usage(true, &model, &picked.uid, &key_id, false, stream, duration_ms, 0, 0);
-                                state.logger.log_request(
-                                    "buddy", "POST", "/v2/chat/completions", &model, stream, 200, &picked.uid,
-                                    duration_ms, Some(&msg),
+                                    Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
+                                state.record_usage_ttfb(true, &model, win_uid, &key_id, false, stream, duration_ms, 0, 0, Some(ttfb_ms));
+                                state.logger.log_request_ttfb(
+                                    "buddy", "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
+                                    duration_ms, Some(ttfb_ms), Some(&msg),
                                 );
                                 // 流内错误且未产出内容 → 换号重试
                                 break;
                             }
                             _ => {
-                                state.wb_pool.note_error(&picked.uid, ErrKind::Server);
+                                state.wb_pool.note_error(win_uid, ErrKind::Server);
                                 note_model_failure(&state, &model);
-                                state.record_usage(true, &model, &picked.uid, &key_id, false, stream, duration_ms, 0, 0);
-                                state.logger.log_request(
-                                    "buddy", "POST", "/v2/chat/completions", &model, stream, 502, &picked.uid,
-                                    duration_ms, Some("empty response"),
+                                state.record_usage_ttfb(true, &model, win_uid, &key_id, false, stream, duration_ms, 0, 0, Some(ttfb_ms));
+                                state.logger.log_request_ttfb(
+                                    "buddy", "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
+                                    duration_ms, Some(ttfb_ms), Some("empty response"),
                                 );
                                 break;
                             }
@@ -743,12 +978,14 @@ pub async fn wb_tool_exec_chat(
 ) -> Response {
     let model_inner = model.clone();
     let result = tokio::task::spawn_blocking(move || {
-        // inflight guard 随后台任务存续至编排完成（§4.5）
-        let _inflight = guard;
+        // inflight guard 随后台任务存续至编排完成（§4.5）；F-77 取号后绑定账号级计数
+        let mut guard = guard;
         let model = model_inner;
         let templates = load_templates(&state);
         let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         super::wb_toolexec::inject_proxy_tools(&mut chat_body);
+        // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
+        log_longctx_hint(&state, &chat_body, &model);
 
         // F-35 子 Key 约束（与非流式同款）
         let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_id);
@@ -778,19 +1015,28 @@ pub async fn wb_tool_exec_chat(
         let mut final_completion: Option<Value> = None;
         let mut success_uid: Option<String> = None; // 审查修复：保留真实账号归因
         let mut last_err: Option<String> = None;
+        // F-76① TTFT：各轮首字耗时（最终轮即最终回复的首字延迟）
+        let mut last_ttfb_ms: Option<u64> = None;
         let resp_id = format!("resp_{}", now_ts());
 
         'accounts: loop {
             let picked = match state
                 .wb_pool
-                .pick_excluding_constrained(&tried, allowed_set.as_ref(), dedicated.as_deref())
+                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
             {
-                Some(p) => p,
+                Some((p, ev)) => {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                }
                 None => break,
             };
             tried.insert(picked.uid.clone());
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
             let conv_id = gen_conv_id();
+            // F-77 账号级在途计数：取号即绑定
+            guard = guard.bind_account(state.wb_pool.inflight_handle(&picked.uid));
             let mut creds = WbCreds {
                 id: picked.uid.clone(),
                 uid: picked.uid.clone(),
@@ -822,6 +1068,8 @@ pub async fn wb_tool_exec_chat(
                     &body_bytes, &model, &conv_id, effort.as_deref(), sanitize, &templates,
                 );
 
+                // F-76① 各轮记首字耗时（最终轮即最终回复的 TTFT）
+                let ttfb_start = Instant::now();
                 match wb_upstream::make_wb_request(&creds, &converted) {
                     Ok(reader) => {
                         let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
@@ -832,6 +1080,7 @@ pub async fn wb_tool_exec_chat(
                                 break Err("上游首字超时".to_string());
                             }
                         };
+                        last_ttfb_ms = Some(ttfb_start.elapsed().as_millis() as u64);
                         let (completion, error_info) =
                             wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()));
                         if let Some((code, msg)) = error_info {
@@ -973,10 +1222,12 @@ pub async fn wb_tool_exec_chat(
                     u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                 )).unwrap_or((0, 0));
                 let usage_uid = success_uid.as_deref().unwrap_or("wb-toolexec");
-                state.record_usage(true, &model, usage_uid, &key_id, true, stream, duration_ms, pt, ct);
-                state.logger.log_request(
+                // F-76① TTFT 入账：最终轮首字耗时
+                state.record_usage_ttfb(true, &model, usage_uid, &key_id, true, stream, duration_ms, pt, ct, last_ttfb_ms);
+                state.logger.log_request_ttfb(
                     "buddy", "POST", "/v1/responses", &model, stream, 200, usage_uid,
-                    duration_ms, Some(&format!("rounds={} searches={}", records.len(), records.iter().filter(|r| r.tool == super::wb_toolexec::TOOL_SEARCH).count())),
+                    duration_ms, last_ttfb_ms,
+                    Some(&format!("rounds={} searches={}", records.len(), records.iter().filter(|r| r.tool == super::wb_toolexec::TOOL_SEARCH).count())),
                 );
                 // Responses 投影：web_search_call 历史项前置
                 completion["model"] = json!(model.clone());

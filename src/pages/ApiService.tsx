@@ -5,6 +5,7 @@ import { Badge, Modal, Spinner, StatCard } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
+import { RefreshTokenBadge } from './accounts/RefreshTokenBadge';
 import type {
   ApiServiceStatus,
   PoolStatus,
@@ -517,11 +518,22 @@ export default function ApiService() {
                         {poolItem?.cooling && (
                           <Badge tone="amber">冷却中</Badge>
                         )}
-                        {poolItem?.disabled && (
+                        {/* F-78 批次 3：refresh_token 生命周期徽标（失效账号同时被调度禁用） */}
+                        <RefreshTokenBadge
+                          invalid={a.refresh_token_invalid}
+                          fails={a.refresh_token_fails}
+                          expiresAt={a.refresh_token_expires_at}
+                        />
+                        {poolItem?.disabled && !a.refresh_token_invalid && (
                           <Badge tone="red">已禁用</Badge>
                         )}
                         {running && poolItem && !poolItem.cooling && !poolItem.disabled && (
-                          <Badge tone="green">就绪</Badge>
+                          // F-77⑤ 可观测：在途并发 > 0 时显示 busy 状态（替代"就绪"）
+                          (poolItem.inflight ?? 0) > 0 ? (
+                            <Badge tone="amber">在途 {poolItem.inflight}</Badge>
+                          ) : (
+                            <Badge tone="green">就绪</Badge>
+                          )
                         )}
                       </div>
                     </label>

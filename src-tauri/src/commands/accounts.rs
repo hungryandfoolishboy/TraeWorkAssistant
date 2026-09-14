@@ -388,6 +388,10 @@ pub fn accounts_import(
             added_at: Some(fs_utils::now_iso()),
             updated_at: Some(fs_utils::now_iso()),
             dc_id: pick_str(entry, &["dcId", "DcID", "dc_id"]),
+            // refresh_token 生命周期字段（F-78 批次 3）：导入账号从零计数
+            refresh_token_expires_at: None,
+            refresh_token_fails: 0,
+            refresh_token_invalid: false,
         });
         report.added += 1;
     }
@@ -563,6 +567,9 @@ pub fn account_add_manual(
         added_at: Some(fs_utils::now_iso()),
         updated_at: Some(fs_utils::now_iso()),
         dc_id: None,
+        refresh_token_expires_at: None,
+        refresh_token_fails: 0,
+        refresh_token_invalid: false,
     });
     crate::vault::save_accounts(&state, &mut accounts)?;
     if let Some(g) = group_id {
@@ -1413,8 +1420,35 @@ pub fn cooldown_clear_all(
 /// 成功后原子写回新 accessToken + refresh_token，返回新 JWT
 // async：内含 ExchangeToken 网络请求（最长 120s），同步命令会冻结 UI（审查修复）
 #[tauri::command(async)]
-pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, String> {
-    refresh_jwt_impl(&state, &user_id)
+pub fn refresh_jwt(
+    state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    user_id: String,
+) -> Result<String, String> {
+    let result = refresh_jwt_impl(&state, &user_id);
+    // F-78 批次 3：运行中 API 池联动——成功解除失效禁用；失败且已判定失效则禁用
+    // （entry 按 uid 命中，Trae 账号在 pool、WB 账号在 wb_pool，双查无害）
+    let guard = runtime.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(rt) = guard.as_ref() {
+        match &result {
+            Ok(new_jwt) => {
+                rt.shared.pool.note_refresh_success(&user_id, new_jwt);
+                rt.shared.wb_pool.note_refresh_success(&user_id, new_jwt);
+            }
+            Err(_) => {
+                let accounts = crate::vault::load_accounts(&state);
+                if accounts
+                    .accounts
+                    .iter()
+                    .any(|a| a.user_id.as_deref() == Some(user_id.as_str()) && a.refresh_token_invalid)
+                {
+                    rt.shared.pool.note_refresh_invalid(&user_id);
+                    rt.shared.wb_pool.note_refresh_invalid(&user_id);
+                }
+            }
+        }
+    }
+    result
 }
 
 /// refresh_jwt 核心逻辑（&AppState，供命令与测试探针共用）
@@ -1439,21 +1473,29 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
         .filter(|s| !s.is_empty())
         .ok_or("该账号无 refresh_token，无法自动刷新")?;
 
-    // 调用 ExchangeToken API
+    // 调用 ExchangeToken API（凭证与端点来自外置配置，缺失回退内置默认）
+    let client = crate::commands::oauth::oauth_client();
     let resp = short_agent()
-        .post("https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken")
+        .post(&client.exchange_url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
         .send_json(ureq::json!({
-            "ClientID": "en1oxy7wnw8j9n",
+            "ClientID": client.client_id,
             "RefreshToken": refresh_token,
-            "ClientSecret": "-",
+            "ClientSecret": client.client_secret,
             "UserID": ""
         }))
-        .map_err(|e| format!("ExchangeToken 请求失败: {}", e))?;
+        .map_err(|e| {
+            let msg = format!("ExchangeToken 请求失败: {}", e);
+            record_refresh_failure(state, user_id, false, &msg);
+            msg
+        })?;
 
-    let body: serde_json::Value =
-        resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
+    let body: serde_json::Value = resp.into_json().map_err(|e| {
+        let msg = format!("解析响应失败: {}", e);
+        record_refresh_failure(state, user_id, false, &msg);
+        msg
+    })?;
 
     let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 {
@@ -1461,7 +1503,10 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
             .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("未知错误");
-        return Err(format!("ExchangeToken 失败 (code={}): {}", code, msg));
+        let err = format!("ExchangeToken 失败 (code={}): {}", code, msg);
+        // 服务端明确拒绝（code != 0）：refresh_token 已失效，立即置 invalid（F-78 批次 3）
+        record_refresh_failure(state, user_id, true, &err);
+        return Err(err);
     }
 
     // F-49 宽容解析：data 信封内字段直接 dig 查找，兼容嵌套包裹
@@ -1483,10 +1528,13 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
     let new_info = jwt::parse(&new_jwt_full);
     if let Some(ref new_uid) = new_info.user_id {
         if new_uid.as_str() != user_id {
-            return Err(format!(
+            // 换发 token 归属他人：refresh_token 已不可信，立即置 invalid（F-78 批次 3）
+            let err = format!(
                 "刷新后 user_id 不匹配: 期望={}, 实际={}",
                 user_id, new_uid
-            ));
+            );
+            record_refresh_failure(state, user_id, true, &err);
+            return Err(err);
         }
     }
 
@@ -1502,6 +1550,24 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
             account.refresh_token = Some(rt);
         }
         account.updated_at = Some(fs_utils::now_iso());
+        // 刷新成功：生命周期计数清零、失效标记解除（F-78 批次 3）
+        account.refresh_token_fails = 0;
+        account.refresh_token_invalid = false;
+        // 若响应携带 refresh_token 过期时间则更新（兼容秒/毫秒两种时间戳）
+        if let Some(exp) = crate::fs_utils::dig(
+            &body,
+            &[
+                "refresh_token_expires_at",
+                "refresh_expires_at",
+                "refreshTokenExpiresAt",
+                "refresh_expires_at_ms",
+            ],
+        )
+        .and_then(|v| v.as_i64())
+        {
+            account.refresh_token_expires_at =
+                Some(if exp > 10_000_000_000 { exp / 1000 } else { exp });
+        }
         account.name.clone()
     };
     crate::vault::save_accounts(&state, &mut accounts)?;
@@ -1532,6 +1598,46 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
     );
 
     Ok(new_jwt_full)
+}
+
+/// 记录一次 refresh_token 刷新失败（F-78 批次 3 生命周期管理）：
+/// 递增连续失败计数；服务端明确拒绝（code != 0 / user_id 不匹配）或连续 3 次失败时
+/// 置 refresh_token_invalid=true，供调度与 UI 提前规避（原实现只能等签到 401 才暴露）。
+/// 刷新成功在 refresh_jwt_impl 写回时清零；重新 OAuth 登录亦会重置（commands/oauth.rs）。
+/// 调用方持有 jwt_refresh_lock，无并发写竞争。
+fn record_refresh_failure(state: &AppState, user_id: &str, rejected: bool, err_msg: &str) {
+    let mut accounts = crate::vault::load_accounts(state);
+    let Some(acct) = accounts
+        .accounts
+        .iter_mut()
+        .find(|a| a.user_id.as_deref() == Some(user_id))
+    else {
+        return;
+    };
+    acct.refresh_token_fails = acct.refresh_token_fails.saturating_add(1);
+    if rejected || acct.refresh_token_fails >= 3 {
+        acct.refresh_token_invalid = true;
+    }
+    acct.updated_at = Some(fs_utils::now_iso());
+    let (name, fails, invalid) =
+        (acct.name.clone(), acct.refresh_token_fails, acct.refresh_token_invalid);
+    if let Err(e) = crate::vault::save_accounts(state, &mut accounts) {
+        fs_utils::app_log(&state.data_dir, &format!("refresh_token 失败计数写入失败: {e}"));
+    }
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "refresh_token 刷新失败 [{}] 连续第 {} 次{}: {}",
+            name,
+            fails,
+            if invalid {
+                "（已标记失效，需重新 OAuth 登录）"
+            } else {
+                ""
+            },
+            err_msg
+        ),
+    );
 }
 
 // ---------------- 内部工具 ----------------
@@ -1656,6 +1762,10 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
                 .map(|p| p.identity_str.clone()),
             membership_expire: rc.membership_expire.get(&uid).copied(),
             membership_next_billing: rc.membership_next_billing.get(&uid).copied(),
+            // refresh_token 生命周期（F-78 批次 3）：过期时间/连续失败次数/失效标记
+            refresh_token_expires_at: a.refresh_token_expires_at,
+            refresh_token_fails: a.refresh_token_fails,
+            refresh_token_invalid: a.refresh_token_invalid,
         });
     }
     out

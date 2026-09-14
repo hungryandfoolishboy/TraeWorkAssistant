@@ -99,11 +99,17 @@ fn resolve_wb_target(
     if wb_catalog::find(&catalog, &r.model).is_none() {
         return None;
     }
-    // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型
+    // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型；
+    // F-76④ 长上下文降档：输入粗估超阈值 → flash 档模型
     let final_model = if state.wb_bg_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::is_background_task(body)
     {
         wb_model_route::cheapest_catalog_model(&catalog).unwrap_or(r.model)
+    } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+        && wb_model_route::estimate_input_tokens(body)
+            >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
+    {
+        wb_model_route::flash_catalog_model(&catalog).unwrap_or(r.model)
     } else {
         r.model
     };
@@ -249,7 +255,7 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     let total_credits: f64 = pool.iter().filter_map(|p| p.credits).sum();
     let total_credits = (total_credits * 100.0).round() / 100.0;
 
-    // 账号明细
+    // 账号明细（inflight 为 F-77 账号级实时并发）
     let accounts: Vec<Value> = pool.iter().map(|p| {
         let status = if p.disabled {
             "disabled"
@@ -274,10 +280,11 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "disabled": p.disabled,
             "err_count": p.err_count,
             "state": p.state,
+            "inflight": p.inflight,
         })
     }).collect();
 
-    // WB 池画像（T2.3/F-32）
+    // WB 池画像（T2.3/F-32；inflight 为 F-77 账号级实时并发）
     let wb_pool = state.wb_pool.status_list();
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let wb_accounts: Vec<Value> = wb_pool.iter().map(|p| {
@@ -285,9 +292,17 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "uid": p.uid, "name": p.name, "credits": p.credits,
             "cooling": p.cooling, "cooldown_until": p.cooldown_until,
             "cooldown_reason": p.cooldown_reason, "disabled": p.disabled,
-            "err_count": p.err_count, "state": p.state,
+            "err_count": p.err_count, "state": p.state, "inflight": p.inflight,
         })
     }).collect();
+    // F-77：per-account 并发列表（活跃账号 [{uid, name, inflight}]），
+    // 供前端池状态页实时展示 busy/idle 分布（active_uid 单值的超集）
+    let active_accounts: Vec<Value> = pool
+        .iter()
+        .chain(wb_pool.iter())
+        .filter(|p| p.inflight > 0)
+        .map(|p| json!({ "uid": p.uid, "name": p.name, "inflight": p.inflight }))
+        .collect();
     let model_cooldowns: Vec<Value> = {
         let map = safe_lock(&state.model_cooldowns);
         map.iter()
@@ -304,6 +319,8 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
         // 当前并发数（统一网关 §4.5）：InflightGuard RAII 维护，覆盖 6 业务端点
         "inflight": state.inflight.load(std::sync::atomic::Ordering::Relaxed),
         "active_uid": active,
+        // F-77：per-account 并发列表（busy 账号实时画像）
+        "active_accounts": active_accounts,
         "last_error": last_err,
         "summary": {
             "total_accounts": total_accounts,
@@ -874,7 +891,14 @@ async fn images_entry(
         let tried = HashSet::new();
         state
             .wb_pool
-            .pick_excluding_constrained(&tried, allowed_set.as_ref(), dedicated.as_deref())
+            .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+            .map(|(p, ev)| {
+                // F-77⑤ 可观测：busy_yield / busy_fallback 调度事件
+                if let Some(ev) = ev {
+                    state.logger.log_sched_event(&ev);
+                }
+                p
+            })
     };
     let Some(picked) = picked else {
         return openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", "no healthy WB account available");
@@ -962,8 +986,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
     tokio::task::spawn_blocking(move || {
         // inflight guard 随后台任务存续至流结束（§4.5：客户端断连/流终止由
-        // 任务结束 Drop 兜底释放）
-        let _inflight = guard;
+        // 任务结束 Drop 兜底释放）；F-77 取号后绑定账号级计数
+        let mut guard = guard;
         // 主任务结束（含 panic 展开）→ 通知 keep-alive ticker 退出（P1 修复3）
         let _done = DoneSignal(done_tx);
         let chat_id = match proto {
@@ -981,6 +1005,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 None => break,
             };
             tried.insert(picked.uid.clone());
+            // F-77 账号级在途计数：取号即绑定（换号时 bind_account 自动解绑旧账号）
+            guard = guard.bind_account(state.pool.inflight_handle(&picked.uid));
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             let converted = super::payload::prepare_llm_chat_body(
@@ -1058,12 +1084,12 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             let us = ttfb_us.load(std::sync::atomic::Ordering::Relaxed);
                             if us == 0 { None } else { Some(us / 1000) }
                         };
-                        // 用量记账（流式结束即落盘）
+                        // 用量记账（流式结束即落盘；F-76① TTFT 入账）
                         {
                             let (pt, ct) = up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0));
-                            state.record_usage(
+                            state.record_usage_ttfb(
                                 false, &model, &picked.uid, &key_id, error_info.is_none(), true,
-                                duration_ms, pt, ct,
+                                duration_ms, pt, ct, ttfb_ms,
                             );
                         }
                         if let Some((code, msg)) = error_info {
@@ -1235,8 +1261,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
 async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard) -> Response {
     let result = tokio::task::spawn_blocking(move || {
-        // inflight guard 随后台任务存续至聚合完成（§4.5）
-        let _inflight = guard;
+        // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
+        let mut guard = guard;
         let mut tried = HashSet::new();
 
         for _ in 0..MAX_ROTATE {
@@ -1246,6 +1272,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             };
             tried.insert(picked.uid.clone());
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+            // F-77 账号级在途计数：取号即绑定（换号时自动解绑旧账号）
+            guard = guard.bind_account(state.pool.inflight_handle(&picked.uid));
 
             let converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,

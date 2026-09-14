@@ -73,6 +73,12 @@ export interface AccountView {
   membership_expire?: number | null;
   /** 会员套餐下次自动续费时间（Unix 秒，无自动续费为空） */
   membership_next_billing?: number | null;
+  /** refresh_token 过期时间（Unix 秒；上游未下发为 null） */
+  refresh_token_expires_at?: number | null;
+  /** refresh_token 连续刷新失败次数（成功清零） */
+  refresh_token_fails?: number;
+  /** refresh_token 是否已判定失效（连续 3 次失败或服务端明确拒绝，需重新 OAuth 登录） */
+  refresh_token_invalid?: boolean;
 }
 
 // ---- 积分消耗历史（Trae Work query_user_usage_group_by_session，按本地日聚合 + 增量拉取） ----
@@ -444,6 +450,10 @@ export interface PoolStatus {
   cooldown_reason: string | null;
   disabled: boolean;
   err_count: number;
+  /** 账号实时在途并发数（F-77⑤ 可观测；旧后端未返回时为 undefined） */
+  inflight?: number;
+  /** refresh_token 是否已判定失效（F-78 批次 3：展示「Token 失效」徽标，需重新 OAuth 登录） */
+  refresh_invalid?: boolean;
 }
 
 export interface ApiPoolFile {
@@ -462,6 +472,16 @@ export interface ApiPoolFile {
   wb_tool_exec?: boolean;
   /** 后台任务降级（T5.6③/F-65）：标题/摘要类短请求路由到目录最低倍率模型 */
   wb_bg_downgrade?: boolean;
+  /** 长上下文降档（F-76④）：后台任务类 + 超长输入（粗估 ≥100k token）自动换 flash 档模型 */
+  wb_longctx_downgrade?: boolean;
+  /** 慢请求竞速对冲阈值毫秒（F-76③）：流式首字节超阈值时向第二账号发对冲请求；0 = 关闭 */
+  wb_hedge_threshold_ms?: number;
+  /** 账号并发上限（F-77）：单账号在途请求数达到上限视为 busy；0 = 不限 */
+  account_concurrency_limit?: number;
+  /** 池粘性 TTL 秒（F-76②）：TTL 内同会话落同一池同账号（KV cache 复用） */
+  pool_sticky_ttl_secs?: number;
+  /** WB 显式会话粘性 TTL 秒（F-76②） */
+  wb_sticky_ttl_secs?: number;
 }
 
 /** CC Switch 协同状态（T5.7/F-43） */
@@ -500,10 +520,31 @@ export interface UsageDayView {
   prompt_tokens: number;
   completion_tokens: number;
   avg_duration_ms: number;
+  /** 总耗时 P50/P95/最大值（F-76；样本不足时缺省） */
+  p50_duration_ms?: number;
+  p95_duration_ms?: number;
+  max_duration_ms?: number;
+  /** 首字延迟 TTFT（F-76①；仅流式成功请求有样本） */
+  avg_ttfb_ms?: number;
+  p95_ttfb_ms?: number;
+  ttfb_samples?: number;
   models: UsageCounterView[];
   accounts: UsageCounterView[];
   keys: UsageCounterView[];
   key_tokens: UsageKeyTokenView[];
+  /** 按模型的延迟分位（F-76①，按请求数降序） */
+  model_latency?: UsageModelLatencyView[];
+}
+
+/** 按模型的延迟分位视图（F-76①：P50/P95/最大值 + TTFT 分桶） */
+export interface UsageModelLatencyView {
+  model: string;
+  samples: number;
+  p50_duration_ms?: number;
+  p95_duration_ms?: number;
+  max_duration_ms?: number;
+  avg_ttfb_ms?: number;
+  p95_ttfb_ms?: number;
 }
 
 /** API Key 条目（data/api_keys.json；daily_limit=0 表示不限，T2；F-35 子 Key 体系批次3） */
@@ -693,6 +734,16 @@ export interface OAuthLoginResult {
   jwt: string;
   refresh_token: string;
   has_refresh_token: boolean;
+}
+
+/** 本机回环监听器落库完成事件（oauth-login-done）负载 */
+export interface OAuthLoginDoneEvent {
+  ok: boolean;
+  message: string;
+  /** 登录成功时的账号备注名 */
+  account: string | null;
+  /** 登录成功时的 user_id */
+  user_id: string | null;
 }
 
 // ---- 应用自更新 ----

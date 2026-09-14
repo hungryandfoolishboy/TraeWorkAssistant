@@ -46,6 +46,7 @@ import { JwtViewModal } from './accounts/JwtViewModal';
 import { OAuthLoginModal } from './accounts/OAuthLoginModal';
 import { PayIdentityBadge } from './accounts/PayIdentityBadge';
 import { ProfileModal } from './accounts/SnapshotModal';
+import { RefreshTokenBadge } from './accounts/RefreshTokenBadge';
 
 export default function Accounts() {
   const accounts = useAppStore((s) => s.accounts);
@@ -440,6 +441,12 @@ export default function Accounts() {
                             <Zap size={12} />
                           </span>
                         )}
+                        {/* F-78 批次 3：refresh_token 生命周期（失效/连续失败/即将过期） */}
+                        <RefreshTokenBadge
+                          invalid={a.refresh_token_invalid}
+                          fails={a.refresh_token_fails}
+                          expiresAt={a.refresh_token_expires_at}
+                        />
                         <button
                           title="查看 JWT"
                           onClick={() => setJwtTarget(a)}

@@ -59,6 +59,17 @@ pub struct ApiSharedState {
     pub wb_tool_exec: std::sync::atomic::AtomicBool,
     /// 后台任务降级（T5.6③/F-65）：标题/摘要类短请求路由到目录最低倍率模型
     pub wb_bg_downgrade: std::sync::atomic::AtomicBool,
+    /// 长上下文降档（F-76④）：输入粗估 ≥100k token 的请求自动换 flash 档模型
+    pub wb_longctx_downgrade: std::sync::atomic::AtomicBool,
+    /// 慢请求竞速对冲阈值毫秒（F-76③，0 = 关闭；默认 8000，运行时 clamp 1s–8s）：
+    /// 流式首字节超过该阈值且池内有其他健康账号时向第二账号发对冲请求
+    pub wb_hedge_threshold_ms: std::sync::atomic::AtomicU64,
+    /// 账号并发上限（F-77，0 = 不限；默认 1）：inflight ≥ 上限的账号视为 busy
+    /// 不参与候选，全部 busy 时降级取 inflight 最小者（不过载拒绝）
+    pub account_concurrency_limit: std::sync::atomic::AtomicU32,
+    /// 池粘性 TTL 秒（F-76②，默认 300）：TTL 内同会话必落同一池同账号，
+    /// 上游 KV cache 复用直接砍 prefill 时间
+    pub pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
     /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
     pub wb_sticky: wb_sticky::StickyStore,
     /// 会话池粘性（统一网关 §4.4，内存态不落盘、重启即清）：
@@ -109,12 +120,35 @@ impl ApiSharedState {
         prompt_tokens: u64,
         completion_tokens: u64,
     ) {
+        self.record_usage_ttfb(
+            is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, None,
+        );
+    }
+
+    /// 记录一次请求用量（带 TTFT，F-76①）：流式路径已知首字耗时（毫秒）时使用，
+    /// 供用量页 P50/P95/TTFT 分位统计；`ttfb_ms=None` 等价 record_usage
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_ttfb(
+        &self,
+        is_wb: bool,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+    ) {
         let mut guard = self
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        guard.record(
-            is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+        guard.record_ttfb(
+            is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, ttfb_ms,
         );
         usage::save(&self.data_dir, &guard);
     }
@@ -147,8 +181,14 @@ impl ApiSharedState {
 /// 当前并发计数 RAII guard（统一网关 §4.5）：构造时 +1，Drop 时 -1。
 /// 持有 Arc 克隆（'static + Send）——端点获取后作为参数移入执行路径，
 /// 流式场景随 spawn 任务存续至流结束；不做下溢防护依赖"构造必 +1"配对语义
+///
+/// F-77 双维护扩展：取号成功后通过 `bind_account` 绑定账号级在途计数
+/// （进入 +1 / Drop -1），实现 busy 让位 idle 的账号并发感知调度；
+/// 未绑定时行为与原版完全一致（仅全局计数）
 pub struct InflightGuard {
     counter: Arc<AtomicU64>,
+    /// 账号级在途计数（F-77）：账号 uid → 计数器的共享句柄（存于 ApiPool）
+    account: Option<Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl InflightGuard {
@@ -156,13 +196,27 @@ impl InflightGuard {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         InflightGuard {
             counter: counter.clone(),
+            account: None,
         }
+    }
+
+    /// F-77：取号成功后绑定账号在途计数（+1）；guard 存续至请求/流结束。
+    /// 重复绑定（重试换号）时先解绑旧账号再绑新账号，计数不泄漏
+    pub fn bind_account(mut self, acct: Arc<std::sync::atomic::AtomicU32>) -> InflightGuard {
+        acct.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(old) = self.account.replace(acct) {
+            old.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self
     }
 }
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(acct) = self.account.take() {
+            acct.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -362,6 +416,10 @@ mod inflight_tests {
             wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
             wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
             wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_hedge_threshold_ms: AtomicU64::new(0),
+            account_concurrency_limit: std::sync::atomic::AtomicU32::new(0),
+            pool_sticky_ttl_secs: AtomicU64::new(0),
             wb_sticky: wb_sticky::StickyStore::default(),
             pool_sticky: Mutex::new(std::collections::HashMap::new()),
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),

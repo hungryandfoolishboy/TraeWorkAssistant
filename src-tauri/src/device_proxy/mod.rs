@@ -9,6 +9,7 @@ pub mod local_capture;
 pub mod logger;
 pub mod upstream;
 pub mod ws;
+pub mod bypass;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

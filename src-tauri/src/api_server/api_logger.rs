@@ -135,6 +135,23 @@ impl ApiLogger {
         }
     }
 
+    /// 记录调度事件日志（F-77）：sticky_yield 让位 / busy 降级取号 / 对冲接管等，
+    /// 单行 `[SCHED]` 前缀写入当日日志，供用量页日志检索与调度行为观测
+    pub fn log_sched_event(&self, event: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let local_ts = now + 8 * 3600;
+        let h = (local_ts % 86400) / 3600;
+        let m = (local_ts % 3600) / 60;
+        let s = local_ts % 60;
+        let line = format!("[{:02}:{:02}:{:02}] [SCHED] {}\n", h, m, s, event);
+        if let Some(mut f) = self.get_writer() {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
     /// 记录 Debug 级别的完整请求/响应日志
     pub fn log_debug(
         &self,
@@ -480,6 +497,16 @@ mod tests {
         assert!(content.contains("pool=buddy model=glm-5.3"), "buddy 行需含资源标识与模型: {content}");
         assert!(content.contains("pool=trae model=glm-5.2"), "trae 行需含资源标识与模型: {content}");
         assert!(content.contains("error=no healthy account"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sched_event_line_format() {
+        let dir = tmp_dir("sched");
+        let logger = ApiLogger::new(dir.clone());
+        logger.log_sched_event("sticky_yield uid=abc inflight=1 limit=1");
+        let content = logger.read_log(&today()).expect("log written");
+        assert!(content.contains("[SCHED] sticky_yield uid=abc inflight=1 limit=1"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

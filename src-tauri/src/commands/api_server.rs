@@ -220,6 +220,13 @@ pub async fn do_start(
         wb_default_thinking: std::sync::atomic::AtomicBool::new(pool_file.wb_default_thinking),
         wb_tool_exec: std::sync::atomic::AtomicBool::new(pool_file.wb_tool_exec),
         wb_bg_downgrade: std::sync::atomic::AtomicBool::new(pool_file.wb_bg_downgrade),
+        // F-76/F-77 新开关（api_pool.json，serde default 兼容旧文件）
+        wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(pool_file.wb_longctx_downgrade),
+        wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(pool_file.wb_hedge_threshold_ms),
+        account_concurrency_limit: std::sync::atomic::AtomicU32::new(
+            pool_file.account_concurrency_limit,
+        ),
+        pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(pool_file.pool_sticky_ttl_secs),
         wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
         pool_sticky: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
@@ -235,6 +242,15 @@ pub async fn do_start(
         wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
         wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
     });
+
+    // F-76②/F-77 热参数：池并发上限（两池同构生效）+ wb_sticky 显式 TTL
+    shared.pool.set_concurrency_limit(pool_file.account_concurrency_limit);
+    shared
+        .wb_pool
+        .set_concurrency_limit(pool_file.account_concurrency_limit);
+    shared
+        .wb_sticky
+        .set_explicit_ttl(pool_file.wb_sticky_ttl_secs as i64);
 
     let handle = start_api_server(port, shared.clone()).await?;
 
@@ -374,6 +390,11 @@ fn merge_pool_set(
     wb_default_thinking: Option<bool>,
     wb_tool_exec: Option<bool>,
     wb_bg_downgrade: Option<bool>,
+    wb_longctx_downgrade: Option<bool>,
+    wb_hedge_threshold_ms: Option<u64>,
+    account_concurrency_limit: Option<u32>,
+    pool_sticky_ttl_secs: Option<u64>,
+    wb_sticky_ttl_secs: Option<u64>,
 ) -> ApiPoolFile {
     ApiPoolFile {
         enabled_uids: uids,
@@ -384,11 +405,20 @@ fn merge_pool_set(
         wb_default_thinking: wb_default_thinking.unwrap_or(existing.wb_default_thinking),
         wb_tool_exec: wb_tool_exec.unwrap_or(existing.wb_tool_exec),
         wb_bg_downgrade: wb_bg_downgrade.unwrap_or(existing.wb_bg_downgrade),
+        wb_longctx_downgrade: wb_longctx_downgrade.unwrap_or(existing.wb_longctx_downgrade),
+        wb_hedge_threshold_ms: wb_hedge_threshold_ms
+            .unwrap_or(existing.wb_hedge_threshold_ms),
+        account_concurrency_limit: account_concurrency_limit
+            .unwrap_or(existing.account_concurrency_limit),
+        pool_sticky_ttl_secs: pool_sticky_ttl_secs.unwrap_or(existing.pool_sticky_ttl_secs),
+        wb_sticky_ttl_secs: wb_sticky_ttl_secs.unwrap_or(existing.wb_sticky_ttl_secs),
     }
 }
 
 /// 批量设置池中的账号 UID 列表 + 调度策略 + 分组筛选（T10）+ WB 上游开关（T2.1）
 /// + T5.3 默认深度思考 / T5.5 工具代执行 / T5.6③ 后台任务降级（未传字段保留原值）。
+/// + F-76/F-77 热参数：长上下文降档 / 慢请求对冲阈值 / 账号并发上限 /
+/// 池粘性 TTL / wb_sticky TTL（未传字段保留原值）。
 /// 策略部分热应用：运行中池立即生效（成员/分组变更仍需重启重建池）。
 #[tauri::command]
 pub fn pool_set(
@@ -402,6 +432,11 @@ pub fn pool_set(
     wb_default_thinking: Option<bool>,
     wb_tool_exec: Option<bool>,
     wb_bg_downgrade: Option<bool>,
+    wb_longctx_downgrade: Option<bool>,
+    wb_hedge_threshold_ms: Option<u64>,
+    account_concurrency_limit: Option<u32>,
+    pool_sticky_ttl_secs: Option<u64>,
+    wb_sticky_ttl_secs: Option<u64>,
 ) -> Result<(), String> {
     let existing: ApiPoolFile = fs_utils::read_json(&state.path("api_pool.json"));
     let pool_file = merge_pool_set(
@@ -414,6 +449,11 @@ pub fn pool_set(
         wb_default_thinking,
         wb_tool_exec,
         wb_bg_downgrade,
+        wb_longctx_downgrade,
+        wb_hedge_threshold_ms,
+        account_concurrency_limit,
+        pool_sticky_ttl_secs,
+        wb_sticky_ttl_secs,
     );
     fs_utils::write_json(&state.path("api_pool.json"), &pool_file)?;
     // 热应用：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
@@ -423,6 +463,30 @@ pub fn pool_set(
             .set_strategy(crate::api_server::pool::PoolStrategy::parse(&pool_file.strategy));
         rt.shared.wb_pool.set_strategy(
             crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy),
+        );
+        // F-76②/F-77 热参数即时生效（两池同构）
+        rt.shared
+            .pool
+            .set_concurrency_limit(pool_file.account_concurrency_limit);
+        rt.shared
+            .wb_pool
+            .set_concurrency_limit(pool_file.account_concurrency_limit);
+        rt.shared.wb_sticky.set_explicit_ttl(pool_file.wb_sticky_ttl_secs as i64);
+        rt.shared.wb_longctx_downgrade.store(
+            pool_file.wb_longctx_downgrade,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        rt.shared.wb_hedge_threshold_ms.store(
+            pool_file.wb_hedge_threshold_ms,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        rt.shared.account_concurrency_limit.store(
+            pool_file.account_concurrency_limit,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        rt.shared.pool_sticky_ttl_secs.store(
+            pool_file.pool_sticky_ttl_secs,
+            std::sync::atomic::Ordering::Relaxed,
         );
     }
     Ok(())
@@ -434,6 +498,17 @@ pub fn pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Vec<P
     let guard = safe_lock(&runtime);
     match guard.as_ref() {
         Some(rt) => rt.shared.pool.status_list(),
+        None => vec![],
+    }
+}
+
+/// 返回运行中 WB 池的实时状态（F-77⑤ 可观测：含 per-account inflight 在途计数）；
+/// 服务未运行时返回空数组
+#[tauri::command]
+pub fn wb_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Vec<PoolStatus> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => rt.shared.wb_pool.status_list(),
         None => vec![],
     }
 }
@@ -785,15 +860,25 @@ mod pool_merge_tests {
             wb_default_thinking: true,
             wb_tool_exec: false,
             wb_bg_downgrade: false,
+            wb_longctx_downgrade: true,
+            wb_hedge_threshold_ms: 8000,
+            account_concurrency_limit: 2,
+            pool_sticky_ttl_secs: 600,
+            wb_sticky_ttl_secs: 3600,
         }
     }
 
     #[test]
     fn none_fields_preserve_existing() {
-        // 只改成员（uids 必传覆盖），其余未传 → 全部保留原值
+        // 只改成员（uids 必传覆盖），其余未传 → 全部保留原值（含 F-76/F-77 新参数）
         let m = merge_pool_set(
             &existing(),
             vec!["u2".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -810,6 +895,12 @@ mod pool_merge_tests {
         assert!(m.wb_default_thinking);
         assert!(!m.wb_tool_exec);
         assert!(!m.wb_bg_downgrade);
+        // F-76/F-77 新参数未传 → 保留原值
+        assert!(m.wb_longctx_downgrade);
+        assert_eq!(m.wb_hedge_threshold_ms, 8000);
+        assert_eq!(m.account_concurrency_limit, 2);
+        assert_eq!(m.pool_sticky_ttl_secs, 600);
+        assert_eq!(m.wb_sticky_ttl_secs, 3600);
     }
 
     #[test]
@@ -825,6 +916,11 @@ mod pool_merge_tests {
             Some(false),
             Some(true),
             Some(true),
+            Some(false),
+            Some(3000),
+            Some(0),
+            Some(60),
+            Some(120),
         );
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
@@ -833,6 +929,12 @@ mod pool_merge_tests {
         assert!(!m.wb_default_thinking);
         assert!(m.wb_tool_exec);
         assert!(m.wb_bg_downgrade);
+        // F-76/F-77 新参数显式传入 → 覆盖
+        assert!(!m.wb_longctx_downgrade);
+        assert_eq!(m.wb_hedge_threshold_ms, 3000);
+        assert_eq!(m.account_concurrency_limit, 0);
+        assert_eq!(m.pool_sticky_ttl_secs, 60);
+        assert_eq!(m.wb_sticky_ttl_secs, 120);
     }
 
     #[test]
@@ -848,6 +950,11 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
@@ -858,10 +965,16 @@ mod pool_merge_tests {
 
     #[test]
     fn empty_existing_preserves_nothing_but_fills_defaults() {
-        // 旧版 api_pool.json（无策略字段）+ 只传成员：策略落为空串（运行时 parse 回退 expire_first）
+        // 旧版 api_pool.json（无策略字段）+ 只传成员：策略落为空串（运行时 parse 回退 expire_first）；
+        // F-76/F-77 新参数未传 → serde default 生效（对冲 8s、并发=1、池粘性 300s）
         let m = merge_pool_set(
             &ApiPoolFile::default(),
             vec!["u1".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -874,5 +987,10 @@ mod pool_merge_tests {
         assert_eq!(m.wb_strategy, "");
         assert!(m.group_ids.is_empty());
         assert!(!m.wb_enabled);
+        assert!(!m.wb_longctx_downgrade);
+        assert_eq!(m.wb_hedge_threshold_ms, 8000);
+        assert_eq!(m.account_concurrency_limit, 1);
+        assert_eq!(m.pool_sticky_ttl_secs, 300);
+        assert_eq!(m.wb_sticky_ttl_secs, 1800);
     }
 }

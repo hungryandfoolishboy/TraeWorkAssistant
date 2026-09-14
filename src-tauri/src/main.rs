@@ -64,6 +64,9 @@ fn main() {
     if let Some(note) = commands::doubao::try_migrate_keepalive_launcher(&state) {
         fs_utils::app_log(&state.data_dir, &note);
     }
+    // OAuth 代理直连豁免崩溃残留清理（F-78 批次 2/缺陷13）：上次进程异常退出
+    // 未还原 ProxyOverride 时，按标记文件只移除本软件追加的条目（无标记幂等空操作）
+    device_proxy::bypass::cleanup_residual_bypass(&state.data_dir);
 
     // 单实例防护（仅正式版）：第二个进程启动时，本回调在首个实例中执行——把主窗口
     // 还原/显示/聚焦后，第二进程由插件自动退出。必须第一个注册（在创建窗口前持有互斥锁）。
@@ -161,6 +164,7 @@ fn main() {
             commands::api_server::pool_list,
             commands::api_server::pool_set,
             commands::api_server::pool_status,
+            commands::api_server::wb_pool_status,
             commands::api_server::api_logs_list,
             commands::api_server::api_logs_detail,
             commands::api_server::api_logs_search,
@@ -225,6 +229,8 @@ fn main() {
             commands::oauth::oauth_get_login_url,
             commands::oauth::oauth_parse_callback,
             commands::oauth::oauth_login,
+            commands::oauth_loopback::oauth_start_loopback,
+            commands::oauth_loopback::oauth_stop_loopback,
             commands::trae_apps::apps_accounts_discover,
             commands::trae_apps::apps_account_add,
             commands::trae_apps::apps_entitlement_read,

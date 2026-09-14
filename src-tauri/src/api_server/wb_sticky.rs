@@ -13,10 +13,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use sha2::{Digest, Sha256};
 
-/// 显式模式 TTL（滚动续期）
+/// 显式模式 TTL 默认值（滚动续期）；实际生效值可经
+/// `set_explicit_ttl` 覆盖（F-76② api_pool.json.wb_sticky_ttl_secs 热应用）
 pub const EXPLICIT_TTL_SECS: i64 = 30 * 60;
 /// 指纹模式时间窗
 pub const FINGERPRINT_WINDOW_SECS: i64 = 60;
@@ -48,6 +50,8 @@ pub struct StickyStore {
     inner: Mutex<HashMap<String, Binding>>,
     /// 上次成功落盘时刻（节流，见 save）：Some 之前的 save 一律跳过写盘
     last_save: Mutex<Option<std::time::Instant>>,
+    /// 显式模式 TTL 秒（F-76② 可配置，0 视为未设置 → 回退 EXPLICIT_TTL_SECS）
+    explicit_ttl_secs: AtomicI64,
 }
 
 /// 会话键：显式 conversationId 或消息指纹
@@ -122,11 +126,26 @@ impl StickyStore {
         Self::default()
     }
 
+    /// 设置显式模式 TTL 秒（F-76②，pool_set 热应用；≤0 回退默认值）
+    pub fn set_explicit_ttl(&self, secs: i64) {
+        self.explicit_ttl_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// 当前生效的显式模式 TTL 秒（未设置/非法回退 EXPLICIT_TTL_SECS）
+    fn effective_explicit_ttl(&self) -> i64 {
+        let v = self.explicit_ttl_secs.load(Ordering::Relaxed);
+        if v > 0 {
+            v
+        } else {
+            EXPLICIT_TTL_SECS
+        }
+    }
+
     /// 解析绑定（TTL 校验 + 显式模式滚动续期）。过期/不匹配即返回 None。
     pub fn resolve(&self, key: &SessionKey, now: i64) -> Option<Binding> {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let ttl = if key.is_explicit() {
-            EXPLICIT_TTL_SECS
+            self.effective_explicit_ttl()
         } else {
             FINGERPRINT_WINDOW_SECS
         };
@@ -251,6 +270,7 @@ impl StickyStore {
         Self {
             inner: Mutex::new(map),
             last_save: Mutex::new(None),
+            explicit_ttl_secs: std::sync::atomic::AtomicI64::new(0),
         }
     }
 }

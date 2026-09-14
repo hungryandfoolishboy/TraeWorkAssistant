@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn 备份auth缺失整体跳过_恢复缺auth中止() {
         let _guard = test_io_lock();
-        let mut sess = session(TargetApp::WorkBuddy, "skip");
+        let sess = session(TargetApp::WorkBuddy, "skip");
         let sink = QuietSink;
         // auth 文件不存在 → warn 整体跳过（不建槽/不写 meta/不动 .bak）
         backup_authfile(&sess, "100", &sink).unwrap();
@@ -639,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn 备份恢复round_trip_含meta与L2() {
+    fn 备份恢复round_trip_含meta与_l2() {
         let _guard = test_io_lock();
         let sess = session(TargetApp::WorkBuddy, "roundtrip");
         let sink = QuietSink;

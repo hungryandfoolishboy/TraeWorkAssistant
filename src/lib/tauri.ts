@@ -35,6 +35,7 @@ import type {
   ModelOption,
   OAuthLoginUrl,
   OAuthLoginResult,
+  OAuthLoginDoneEvent,
   PoolStatus,
   ProfileInfo,
   ProxyLogListResult,
@@ -368,6 +369,17 @@ export const api = {
       invoke('oauth_parse_callback', { callbackUrl }),
     login: (callbackUrl: string, accountName?: string, groupId?: string) =>
       invoke<OAuthLoginResult>('oauth_login', { callbackUrl, accountName, groupId }),
+    // F-78 批次 1：本机回环监听（127.0.0.1:17388），浏览器回调自动落库收尾；
+    // startLoopback 端口被占用时后端返回明确错误，前端降级为手动粘贴兜底
+    startLoopback: (accountName?: string, groupId?: string) =>
+      invoke<void>('oauth_start_loopback', {
+        accountName: accountName ?? null,
+        groupId: groupId ?? null,
+      }),
+    stopLoopback: () => invoke<void>('oauth_stop_loopback'),
+    // 登录完成事件：回环监听器自动落库后发出；ok=false 时提示改用手动粘贴兜底
+    onLoginDone: (cb: (e: OAuthLoginDoneEvent) => void): Promise<UnlistenFn> =>
+      listen<OAuthLoginDoneEvent>('oauth-login-done', (ev) => cb(ev.payload)),
   },
   apiServer: {
     start: () => invoke<ApiServiceStatus>('api_server_start'),
@@ -385,6 +397,16 @@ export const api = {
         wbDefaultThinking?: boolean;
         wbToolExec?: boolean;
         wbBgDowngrade?: boolean;
+        /** F-76④ 长上下文降档开关 */
+        wbLongctxDowngrade?: boolean;
+        /** F-76③ 竞速对冲阈值毫秒（0 = 关闭） */
+        wbHedgeThresholdMs?: number;
+        /** F-77 账号并发上限（0 = 不限） */
+        accountConcurrencyLimit?: number;
+        /** F-76② 池粘性 TTL 秒 */
+        poolStickyTtlSecs?: number;
+        /** F-76② WB 会话粘性 TTL 秒 */
+        wbStickyTtlSecs?: number;
       },
       wbStrategy?: string,
     ) =>
@@ -396,9 +418,16 @@ export const api = {
         wbDefaultThinking: wbFlags?.wbDefaultThinking ?? null,
         wbToolExec: wbFlags?.wbToolExec ?? null,
         wbBgDowngrade: wbFlags?.wbBgDowngrade ?? null,
+        wbLongctxDowngrade: wbFlags?.wbLongctxDowngrade ?? null,
+        wbHedgeThresholdMs: wbFlags?.wbHedgeThresholdMs ?? null,
+        accountConcurrencyLimit: wbFlags?.accountConcurrencyLimit ?? null,
+        poolStickyTtlSecs: wbFlags?.poolStickyTtlSecs ?? null,
+        wbStickyTtlSecs: wbFlags?.wbStickyTtlSecs ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
+    /** WB 池实时状态（F-77⑤：含 per-account inflight 在途计数） */
+    wbPoolStatus: () => invoke<PoolStatus[]>('wb_pool_status'),
     logsList: () => invoke<string[]>('api_logs_list'),
     logsDetail: (date: string) => invoke<string | null>('api_logs_detail', { date }),
     logsSearch: (opts: {
