@@ -33,7 +33,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
 use crate::device_proxy::ca::{ensure_ca, CaAuthority};
-use crate::device_proxy::handler::{serve_mitm, HOP_BY_HOP_REQ, PIN_FAIL_THRESHOLD, ProxyCtx};
+use crate::device_proxy::handler::{serve_mitm, HOP_BY_HOP_REQ, PIN_MIN_FAILS, ProxyCtx};
 use crate::device_proxy::logger::{ProxyLog, RequestLogger};
 use crate::device_proxy::upstream::{
     connect_direct, connect_via_upstream, UpstreamConnector, UpstreamProxy,
@@ -352,10 +352,10 @@ async fn handle_conn(
                     || e.to_string().contains("close_notify")
                     || e.to_string().contains("unexpected EOF");
                 if aborted && ctx.note_handshake_fail(&host) {
-                    // 自适应降级：连续 PIN_FAIL_THRESHOLD 次中止 → 判定证书锁定，
-                    // 后续该域 CONNECT 透明直通（进程内生效，重启代理复位）
+                    // 自适应降级：失败样本 ≥ PIN_MIN_FAILS 且失败率 > 75% → 判定
+                    // 证书锁定，后续该域 CONNECT 透明直通（进程内生效，重启复位）
                     ctx.log.log(&format!(
-                        "  [MITM] {host} 连续 {PIN_FAIL_THRESHOLD} 次握手被客户端中止，疑似证书锁定，已自动降级为透明直通"
+                        "  [MITM] {host} 握手被客户端中止率达阈值（{PIN_MIN_FAILS}+ 次失败、成功率 <25%），疑似证书锁定，已自动降级为透明直通"
                     ));
                 } else if !aborted {
                     ctx.log
@@ -797,26 +797,28 @@ mod tests {
         assert!(!ctx.host_in_targets("notdoubao.com"));
     }
 
-    /// 自适应证书锁定降级：连续失败达阈值判 pinned，成功清零
+    /// 自适应证书锁定降级（失败率判定）：真锁定域快速降级，投机预连接裁撤
+    /// （混布成功/失败）不误判
     #[test]
     fn adaptive_pin_downgrade() {
         let dir = temp_dir("pin");
         let ctx = test_ctx(&dir);
         assert!(!ctx.is_pinned("mcs.doubao.com"));
-        assert!(ctx.note_handshake_fail("mcs.doubao.com") == (PIN_FAIL_THRESHOLD == 1));
+        // 少量失败不降级（投机预连接裁撤是正常现象）
+        for _ in 0..4 {
+            ctx.note_handshake_fail("mcs.doubao.com");
+        }
         assert!(!ctx.is_pinned("mcs.doubao.com"));
-        ctx.note_handshake_fail("mcs.doubao.com");
-        // 阈值（3）达到 → pinned，CONNECT 分流将转透明直通
+        // 第 5 次失败（成功数 0，失败率 100%）→ 判定锁定
         assert!(ctx.note_handshake_fail("mcs.doubao.com"));
         assert!(ctx.is_pinned("mcs.doubao.com"));
         // 其他域不受影响
         assert!(!ctx.is_pinned("www.doubao.com"));
-        // 混布域：一次成功即清零（webview 成功连接不应被 cronet 失败连坐）
-        ctx.note_handshake_fail("www.doubao.com");
-        ctx.note_handshake_fail("www.doubao.com");
-        ctx.note_handshake_ok("www.doubao.com");
-        assert!(!ctx.is_pinned("www.doubao.com"));
-        ctx.note_handshake_fail("www.doubao.com");
+        // 混布域（webview 成功 + cronet 失败各半）：失败率高也不误判
+        for _ in 0..10 {
+            ctx.note_handshake_ok("www.doubao.com");
+            ctx.note_handshake_fail("www.doubao.com");
+        }
         assert!(!ctx.is_pinned("www.doubao.com"));
     }
 

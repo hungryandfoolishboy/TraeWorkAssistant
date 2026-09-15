@@ -91,13 +91,18 @@ pub struct ProxyCtx {
     pub auto_capture_jwt: bool,
     /// 数据根目录（SQLite 化 P3：accounts/cooldowns/凭证快照均经 store 读写）
     pub data_dir: PathBuf,
-    /// 自适应证书锁定降级：host → 连续握手被客户端中止次数（成功清零；
-    /// 达 PIN_FAIL_THRESHOLD 即 pinned，该域 CONNECT 转透明直通，重启复位）
-    pub pin_state: Mutex<HashMap<String, u32>>,
+    /// 自适应证书锁定降级：host → (握手成功数, 握手被中止数, 已判定锁定)。
+    /// 失败率判定（非连续计数）：投机性预连接风暴（客户端并发开连接再裁撤，
+    /// 握手 RST）会造成「连续 3 次失败」的假阳性，把正常域误降级为直通（实测
+    /// www/accounts.doubao.com 被误降级、Cookie 捕获停摆）；样本 ≥5 且失败率
+    /// >75% 才判锁定，混布域（webview 成功 + cronet 失败）永不误判。重启复位。
+    pub pin_state: Mutex<HashMap<String, (u32, u32, bool)>>,
 }
 
-/// 自适应降级阈值：连续 N 次握手被客户端中止即判定证书锁定
-pub const PIN_FAIL_THRESHOLD: u32 = 3;
+/// 判定证书锁定的最小失败样本数
+pub const PIN_MIN_FAILS: u32 = 5;
+/// 判定证书锁定的最大成功/失败比（成功数低于失败数的 25% 才判锁定）
+pub const PIN_MAX_OK_RATIO: f64 = 0.25;
 
 impl ProxyCtx {
     /// 域名后缀匹配（对齐 Python host_in_targets）
@@ -108,29 +113,32 @@ impl ProxyCtx {
             .any(|d| h == *d || h.ends_with(&format!(".{d}")))
     }
 
-    /// 握手成功：清除该域的中止计数（混布域——webview 成功/cronet 失败——不被误判）
+    /// 握手成功：成功计数 +1（混布域——webview 成功/cronet 失败——永不误判）
     pub fn note_handshake_ok(&self, host: &str) {
-        self.pin_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(host);
+        let mut m = self.pin_state.lock().unwrap_or_else(|e| e.into_inner());
+        let e = m.entry(host.to_string()).or_insert((0, 0, false));
+        e.0 = e.0.saturating_add(1);
     }
 
-    /// 握手被客户端中止：累加连续计数，返回 true 表示刚达到阈值（首次判定为锁定）
+    /// 握手被客户端中止：失败计数 +1，返回 true 表示刚判定为锁定
     pub fn note_handshake_fail(&self, host: &str) -> bool {
         let mut m = self.pin_state.lock().unwrap_or_else(|e| e.into_inner());
-        let c = m.entry(host.to_string()).or_insert(0);
-        *c = c.saturating_add(1);
-        *c == PIN_FAIL_THRESHOLD
+        let e = m.entry(host.to_string()).or_insert((0, 0, false));
+        e.1 = e.1.saturating_add(1);
+        if !e.2 && e.1 >= PIN_MIN_FAILS && (e.0 as f64) < (e.1 as f64) * PIN_MAX_OK_RATIO {
+            e.2 = true;
+            return true;
+        }
+        false
     }
 
-    /// 该域是否已判定证书锁定（CONNECT 转透明直通）
+    /// 该域是否已判定证书锁定（CONNECT 转透明直通；判定后本会话保持）
     pub fn is_pinned(&self, host: &str) -> bool {
         self.pin_state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(host)
-            .map(|c| *c >= PIN_FAIL_THRESHOLD)
+            .map(|e| e.2)
             .unwrap_or(false)
     }
 
