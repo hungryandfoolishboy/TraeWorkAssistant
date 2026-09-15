@@ -386,11 +386,16 @@ pub fn restore_authfile(
     Ok(())
 }
 
-/// 三信号切换确认结果（PS 返回 'ok'/'timeout'）
+/// 切换确认结果（PS 返回 'ok'/'timeout'）
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VerifyResult {
     Ok,
     Timeout,
+    /// 信号④（仅 CodeBuddy）：客户端启动后 live 身份（storage.json genie.userId）
+    /// 重写为非目标账号——vscdb mtime 只是「动过登录库」的因果信号，防不了
+    /// 「会话回退到旧账号」的假阳性（switcher.log 实测：恢复 A 后 verify 报 OK，
+    /// 45 秒后 live 身份仍是旧账号 B，守卫正确跳过槽位回写但用户拿到假「切换成功」）
+    Reverted,
 }
 
 /// authfile 切换后轮询确认（F-02 验收项，超时 30s / 2s 间隔，PS 1156-1243 对译）。
@@ -496,8 +501,7 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
         {
             auth_hits += 1;
             if auth_hits >= 2 {
-                sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
-                return VerifyResult::Ok;
+                return confirm_ok(sess, slot, &expect_uid, sink);
             }
         } else {
             auth_hits = 0;
@@ -534,8 +538,7 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
                     .flatten()
                     .find_map(|v| v.as_str().map(|s| s.to_string()));
                     if uid.as_deref() == Some(expect_uid.as_str()) {
-                        sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
-                        return VerifyResult::Ok;
+                        return confirm_ok(sess, slot, &expect_uid, sink);
                     }
                 }
             }
@@ -571,6 +574,56 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
         );
     }
     VerifyResult::Timeout
+}
+
+/// 确认收尾 + 信号④ live 身份复核（仅 CodeBuddy）。
+/// vscdb mtime 只证明「客户端动过登录库」，防不了「客户端启动后会话回退到旧账号」
+/// 的假阳性（switcher.log 实测：恢复 A 后 verify 报 OK，45 秒后 live 身份仍是旧
+/// 账号 B）。恢复落盘时 live 身份（globalStorage\storage.json genie.userId）即目标
+/// uid——客户端若回退必然重写它 → 轮询 3 次（2s 间隔），读到非目标非空 uid 即判
+/// Reverted；读到目标 uid 或 3 次无定论（客户端暂未回写）则 fail-open 维持确认。
+/// 前提守卫：仅当槽位快照含 storage.json（恢复确实覆盖了 live 身份）才启用复核——
+/// 槽位缺该文件时 live storage.json 是切换前旧账号残留，读到非目标 uid 只是
+/// 「客户端尚未回写」，判 Reverted 即假阳性。
+/// WorkBuddy 信号②本就是内容级校验，直接确认（零额外延迟）。
+fn confirm_ok(sess: &Session, slot: &str, expect_uid: &str, sink: &dyn ProgressSink) -> VerifyResult {
+    if sess.prof.app_name != "CodeBuddy" {
+        sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
+        return VerifyResult::Ok;
+    }
+    let Some(gs) = sess.prof.cb_global_storage_dir.as_ref() else {
+        sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
+        return VerifyResult::Ok;
+    };
+    if !sess.prof.profiles_dir.join(slot).join("vscdb").join("storage.json").exists() {
+        sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
+        return VerifyResult::Ok;
+    }
+    let live_file = gs.join("storage.json");
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_secs(2));
+        let raw = crate::fs_utils::read_json::<serde_json::Value>(&live_file);
+        let uid = crate::fs_utils::dig(&raw, &["genie.userId"])
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if !uid.is_empty() {
+            if uid == expect_uid {
+                sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
+                return VerifyResult::Ok;
+            }
+            sink.step(
+                "verify",
+                StepStatus::Warn,
+                &format!(
+                    "客户端实际登录身份为 {uid}，与目标 {expect_uid} 不一致（疑似会话回退到旧账号），请打开客户端核实"
+                ),
+            );
+            return VerifyResult::Reverted;
+        }
+    }
+    sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
+    VerifyResult::Ok
 }
 
 #[cfg(test)]

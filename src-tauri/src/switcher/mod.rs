@@ -588,15 +588,27 @@ fn switch_flow(
 
     // authfile 布局：verify 超时 ≠ 切换失败（快照已恢复、客户端已启动），但必须在
     // done 里如实告知「登录身份未确认」，否则前端报「切换成功」掩盖未登录事实
-    //（switcher.log 实测 4/4 超时）
+    //（switcher.log 实测 4/4 超时）；Reverted = live 身份被客户端回退到旧账号（信号④），
+    // 同样如实告知
     if sess.prof.layout == Layout::Authfile {
-        if authfile::confirm_switch(sess, uid, sink) == authfile::VerifyResult::Timeout {
-            return done(
-                sink,
-                &format!(
-                    "已切换至账号 {uid}（警告：30 秒内未确认登录身份，请打开客户端核实；若客户端未登录，请重新登录后「保存当前登录态」）"
-                ),
-            );
+        match authfile::confirm_switch(sess, uid, sink) {
+            authfile::VerifyResult::Timeout => {
+                return done(
+                    sink,
+                    &format!(
+                        "已切换至账号 {uid}（警告：30 秒内未确认登录身份，请打开客户端核实；若客户端未登录，请重新登录后「保存当前登录态」）"
+                    ),
+                );
+            }
+            authfile::VerifyResult::Reverted => {
+                return done(
+                    sink,
+                    &format!(
+                        "已切换至账号 {uid}（警告：客户端实际登录身份已回退到其他账号，本次切换可能未生效，请打开客户端核实；若未登录，请重新切换或在客户端登录后「保存当前登录态」）"
+                    ),
+                );
+            }
+            authfile::VerifyResult::Ok => {}
         }
     }
     done(sink, &format!("已切换至账号 {uid}"))
