@@ -98,14 +98,10 @@ pub fn clear_model_failure(state: &ApiSharedState, model: &str) {
 /// 免自建缓存结构与 Mutex 内磁盘 IO）；data/ 新路径缺失回退旧根路径（存量数据
 /// 兼容）；文件缺失/损坏/空表用内置兜底
 pub fn load_templates(state: &ApiSharedState) -> Vec<(String, String)> {
-    let new_path = wb_payload::template_map_path(&state.data_dir);
-    let effective = if new_path.exists() {
-        new_path
-    } else {
-        wb_payload::template_map_path_legacy(&state.data_dir)
-    };
-    crate::fs_utils::read_json_cached::<wb_payload::TemplateMapFile>(&effective)
-        .and_then(|f| f.into_rules())
+    // SQLite 化（P2）：data/wb_template_map.json → kv `wb_template_map`（热路径单行读取）
+    crate::store::db(&state.data_dir)
+        .kv_get::<wb_payload::TemplateMapFile>("wb_template_map")
+        .into_rules()
         .unwrap_or_else(wb_payload::default_template_map)
 }
 

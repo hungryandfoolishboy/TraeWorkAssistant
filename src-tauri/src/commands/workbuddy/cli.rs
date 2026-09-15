@@ -32,7 +32,8 @@ pub(super) struct CliRotateState {
 }
 
 pub(super) fn load_cli_rotate_state(state: &AppState) -> CliRotateState {
-    fs_utils::read_json(&cli_rotate_state_path(state))
+    // SQLite 化（P2）：wb_cli_rotate_state.json → kv `wb_cli_rotate_state`
+    crate::store::db(&state.data_dir).kv_get("wb_cli_rotate_state")
 }
 
 fn append_cli_log(_state: &AppState, st: &mut CliRotateState, mut entry: serde_json::Value) {
@@ -63,7 +64,7 @@ fn cli_token_of(state: &AppState, account_id: &str) -> Option<String> {
 /// 缓存缺失/无凭证 → invalid 候选（供日志与防横跳参照，不作为目标）。
 fn cli_candidates(state: &AppState) -> Vec<workbuddy_cli::CliCandidate> {
     let cache: serde_json::Value =
-        fs_utils::read_json(&state.data_dir.join("data").join("workbuddy_credits_cache.json"));
+        crate::store::db(&state.data_dir).kv_get("workbuddy_credits_cache");
     let cache_accounts = cache.get("accounts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let pool = load_pool(state);
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -227,7 +228,7 @@ pub fn workbuddy_cli_bridge_set(state: State<AppState>, user_id: String) -> Resu
             "reason": "手动切换 CLI 账号",
         }),
     );
-    fs_utils::write_json(&cli_rotate_state_path(&state), &st)?;
+    crate::store::db(&state.data_dir).kv_set("wb_cli_rotate_state", &st)?;
     fs_utils::app_log(&state.data_dir, &format!("CodeBuddy CLI 手动切号: {} ({})", display, acct.id));
     Ok(cli_status_value(&state))
 }
@@ -337,7 +338,7 @@ fn cli_rotate_cycle(state: &AppState) -> serde_json::Value {
             .map(|s| s.to_string());
     }
     append_cli_log(state, &mut st, entry);
-    let _ = fs_utils::write_json(&cli_rotate_state_path(state), &st);
+    let _ = crate::store::db(&state.data_dir).kv_set("wb_cli_rotate_state", &st);
     if result.get("status") == Some(&serde_json::json!("switched")) {
         fs_utils::app_log(
             &state.data_dir,

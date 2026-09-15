@@ -108,8 +108,9 @@ pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Opt
 /// 之后即使注册表/默认目录变化，也能用上次成功的路径直接启动。
 /// 用户手动指定（设置页）优先级更高，且仅在探测值与存量值不同时写盘。
 fn persist_detected_path(state: &State<AppState>, key: &str, exe: &str) {
-    let path = state.path("app_settings.json");
-    let mut current: serde_json::Value = crate::fs_utils::read_json(&path);
+    // SQLite 化（P2）：app_settings 入 kv 文档
+    let store = crate::store::db(&state.data_dir);
+    let mut current: serde_json::Value = store.kv_get("app_settings");
     if !current.is_object() {
         current = serde_json::json!({});
     }
@@ -122,7 +123,7 @@ fn persist_detected_path(state: &State<AppState>, key: &str, exe: &str) {
         if let Some(obj) = current.as_object_mut() {
             obj.insert(key.to_string(), serde_json::json!(exe));
         }
-        let _ = crate::fs_utils::write_json(&path, &current);
+        let _ = store.kv_set("app_settings", &current);
     }
 }
 

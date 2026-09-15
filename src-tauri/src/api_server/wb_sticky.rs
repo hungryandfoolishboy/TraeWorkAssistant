@@ -11,7 +11,6 @@
 //! 旧根路径文件仅作启动加载兼容）。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -22,18 +21,8 @@ use sha2::{Digest, Sha256};
 pub const EXPLICIT_TTL_SECS: i64 = 30 * 60;
 /// 指纹模式时间窗
 pub const FINGERPRINT_WINDOW_SECS: i64 = 60;
-/// 落盘文件名（迁移至 data/ 子目录，与全仓数据文件约定一致；旧根路径仅作读取兼容）
-const STICKY_FILE: &str = "wb_sticky_sessions.json";
 /// 落盘节流间隔：距上次成功保存不足该时长则跳过本次写盘
 const SAVE_THROTTLE_MS: u64 = 1000;
-
-fn sticky_path(data_dir: &std::path::Path) -> PathBuf {
-    data_dir.join("data").join(STICKY_FILE)
-}
-
-fn sticky_path_legacy(data_dir: &std::path::Path) -> PathBuf {
-    data_dir.join(STICKY_FILE)
-}
 
 /// 一条绑定：uid + 上游 conversation_id + 最后命中时间
 #[derive(Debug, Clone)]
@@ -234,22 +223,17 @@ impl StickyStore {
                 })).collect::<Vec<_>>(),
             })
         };
-        if crate::fs_utils::write_json(&sticky_path(data_dir), &file).is_ok() {
+        if crate::store::db(data_dir).kv_set("wb_sticky_sessions", &file).is_ok() {
             let mut last = self.last_save.lock().unwrap_or_else(|e| e.into_inner());
             *last = Some(std::time::Instant::now());
         }
     }
 
     /// 启动时加载（过期的条目在 resolve 时自然失效）。
-    /// data/ 新路径不存在时回退旧根路径（存量用户数据兼容）
+    /// SQLite 化（P2）：data/wb_sticky_sessions.json → kv `wb_sticky_sessions`；
+    /// 旧根路径兼容由启动迁移器完成。
     pub fn load(data_dir: &std::path::Path) -> Self {
-        let new_path = sticky_path(data_dir);
-        let path = if new_path.exists() {
-            new_path
-        } else {
-            sticky_path_legacy(data_dir)
-        };
-        let file: serde_json::Value = crate::fs_utils::read_json(&path);
+        let file: serde_json::Value = crate::store::db(data_dir).kv_get("wb_sticky_sessions");
         let mut map = HashMap::new();
         if let Some(list) = file.get("bindings").and_then(|b| b.as_array()) {
             for item in list {
@@ -385,14 +369,13 @@ mod tests {
         let key = SessionKey::from_body(&body_with(Some("c"), json!([{"role":"user","content":"x"}])));
         store.bind(&key, "u1", "v1", 1000);
         store.save(&dir);
-        let path = dir.join("data").join("wb_sticky_sessions.json");
-        assert!(path.exists(), "落盘应写入 data/ 子目录");
-        assert!(!dir.join("wb_sticky_sessions.json").exists(), "不得再写旧根路径");
-        let snapshot1 = std::fs::read_to_string(&path).unwrap();
-        // 1s 内再次 bind + save：落盘被节流跳过，文件内容不变
+        // SQLite 化（P2）：落盘 = kv `wb_sticky_sessions`
+        let snapshot1 = crate::store::db(&dir).kv_get_raw("wb_sticky_sessions");
+        assert!(snapshot1.is_some(), "落盘应写入 kv");
+        // 1s 内再次 bind + save：落盘被节流跳过，内容不变
         store.bind(&key, "u2", "v2", 1006);
         store.save(&dir);
-        let snapshot2 = std::fs::read_to_string(&path).unwrap();
+        let snapshot2 = crate::store::db(&dir).kv_get_raw("wb_sticky_sessions");
         assert_eq!(snapshot1, snapshot2, "距上次成功保存 <1000ms 应跳过落盘");
         // 内存态已更新（resolve 读到新绑定）
         assert_eq!(store.resolve(&key, 1007).unwrap().uid, "u2");
@@ -411,20 +394,21 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(dir.join("data")).unwrap();
-        std::fs::write(
-            dir.join("wb_sticky_sessions.json"),
-            json!({"version": 1, "bindings": [
-                {"key": "cid:legacy", "uid": "u9", "conv_id": "c9", "last_seen": 500, "explicit": true}
-            ]})
-            .to_string(),
-        )
-        .unwrap();
+        // SQLite 化（P2）：种子 = kv `wb_sticky_sessions`
+        crate::store::db(&dir)
+            .kv_set(
+                "wb_sticky_sessions",
+                &json!({"version": 1, "bindings": [
+                    {"key": "cid:legacy", "uid": "u9", "conv_id": "c9", "last_seen": 500, "explicit": true}
+                ]}),
+            )
+            .unwrap();
         let store = StickyStore::load(&dir);
         let key = SessionKey::Explicit("legacy".into());
         assert_eq!(store.resolve(&key, 600).unwrap().conv_id, "c9");
-        // save 一律写新路径（迁移完成）
+        // save 落 kv
         store.save(&dir);
-        assert!(dir.join("data").join("wb_sticky_sessions.json").exists());
+        assert!(crate::store::db(&dir).kv_get_raw("wb_sticky_sessions").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

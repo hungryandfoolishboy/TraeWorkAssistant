@@ -173,12 +173,9 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
 
 // ── 状态持久化 ───────────────────────────────────────────────────────────────
 
-fn state_path(st: &AppState) -> std::path::PathBuf {
-    st.path("scheduler_state.json")
-}
-
 fn load_state(st: &AppState) -> Value {
-    let v: Value = fs_utils::read_json(&state_path(st));
+    // SQLite 化（P2）：scheduler_state.json → kv `scheduler_state`
+    let v: Value = crate::store::db(&st.data_dir).kv_get("scheduler_state");
     if v.is_object() { v } else { json!({}) }
 }
 
@@ -228,7 +225,7 @@ fn write_entry(st: &AppState, key: &str, entry: Value) {
         let tasks = obj.entry("tasks".to_string()).or_insert_with(|| json!({}));
         tasks[key] = entry;
     }
-    let _ = fs_utils::write_json(&state_path(st), &root);
+    let _ = crate::store::db(&st.data_dir).kv_set("scheduler_state", &root);
 }
 
 /// 结果 JSON → 单行摘要（签到轮次取 ok/already/failed 计数，其余截断展示）

@@ -447,10 +447,10 @@ pub fn settings_get(state: State<AppState>) -> Settings {
 
 #[tauri::command]
 pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<(), String> {
-    let path = state.path("app_settings.json");
-    // 读取现有设置，合并 patch 中出现的字段（真正的 patch 语义）
-    let mut current: serde_json::Value = fs_utils::read_json(&path);
-    // 文件不存在或内容为 null 时初始化为空对象，避免 patch 被丢弃
+    // SQLite 化（P2）：app_settings 入 kv 文档（patch 合并语义不变）
+    let store = crate::store::db(&state.data_dir);
+    let mut current: serde_json::Value = store.kv_get("app_settings");
+    // 内容为 null 时初始化为空对象，避免 patch 被丢弃
     if !current.is_object() {
         current = serde_json::json!({});
     }
@@ -461,7 +461,7 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
             current_obj.insert(k.clone(), v.clone());
         }
     }
-    fs_utils::write_json(&path, &current)
+    store.kv_set("app_settings", &current)
 }
 
 // ---------------- 积分历史（供看板/趋势图） ----------------

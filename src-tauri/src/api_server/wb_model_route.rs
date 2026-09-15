@@ -19,9 +19,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// 路由配置文件名（data/wb_model_route.json）
-pub const ROUTE_FILE: &str = "wb_model_route.json";
-
 /// 内置后缀：剥离后注入 reasoning_effort（§5.6 effort 降级链仍会按目录校验）
 pub const BUILTIN_THINKING_SUFFIX: &str = "-thinking";
 pub const BUILTIN_THINKING_EFFORT: &str = "high";
@@ -71,20 +68,10 @@ impl RouteResult {
 }
 
 /// 读取路由配置；缺失/损坏 → 空配置（四级中 ①②④ 用户部分退化为内置层）。
-/// data/ 新路径优先，不存在时回退旧根路径（存量用户数据兼容）；
-/// 写入方（配置命令）负责落盘到 data/ 新路径
+/// SQLite 化（P2）：data/wb_model_route.json → kv `wb_model_route`（热路径单行读取）；
+/// 旧根路径兼容由启动迁移器完成。
 pub fn load_config(data_dir: &Path) -> WbRouteFile {
-    let new_path = data_dir.join("data").join(ROUTE_FILE);
-    if let Some(cfg) = crate::fs_utils::read_json_cached::<WbRouteFile>(&new_path) {
-        return cfg;
-    }
-    if !new_path.exists() {
-        let legacy = data_dir.join(ROUTE_FILE);
-        if legacy.exists() {
-            return crate::fs_utils::read_json_cached::<WbRouteFile>(&legacy).unwrap_or_default();
-        }
-    }
-    WbRouteFile::default()
+    crate::store::db(data_dir).kv_get("wb_model_route")
 }
 
 /// 内置系列通配（③）：知名闭源模型族 → 目录代表模型。
@@ -478,9 +465,9 @@ mod tests {
         assert_eq!(inject_effort_hint(&body, &None), body);
     }
 
-    /// 配置读取迁移：data/ 新路径优先，缺失回退旧根路径，全缺失为空配置
+    /// 配置读取（SQLite 化 P2）：kv 缺失 → 空配置；写入后可读回
     #[test]
-    fn load_config_reads_data_subdir_with_legacy_fallback() {
+    fn load_config_kv_roundtrip() {
         let dir = std::env::temp_dir().join(format!(
             "twa_route_{}_{}",
             std::process::id(),
@@ -490,26 +477,22 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(dir.join("data")).unwrap();
-        // 双路径全缺失 → 空配置
+        // kv 缺失 → 空配置
         let empty = load_config(&dir);
         assert!(empty.aliases.is_empty() && empty.rules.is_empty());
-        // 仅旧根路径存在 → 回退读取（存量用户数据兼容）
-        std::fs::write(
-            dir.join(ROUTE_FILE),
-            json!({"aliases": {"gpt-4o": "glm-5.3"}}).to_string(),
-        )
-        .unwrap();
+        // 写入 kv → 读回
+        crate::store::db(&dir)
+            .kv_set("wb_model_route", &json!({"aliases": {"gpt-4o": "glm-5.3"}}))
+            .unwrap();
         let cfg = load_config(&dir);
         assert_eq!(cfg.aliases.get("gpt-4o").map(String::as_str), Some("glm-5.3"));
-        // data/ 新路径存在 → 优先于旧路径
-        std::fs::write(
-            dir.join("data").join(ROUTE_FILE),
-            json!({"aliases": {"claude-x": "hy4"}}).to_string(),
-        )
-        .unwrap();
+        // 覆盖写入生效
+        crate::store::db(&dir)
+            .kv_set("wb_model_route", &json!({"aliases": {"claude-x": "hy4"}}))
+            .unwrap();
         let cfg = load_config(&dir);
         assert!(cfg.aliases.contains_key("claude-x"));
-        assert!(!cfg.aliases.contains_key("gpt-4o"), "新路径存在时不再回退旧路径");
+        assert!(!cfg.aliases.contains_key("gpt-4o"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

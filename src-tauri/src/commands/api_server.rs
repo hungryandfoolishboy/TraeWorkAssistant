@@ -58,7 +58,8 @@ pub async fn do_start(
 
     // 读取账号数据、冷却状态、剩余积分（账号经 vault 解密还原明文 jwt）
     let accounts = crate::vault::load_accounts(state);
-    let pool_file: ApiPoolFile = fs_utils::read_json(&state.path("api_pool.json"));
+    // SQLite 化（P2）：api_pool.json → kv `api_pool`
+    let pool_file: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
     let groups_file: crate::models::GroupsFile = fs_utils::read_json(&state.path("groups.json"));
     let cooldowns_file: AccountCooldownsFile =
         fs_utils::read_json(&state.path("account_cooldowns.json"));
@@ -374,7 +375,7 @@ pub fn api_server_status(
 
 #[tauri::command]
 pub fn pool_list(state: State<'_, AppState>) -> ApiPoolFile {
-    fs_utils::read_json(&state.path("api_pool.json"))
+    crate::store::db(&state.data_dir).kv_get("api_pool")
 }
 
 /// pool_set 字段合并（纯函数，便于单测）：未传（None）保留 existing 原值，传值覆盖。
@@ -438,7 +439,7 @@ pub fn pool_set(
     pool_sticky_ttl_secs: Option<u64>,
     wb_sticky_ttl_secs: Option<u64>,
 ) -> Result<(), String> {
-    let existing: ApiPoolFile = fs_utils::read_json(&state.path("api_pool.json"));
+    let existing: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
     let pool_file = merge_pool_set(
         &existing,
         uids,
@@ -455,7 +456,7 @@ pub fn pool_set(
         pool_sticky_ttl_secs,
         wb_sticky_ttl_secs,
     );
-    fs_utils::write_json(&state.path("api_pool.json"), &pool_file)?;
+    crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     // 热应用：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
     if let Some(rt) = safe_lock(&runtime).as_ref() {
         rt.shared
@@ -712,7 +713,7 @@ pub fn api_unified_models(
             )
         }
         None => {
-            let pf: ApiPoolFile = fs_utils::read_json(&state.path("api_pool.json"));
+            let pf: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
             (pf.wb_enabled, true, true)
         }
     };

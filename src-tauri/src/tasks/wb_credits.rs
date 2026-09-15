@@ -506,8 +506,8 @@ fn filter_accounts(v: Value, uid: &str, key: &str) -> Value {
 /// 回写缓存。返回值即原 python stdout 末行 JSON（credits.rs 消费契约）。
 pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Result<Value, String> {
     let agent = http_agent(30);
-    let cache_path = wb_common::credits_cache_path(state);
-    let cache: Value = fs_utils::read_json(&cache_path);
+    let store = crate::store::db(&state.data_dir);
+    let cache: Value = store.kv_get("workbuddy_credits_cache");
     let fetched_ts = cache.get("fetched_ts").and_then(Value::as_f64).unwrap_or(0.0);
     let cache_ok = fetched_ts > 0.0;
 
@@ -566,8 +566,8 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
     });
     // 缓存回写（池级）：至少一个账号成功才回写，全失败保留旧缓存作回退数据源
     if any_ok || results.is_empty() {
-        let _ = fs_utils::write_json(
-            &cache_path,
+        let _ = store.kv_set(
+            "workbuddy_credits_cache",
             &json!({
                 "fetched_ts": now_secs(),
                 "fetched_at": fs_utils::now_ts(),

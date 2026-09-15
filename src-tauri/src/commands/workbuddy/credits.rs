@@ -133,10 +133,10 @@ pub fn workbuddy_editions_backfill(state: State<AppState>) -> Result<usize, Stri
     Ok(backfill_edition_from_payment_type(&state))
 }
 
-/// 追加每日积分余额快照（F-27）：workbuddy_credits_history.json，同日覆盖最新
+/// 追加每日积分余额快照（F-27）：kv `workbuddy_credits_history`，同日覆盖最新
 fn append_credits_snapshot(state: &AppState, parsed: &Value) {
-    let path = state.data_dir.join("data").join("workbuddy_credits_history.json");
-    let mut hist: Value = fs_utils::read_json(&path);
+    let store = crate::store::db(&state.data_dir);
+    let mut hist: Value = store.kv_get("workbuddy_credits_history");
     if !hist.is_object() {
         hist = serde_json::json!({});
     }
@@ -174,7 +174,7 @@ fn append_credits_snapshot(state: &AppState, parsed: &Value) {
             list.drain(..len - 365);
         }
     }
-    let _ = fs_utils::write_json(&path, &hist);
+    let _ = store.kv_set("workbuddy_credits_history", &hist);
 }
 
 // ── 积分用量快照回退（T4.3/F-27）────────────────────────────────────────────
@@ -184,7 +184,7 @@ fn append_credits_snapshot(state: &AppState, parsed: &Value) {
 /// 负差值（充值包到账/快照波动）记 0。口径明示「快照回退」，非官方逐请求统计。
 #[tauri::command]
 pub fn workbuddy_usage_fallback(state: State<AppState>) -> Result<serde_json::Value, String> {
-    let hist: Value = fs_utils::read_json(&state.data_dir.join("data").join("workbuddy_credits_history.json"));
+    let hist: Value = crate::store::db(&state.data_dir).kv_get("workbuddy_credits_history");
     let snapshots = hist.get("snapshots").and_then(Value::as_array).cloned().unwrap_or_default();
     if snapshots.len() < 2 {
         return Err(
@@ -321,7 +321,7 @@ pub fn workbuddy_usage_official(
     user_id: Option<String>,
     refresh: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    let cache_path = state.data_dir.join("data").join("workbuddy_usage_official_cache.json");
+    let cache_path = "workbuddy_usage_official_cache"; // kv 键（SQLite 化 P2）
 
     // 选号：user_id → auth 文件当前账号 → 首个有 token store 凭证的账号
     //（审查 P1：选号解析提到缓存命中判断之前——缓存按账号区分，命中须同账号）
@@ -354,7 +354,7 @@ pub fn workbuddy_usage_official(
     // 不一致或旧缓存缺 account_id 一律视为未命中，重新按当前账号拉取。
     // F-59 stale-on-error：过期缓存保留一份，拉取失败时降级回退（见下方 fail 闭包）。
     let cached_val: Option<serde_json::Value> = {
-        let c: serde_json::Value = fs_utils::read_json(&cache_path);
+        let c: serde_json::Value = crate::store::db(&state.data_dir).kv_get(cache_path);
         (c.get("status").is_some()).then_some(c)
     };
     if !refresh.unwrap_or(false) {
@@ -387,7 +387,7 @@ pub fn workbuddy_usage_official(
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
-    let _ = fs_utils::write_json(&cache_path, &payload);
+    let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
     fs_utils::app_log(
         &state.data_dir,
         &format!(
@@ -575,9 +575,9 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
 /// 聚合结果缓存 10 分钟（跨账号全量拉取代价高，避免看板每次刷新都打满分页请求）。
 #[tauri::command(async)]
 pub fn workbuddy_usage_official_all(state: State<AppState>) -> Result<serde_json::Value, String> {
-    let cache_path = state.data_dir.join("data").join("workbuddy_usage_official_all_cache.json");
+    let cache_path = "workbuddy_usage_official_all_cache"; // kv 键（SQLite 化 P2）
     let cached_val: Option<Value> = {
-        let c: Value = fs_utils::read_json(&cache_path);
+        let c: Value = crate::store::db(&state.data_dir).kv_get(cache_path);
         (c.get("status").is_some()).then_some(c)
     };
     if let Some(cached) = &cached_val {
@@ -688,7 +688,7 @@ pub fn workbuddy_usage_official_all(state: State<AppState>) -> Result<serde_json
         },
         "daily": daily_out,
     });
-    let _ = fs_utils::write_json(&cache_path, &payload);
+    let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
     fs_utils::app_log(
         &state.data_dir,
         &format!("workbuddy: 全账号官方用量聚合（{ok}/{} 账号，{} 行）", list.len(), req_total),
@@ -718,7 +718,7 @@ pub fn workbuddy_activity_info(
     user_id: Option<String>,
     refresh: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    let cache_path = state.data_dir.join("data").join("workbuddy_activity_cache.json");
+    let cache_path = "workbuddy_activity_cache"; // kv 键（SQLite 化 P2）
 
     // 选号逻辑与 workbuddy_usage_official 一致（复用同一降级链）
     //（审查 P1：选号解析提到缓存命中判断之前——缓存按账号区分，命中须同账号）
@@ -749,7 +749,7 @@ pub fn workbuddy_activity_info(
     // 缓存命中条件（审查 P1）：10min 内 + 缓存 account_id 与本次解析账号一致
     //（无凭证时解析结果为 None，与无凭证缓存 payload 的 account_id=null 对齐）
     if !refresh.unwrap_or(false) {
-        let cached: serde_json::Value = fs_utils::read_json(&cache_path);
+        let cached: serde_json::Value = crate::store::db(&state.data_dir).kv_get(cache_path);
         let fetched = cached.get("fetched_at_ms").and_then(Value::as_i64).unwrap_or(0);
         let cached_acct = cached.get("account_id").and_then(Value::as_str);
         if cached.get("account_id").is_some()
@@ -813,7 +813,7 @@ pub fn workbuddy_activity_info(
         "errors": errors,
         "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
     });
-    let _ = fs_utils::write_json(&cache_path, &payload);
+    let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
     Ok(payload)
 }
 

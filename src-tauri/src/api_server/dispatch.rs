@@ -112,15 +112,10 @@ impl Default for DispatchPolicy {
     }
 }
 
-fn policy_path(data_dir: &Path) -> std::path::PathBuf {
-    data_dir.join("data").join("dispatch_policy.json")
-}
-
-/// 读取调度策略：缺失/损坏回退默认（不落盘——首次 set 时才写，保持数据目录干净）。
-/// 带解析缓存（每请求热路径），write_json 逐出 + mtime 兜底保证新鲜。
+/// 读取调度策略：缺失/损坏回退默认（不落盘——首次 set 时才写，保持数据干净）。
+/// SQLite 化（P2）：kv 文档直读（单行 SELECT+解析 µs 级，替代原 mtime 解析缓存）。
 pub fn load_policy(data_dir: &Path) -> DispatchPolicy {
-    let mut p: DispatchPolicy =
-        crate::fs_utils::read_json_cached(&policy_path(data_dir)).unwrap_or_default();
+    let mut p: DispatchPolicy = crate::store::db(data_dir).kv_get("dispatch_policy");
     // 防御：优先级数组非法值过滤 + 空数组回退默认
     let valid: Vec<String> = p
         .priority
@@ -149,7 +144,7 @@ pub fn save_policy(data_dir: &Path, policy: &DispatchPolicy) -> Result<(), Strin
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    crate::fs_utils::write_json(&policy_path(data_dir), &p)
+    crate::store::db(data_dir).kv_set("dispatch_policy", &p)
 }
 
 // ==================== 选池决策（§4.3/§4.4） ====================
@@ -586,15 +581,13 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(dir.join("data")).unwrap();
+        // SQLite 化（P2）：测试种子改走 kv（api_models / wb_model_catalog / dispatch_policy）
+        let st = crate::store::db(&dir);
         let trae: Vec<Value> = trae_models
             .iter()
             .map(|id| json!({"id": id, "label": id}))
             .collect();
-        std::fs::write(
-            dir.join("data").join("api_models.json"),
-            serde_json::to_string(&trae).unwrap(),
-        )
-        .unwrap();
+        st.kv_set("api_models", &trae).unwrap();
         if let Some(wb) = wb_models {
             let list: Vec<Value> = wb
                 .iter()
@@ -604,18 +597,10 @@ mod tests {
                            "supported_efforts": ["low","medium","high"], "rate": 0.5})
                 })
                 .collect();
-            std::fs::write(
-                dir.join("data").join("wb_model_catalog.json"),
-                json!({"models": list}).to_string(),
-            )
-            .unwrap();
+            st.kv_set("wb_model_catalog", &json!({"models": list})).unwrap();
         }
         if let Some(p) = policy {
-            std::fs::write(
-                dir.join("data").join("dispatch_policy.json"),
-                serde_json::to_string(p).unwrap(),
-            )
-            .unwrap();
+            st.kv_set("dispatch_policy", p).unwrap();
         }
         let state = Arc::new(ApiSharedState {
             pool: super::super::pool::ApiPool::new(),
@@ -906,11 +891,7 @@ mod tests {
         assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
         // 策略热改为 trae 优先
         p.priority = vec!["trae".into(), "buddy".into()];
-        std::fs::write(
-            f.dir.join("data").join("dispatch_policy.json"),
-            serde_json::to_string(&p).unwrap(),
-        )
-        .unwrap();
+        crate::store::db(&f.dir).kv_set("dispatch_policy", &p).unwrap();
         // 同一会话（消息指纹相同）→ 沿用 Buddy
         assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
     }
@@ -949,11 +930,7 @@ mod tests {
         let mut p = policy_default();
         p.strategy = DispatchStrategy::Priority;
         p.priority = vec!["trae".into(), "buddy".into()];
-        std::fs::write(
-            f.dir.join("data").join("dispatch_policy.json"),
-            serde_json::to_string(&p).unwrap(),
-        )
-        .unwrap();
+        crate::store::db(&f.dir).kv_set("dispatch_policy", &p).unwrap();
         let b = resolve_target(
             &f.state,
             "glm-5.3",
@@ -994,12 +971,10 @@ mod tests {
         let p = load_policy(&dir);
         assert_eq!(p.priority, vec!["buddy".to_string(), "trae".to_string()]);
         assert!(p.fallback);
-        // 非法值
-        std::fs::write(
-            dir.join("data").join("dispatch_policy.json"),
-            json!({"priority": ["wb", "", "trae"], "fallback": false}).to_string(),
-        )
-        .unwrap();
+        // 非法值（kv 直写）
+        crate::store::db(&dir)
+            .kv_set("dispatch_policy", &json!({"priority": ["wb", "", "trae"], "fallback": false}))
+            .unwrap();
         let p = load_policy(&dir);
         assert_eq!(p.priority, vec!["trae".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1118,11 +1093,9 @@ mod tests {
     fn t29_smart_lower_rate_wins() {
         let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
         // 给 Trae 侧 api_models 条目补 rate=0.3（fixture 默认不带 rate）
-        std::fs::write(
-            f.dir.join("data").join("api_models.json"),
-            json!([{"id": "glm-5.3", "label": "glm-5.3", "rate": 0.3}]).to_string(),
-        )
-        .unwrap();
+        crate::store::db(&f.dir)
+            .kv_set("api_models", &json!([{"id": "glm-5.3", "label": "glm-5.3", "rate": 0.3}]))
+            .unwrap();
         f.seed_healthy(true);
         f.seed_healthy(false);
         assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Trae);

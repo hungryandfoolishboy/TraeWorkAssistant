@@ -1301,7 +1301,7 @@ fn record_daily_snapshot(
 
     // 优先口径：consumed = 用量接口今日合计；earned = total - 昨日total + consumed
     let usage_cache: serde_json::Value =
-        fs_utils::read_json(&state.data_dir.join("data").join("usage_history.json"));
+        crate::store::db(&state.data_dir).kv_get("usage_history");
     let mut usage_consumed: Option<f64> = None;
     if let Some(accs) = usage_cache.get("accounts").and_then(|v| v.as_object()) {
         let mut sum = 0.0;

@@ -559,10 +559,6 @@ fn scan_root(
     })
 }
 
-fn cache_path(state: &AppState) -> PathBuf {
-    state.data_dir.join("data").join("token_stats_files.json")
-}
-
 /// 本地 Token 统计（F-26/F-57）：合并 ~/.workbuddy/projects 与 ~/.codebuddy/projects，
 /// 固定回看 365 天（热力图数据源）；时间/模型/范围筛选由前端从 daily_by_model 派生。
 /// 性能（F-59）：按文件增量缓存（mtime+size 不变零解析）+ 结果级 10 分钟缓存；
@@ -584,7 +580,7 @@ pub fn workbuddy_token_stats(state: State<AppState>, fresh: Option<bool>) -> Val
     let cutoff = cutoff_date_str();
 
     let mut cache: HashMap<String, FileCacheEntry> =
-        crate::fs_utils::read_json(&cache_path(&state));
+        crate::store::db(&state.data_dir).kv_get("token_stats_files");
     let mut seen: HashSet<String> = HashSet::new();
 
     let mut merged = scan_root(
@@ -604,7 +600,7 @@ pub fn workbuddy_token_stats(state: State<AppState>, fresh: Option<bool>) -> Val
 
     // 已删除文件的缓存条目清理
     cache.retain(|k, _| seen.contains(k));
-    let _ = crate::fs_utils::write_json(&cache_path(&state), &cache);
+    let _ = crate::store::db(&state.data_dir).kv_set("token_stats_files", &cache);
 
     // 合并双源：summary/daily/models/projects/daily_by_model 累加
     merge_totals(merged.get_mut("summary"), second.get("summary"));

@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::fs_utils;
 use crate::models::Settings;
 
 /// 应用数据目录名（品牌 ai-work-assistant）
@@ -207,8 +206,9 @@ impl AppState {
     }
 
     pub fn settings(&self) -> Settings {
-        // 统一走 fs_utils::read_json：文件缺失/为空/解析失败均回退默认，行为一致
-        let mut s: Settings = fs_utils::read_json(&self.conf_path("app_settings.json"));
+        // SQLite 化（docs/sqllite-storage-plan.md P2）：kv 文档读取，
+        // 缺失/为空/解析失败均回退默认（与原 fs_utils::read_json 语义一致）
+        let mut s: Settings = crate::store::db(&self.data_dir).kv_get("app_settings");
         // proxy_domains 为空时回填默认值，确保设置页始终展示默认监听域名；
         // 仍为旧默认（未含 doubao.com）时也迁移到新默认（用户未自定义过才替换）
         if s.proxy_domains.trim().is_empty()

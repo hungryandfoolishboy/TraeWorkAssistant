@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// 单个模型的能力声明
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,10 +123,6 @@ pub fn builtin() -> Vec<WbModel> {
 /// 目录文件路径（data/wb_model_catalog.json，§3.8）。
 /// 数据文件统一 data/ 子目录（与 api_models/api_keys/api_usage 同层）；
 /// Buddy 侧不保历史（§9.4 #7）：旧根目录位置不迁移，缺失即内置兜底重建
-pub fn catalog_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("data").join("wb_model_catalog.json")
-}
-
 /// 内置表版本：倍率等快照更新时 +1。由旧版本内置表自动落盘的目录（fetched_at 为空且
 /// builtin_rev 低于当前值）会按新内置表重建，使倍率修正对存量安装生效；
 /// 上游同步写入的目录（fetched_at 非空）不受影响。人工维护的目录请把 builtin_rev
@@ -144,13 +140,13 @@ pub struct WbCatalogFile {
     pub builtin_rev: u32,
 }
 
-/// 加载目录：wb_model_catalog.json 优先（动态替换结果 / 人工维护），
-/// 缺失或为空时落盘内置表并返回内置表
+/// 加载目录：kv `wb_model_catalog` 优先（动态替换结果 / 人工维护），
+/// 缺失或为空时落盘内置表并返回内置表。
+/// SQLite 化（P2）：原 data/wb_model_catalog.json → kv 键（热路径单行读取替代解析缓存）。
 pub fn load(data_dir: &Path) -> Vec<WbModel> {
-    let path = catalog_path(data_dir);
-    // 带解析缓存（每请求热路径）：write_json 逐出 + mtime 兜底保证新鲜；
-    // 缓存未命中/缺失/为空才走内置表落盘自愈
-    if let Some(file) = crate::fs_utils::read_json_cached::<WbCatalogFile>(&path) {
+    if let Some(file) = crate::store::db(data_dir).kv_get_raw("wb_model_catalog")
+        .and_then(|t| serde_json::from_str::<WbCatalogFile>(&t).ok())
+    {
         if !file.models.is_empty() {
             // 上游同步结果优先保留；否则旧版本内置表落盘的目录按新内置表重建
             if file.fetched_at.is_some() || file.builtin_rev >= BUILTIN_REV {
@@ -159,8 +155,8 @@ pub fn load(data_dir: &Path) -> Vec<WbModel> {
         }
     }
     let builtin = builtin();
-    let _ = crate::fs_utils::write_json(
-        &path,
+    let _ = crate::store::db(data_dir).kv_set(
+        "wb_model_catalog",
         &WbCatalogFile {
             models: builtin.clone(),
             fetched_at: None,
@@ -298,20 +294,21 @@ pub fn fetch_and_replace(
         return Err("上游目录解析产出 0 个模型（响应结构与预期不符），本地目录保持不变".into());
     }
     let count = models.len();
-    crate::fs_utils::write_json(
-        &catalog_path(data_dir),
-        &WbCatalogFile {
-            models,
-            fetched_at: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-            ),
-            ..Default::default()
-        },
-    )
-    .map_err(|e| format!("写目录文件失败: {e}"))?;
+    crate::store::db(data_dir)
+        .kv_set(
+            "wb_model_catalog",
+            &WbCatalogFile {
+                models,
+                fetched_at: Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                ),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("写目录失败: {e}"))?;
     Ok(count)
 }
 

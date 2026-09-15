@@ -29,13 +29,6 @@ pub fn token_store_path(state: &AppState) -> PathBuf {
         .join("workbuddy_token_store.json")
 }
 
-pub fn credits_cache_path(state: &AppState) -> PathBuf {
-    state
-        .data_dir
-        .join("data")
-        .join("workbuddy_credits_cache.json")
-}
-
 /// 签到结果 90 天滚动存储文件（workbuddy_checkin_results.json）
 pub fn checkin_results_path(state: &AppState) -> PathBuf {
     state

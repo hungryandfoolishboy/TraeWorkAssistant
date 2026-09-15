@@ -174,8 +174,9 @@ pub struct OAuthDevice {
 /// 注意：不回写 device_map.json——DeviceEntry 三元组（device_id/market_user_id/session_id）
 /// 与 OAuth 二元组字段语义不同，部分写入会破坏签到脚本的完整三元组假设。
 fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
-    let path = state.path("oauth_device.json");
-    let mut dev: OAuthDevice = fs_utils::read_json(&path);
+    // SQLite 化（P2）：oauth_device.json → kv `oauth_device`
+    let store = crate::store::db(&state.data_dir);
+    let mut dev: OAuthDevice = store.kv_get("oauth_device");
     if dev.machine_id.is_empty() || dev.device_id.is_empty() {
         if dev.device_id.is_empty() {
             let map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
@@ -197,7 +198,7 @@ fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
                 .collect();
         }
         // 写回失败不阻断登录（下次重新生成，仅损失一次稳定性）
-        let _ = fs_utils::write_json(&path, &dev);
+        let _ = store.kv_set("oauth_device", &dev);
     }
     dev
 }

@@ -585,8 +585,8 @@ pub fn run(state: &AppState, sync_only: bool, url_override: Option<&str>) -> Res
             "logs": logs,
         })
     };
-    let result_path = state.data_path("doubao_renew_result.json");
-    crate::fs_utils::write_json(&result_path, &summary)?;
+    // SQLite 化（P2）：doubao_renew_result.json → kv `doubao_renew_result`
+    crate::store::db(&state.data_dir).kv_set("doubao_renew_result", &summary)?;
     Ok(summary)
 }
 

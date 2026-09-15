@@ -14,8 +14,7 @@ use serde_json::Value;
 use tauri::State;
 
 use crate::api_server::wb_model_route::{self, WbRouteFile};
-use crate::api_server::wb_payload::{self, TemplateMapFile};
-use crate::fs_utils;
+use crate::api_server::wb_payload::TemplateMapFile;
 use crate::state::AppState;
 
 // ==================== 模型路由配置（data/wb_model_route.json） ====================
@@ -37,8 +36,8 @@ fn route_config_get_at(data_dir: &std::path::Path) -> Result<Value, String> {
 
 fn route_config_set_at(data_dir: &std::path::Path, config: &Value) -> Result<(), String> {
     validate_route_config(config)?;
-    let path = data_dir.join("data").join(wb_model_route::ROUTE_FILE);
-    fs_utils::write_json(&path, config)
+    // SQLite 化（P2）：data/wb_model_route.json → kv `wb_model_route`（写后网关热路径立即生效）
+    crate::store::db(data_dir).kv_set("wb_model_route", config)
 }
 
 /// 结构校验：形状必须与 wb_model_route::load_config 的反序列化（WbRouteFile）
@@ -67,13 +66,8 @@ pub fn wb_template_map_set(state: State<AppState>, map: Value) -> Result<(), Str
 }
 
 fn template_map_get_at(data_dir: &std::path::Path) -> Result<Value, String> {
-    let new_path = wb_payload::template_map_path(data_dir);
-    let effective = if new_path.exists() {
-        new_path
-    } else {
-        wb_payload::template_map_path_legacy(data_dir)
-    };
-    let file: TemplateMapFile = fs_utils::read_json(&effective);
+    // SQLite 化（P2）：kv `wb_template_map`
+    let file: TemplateMapFile = crate::store::db(data_dir).kv_get("wb_template_map");
     serde_json::to_value(file).map_err(|e| format!("序列化审核模板映射失败: {e}"))
 }
 
@@ -85,8 +79,7 @@ fn template_map_set_at(data_dir: &std::path::Path, map: &Value) -> Result<(), St
     }
     serde_json::from_value::<TemplateMapFile>(map.clone())
         .map_err(|e| format!("审核模板映射格式不正确（templates[].from/to 均为必填字符串）: {e}"))?;
-    let path = wb_payload::template_map_path(data_dir);
-    fs_utils::write_json(&path, map)
+    crate::store::db(data_dir).kv_set("wb_template_map", map)
 }
 
 #[cfg(test)]
@@ -121,20 +114,18 @@ mod tests {
         let dir = tmp_dir("tpl_invalid");
         assert!(template_map_set_at(&dir, &json!({"templates": [{"from": "a"}]})).is_err());
         assert!(template_map_set_at(&dir, &json!([1, 2])).is_err());
-        // 拒绝后不得落盘
-        assert!(!dir.join("data").join("wb_template_map.json").exists());
+        // 拒绝后不得落库
+        assert!(crate::store::db(&dir).kv_get_raw("wb_template_map").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 临时目录写后可读回（落盘 data/ 新路径，get 走同一读取语义）
+    /// 写后可读回（SQLite 化 P2：kv `wb_template_map`，get/set 走同一读取语义）
     #[test]
     fn template_map_set_then_get_roundtrip() {
         let dir = tmp_dir("tpl_roundtrip");
-        // write_json 在目标同目录落临时文件，data/ 子目录须先存在（生产由 AppState 初始化创建）
-        std::fs::create_dir_all(dir.join("data")).unwrap();
         let map = json!({"templates": [{"from": "a", "to": "b"}], "updated_at": 123});
         template_map_set_at(&dir, &map).unwrap();
-        assert!(dir.join("data").join("wb_template_map.json").exists());
+        assert!(crate::store::db(&dir).kv_get_raw("wb_template_map").is_some());
         let got = template_map_get_at(&dir).unwrap();
         assert_eq!(got["templates"][0]["from"], json!("a"));
         assert_eq!(got["templates"][0]["to"], json!("b"));
@@ -146,10 +137,9 @@ mod tests {
     #[test]
     fn route_config_set_then_get_roundtrip() {
         let dir = tmp_dir("route_roundtrip");
-        std::fs::create_dir_all(dir.join("data")).unwrap();
         let cfg = json!({"aliases": {"claude-x": "glm-5.3"}, "rules": [], "suffixes": []});
         route_config_set_at(&dir, &cfg).unwrap();
-        assert!(dir.join("data").join("wb_model_route.json").exists());
+        assert!(crate::store::db(&dir).kv_get_raw("wb_model_route").is_some());
         let got = route_config_get_at(&dir).unwrap();
         assert_eq!(got["aliases"]["claude-x"], json!("glm-5.3"));
 

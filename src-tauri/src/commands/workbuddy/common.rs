@@ -52,10 +52,6 @@ pub(super) fn token_store_path(state: &AppState) -> PathBuf {
     state.data_dir.join("data").join("workbuddy_token_store.json")
 }
 
-fn settings_path(state: &AppState) -> PathBuf {
-    state.data_dir.join("data").join("workbuddy_settings.json")
-}
-
 pub(super) fn checkin_results_path(state: &AppState) -> PathBuf {
     state.data_dir.join("data").join("workbuddy_checkin_results.json")
 }
@@ -226,7 +222,8 @@ pub(super) fn save_pool(state: &AppState, pool: &WbPool) -> Result<(), String> {
 }
 
 pub(super) fn load_settings(state: &AppState) -> WorkBuddySettings {
-    let mut s: WorkBuddySettings = fs_utils::read_json(&settings_path(state));
+    // SQLite 化（P2）：workbuddy_settings.json → kv `workbuddy_settings`
+    let mut s: WorkBuddySettings = crate::store::db(&state.data_dir).kv_get("workbuddy_settings");
     // 审查 P2：单字段非法只钳制该字段为默认值，不再整体 with_defaults() 重置
     //（避免损坏一个字段连带丢掉轮换/通知等其余配置）
     if s.lazy_refresh_hours <= 0 {
@@ -236,9 +233,9 @@ pub(super) fn load_settings(state: &AppState) -> WorkBuddySettings {
 }
 
 /// 失败通知统一入口（F-19）：桌面通知（有 AppHandle 时）+ 企业微信/Server酱可选渠道。
-/// 渠道配置来自 workbuddy_settings.json；渠道失败静默记日志，不影响主流程。
+/// 渠道配置来自 kv `workbuddy_settings`；渠道失败静默记日志，不影响主流程。
 pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &str, body: &str) {
-    let s: WorkBuddySettings = fs_utils::read_json(&data_dir.join("data").join("workbuddy_settings.json"));
+    let s: WorkBuddySettings = crate::store::db(data_dir).kv_get("workbuddy_settings");
     let channels = crate::notify::NotifyChannels {
         wechat_webhook: s.notify_wechat_webhook.clone().filter(|x| !x.trim().is_empty()),
         serverchan_sendkey: s.notify_serverchan_sendkey.clone().filter(|x| !x.trim().is_empty()),
@@ -287,7 +284,7 @@ pub fn workbuddy_settings_get(state: State<AppState>) -> WorkBuddySettings {
 
 #[tauri::command]
 pub fn workbuddy_settings_set(state: State<AppState>, patch: WorkBuddySettings) -> Result<(), String> {
-    fs_utils::write_json(&settings_path(&state), &patch)
+    crate::store::db(&state.data_dir).kv_set("workbuddy_settings", &patch)
 }
 
 // ── 工具侧凭证副本写入（F-10 双源化）───────────────────────────────────────

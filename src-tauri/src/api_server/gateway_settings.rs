@@ -40,14 +40,6 @@ impl Default for GatewaySettings {
     }
 }
 
-fn settings_path(data_dir: &Path) -> std::path::PathBuf {
-    data_dir.join("data").join("api_gateway_settings.json")
-}
-
-fn app_settings_path(data_dir: &Path) -> std::path::PathBuf {
-    data_dir.join("conf").join("app_settings.json")
-}
-
 /// 规范化：default_model 空 → 内置默认
 fn normalized(mut s: GatewaySettings) -> GatewaySettings {
     if s.default_model.trim().is_empty() {
@@ -56,16 +48,18 @@ fn normalized(mut s: GatewaySettings) -> GatewaySettings {
     s
 }
 
-/// 读取网关设置；新文件缺失时从 app_settings.json 旧字段一次性迁移
-/// （迁移即落盘新文件；旧字段保留不删，防回滚，但不再读取）
+/// 读取网关设置；kv 文档缺失时从 kv `app_settings` 旧字段一次性迁移
+/// （迁移即落盘 kv；旧字段保留不删，防回滚，但不再读取）。
+/// SQLite 化（P2）：原 data/api_gateway_settings.json → kv 键 `api_gateway_settings`。
 pub fn load(data_dir: &Path) -> GatewaySettings {
-    let path = settings_path(data_dir);
-    if path.exists() {
-        let s: GatewaySettings = crate::fs_utils::read_json(&path);
-        return normalized(s);
+    let store = crate::store::db(data_dir);
+    if let Some(text) = store.kv_get_raw("api_gateway_settings") {
+        if let Ok(s) = serde_json::from_str::<GatewaySettings>(&text) {
+            return normalized(s);
+        }
     }
     // 一次性迁移：旧字段缺失/损坏均回退默认值（read_json 语义一致）
-    let legacy: serde_json::Value = crate::fs_utils::read_json(&app_settings_path(data_dir));
+    let legacy: serde_json::Value = store.kv_get("app_settings");
     let port = legacy
         .get("api_port")
         .and_then(|v| v.as_u64())
@@ -84,7 +78,7 @@ pub fn load(data_dir: &Path) -> GatewaySettings {
         updated_at: 0,
     });
     // 迁移落盘失败不阻塞启动（下次启动重试），内存值仍生效
-    let _ = crate::fs_utils::write_json(&path, &s);
+    let _ = store.kv_set("api_gateway_settings", &s);
     s
 }
 
@@ -98,7 +92,7 @@ pub fn save(data_dir: &Path, s: GatewaySettings) -> Result<(), String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    crate::fs_utils::write_json(&settings_path(data_dir), &s)
+    crate::store::db(data_dir).kv_set("api_gateway_settings", &s)
 }
 
 #[cfg(test)]
@@ -128,33 +122,28 @@ mod tests {
         std::fs::create_dir_all(dir.join("conf")).unwrap();
         std::fs::create_dir_all(dir.join("data")).unwrap();
         if let Some(v) = app_settings {
-            std::fs::write(dir.join("conf").join("app_settings.json"), v.to_string()).unwrap();
+            // SQLite 化（P2）：旧字段来源 = kv `app_settings`
+            crate::store::db(&dir).kv_set_raw("app_settings", &v.to_string()).unwrap();
         }
         Fixture { dir }
     }
 
-    /// 缺失迁移：app_settings 旧字段 → 新文件；旧文件原样保留（防回滚 §9.6）
+    /// 缺失迁移：app_settings 旧字段 → kv `api_gateway_settings`；旧键保留不删
     #[test]
     fn t01_migrates_from_app_settings_once() {
         let f = fixture(Some(json!({"api_port": 9000, "api_default_model": "glm-5.3"})));
         let s = load(&f.dir);
         assert_eq!(s.port, 9000);
         assert_eq!(s.default_model, "glm-5.3");
-        // 迁移即落盘
-        assert!(settings_path(&f.dir).exists());
+        // 迁移即落盘（kv）
+        assert!(crate::store::db(&f.dir).kv_get_raw("api_gateway_settings").is_some());
         // 旧字段保留不删
-        let legacy_text =
-            std::fs::read_to_string(f.dir.join("conf").join("app_settings.json")).unwrap();
-        assert!(legacy_text.contains("9000"));
-        // 二次读取走新文件（且改旧文件不再生效）
-        let mut legacy: serde_json::Value =
-            serde_json::from_str(&legacy_text).unwrap();
+        let legacy = crate::store::db(&f.dir).kv_get_raw("app_settings").unwrap();
+        assert!(legacy.contains("9000"));
+        // 二次读取走新键（且改旧键不再生效）
+        let mut legacy: serde_json::Value = serde_json::from_str(&legacy).unwrap();
         legacy["api_port"] = json!(7777);
-        std::fs::write(
-            f.dir.join("conf").join("app_settings.json"),
-            legacy.to_string(),
-        )
-        .unwrap();
+        crate::store::db(&f.dir).kv_set_raw("app_settings", &legacy.to_string()).unwrap();
         assert_eq!(load(&f.dir).port, 9000);
     }
 
@@ -165,10 +154,10 @@ mod tests {
         let s = load(&f.dir);
         assert_eq!(s.port, 7864);
         assert_eq!(s.default_model, "deepseek-v4-flash");
-        assert!(settings_path(&f.dir).exists());
+        assert!(crate::store::db(&f.dir).kv_get_raw("api_gateway_settings").is_some());
     }
 
-    /// 新文件存在 → 直接读新文件；save 往返 + updated_at
+    /// 已有配置 → 直接读 kv；save 往返 + updated_at
     #[test]
     fn t03_save_roundtrip() {
         let f = fixture(None);

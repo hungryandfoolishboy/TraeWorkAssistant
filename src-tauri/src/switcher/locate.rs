@@ -12,10 +12,8 @@ use std::path::{Path, PathBuf};
 use super::{profile, glob_match_ci, Session};
 
 pub fn find_exe(sess: &mut Session) -> Option<PathBuf> {
-    // 1) 用户显式配置：<data_dir>/conf/app_settings.json → settings_path_key（最高优先级）
-    let settings: serde_json::Value = crate::fs_utils::read_json(
-        &sess.data_dir.join("conf").join("app_settings.json"),
-    );
+    // 1) 用户显式配置：kv `app_settings` → settings_path_key（最高优先级；SQLite 化 P2）
+    let settings: serde_json::Value = crate::store::db(&sess.data_dir).kv_get("app_settings");
     if let Some(p) = settings.get(sess.prof.settings_path_key).and_then(|v| v.as_str()) {
         let p = PathBuf::from(p);
         if p.is_file() {
