@@ -173,8 +173,7 @@ impl StickyStore {
         );
     }
 
-    /// 清理全部过期绑定，返回清理条数（供后台定期调用/运维扩展）
-    #[allow(dead_code)]
+    /// 清理全部过期绑定，返回清理条数（save 落库前调用，控制绑定表无界增长）
     pub fn evict_expired(&self, now: i64) -> usize {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let before = map.len();
@@ -212,6 +211,9 @@ impl StickyStore {
                 }
             }
         }
+        // P6 流水化：落库前清理过期绑定（原实现过期项滞留内存/落盘缓慢增长）
+        let now_secs = chrono::Utc::now().timestamp();
+        self.evict_expired(now_secs);
         let file = {
             let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             serde_json::json!({
@@ -223,17 +225,17 @@ impl StickyStore {
                 })).collect::<Vec<_>>(),
             })
         };
-        if crate::store::db(data_dir).kv_set("wb_sticky_sessions", &file).is_ok() {
+        if crate::store::docs::sticky_bindings_save(&crate::store::db(data_dir), &file).is_ok() {
             let mut last = self.last_save.lock().unwrap_or_else(|e| e.into_inner());
             *last = Some(std::time::Instant::now());
         }
     }
 
     /// 启动时加载（过期的条目在 resolve 时自然失效）。
-    /// SQLite 化（P2）：data/wb_sticky_sessions.json → kv `wb_sticky_sessions`；
+    /// SQLite 化（P6）：wb_sticky_sessions → sticky_bindings 表；
     /// 旧根路径兼容由启动迁移器完成。
     pub fn load(data_dir: &std::path::Path) -> Self {
-        let file: serde_json::Value = crate::store::db(data_dir).kv_get("wb_sticky_sessions");
+        let file: serde_json::Value = crate::store::docs::sticky_bindings_load(&crate::store::db(data_dir));
         let mut map = HashMap::new();
         if let Some(list) = file.get("bindings").and_then(|b| b.as_array()) {
             for item in list {
@@ -367,18 +369,20 @@ mod tests {
         std::fs::create_dir_all(dir.join("data")).unwrap();
         let store = StickyStore::new();
         let key = SessionKey::from_body(&body_with(Some("c"), json!([{"role":"user","content":"x"}])));
-        store.bind(&key, "u1", "v1", 1000);
+        // P6：save 落库前会按真实时钟清理过期绑定 → 测试绑定也用真实时间
+        let now = chrono::Utc::now().timestamp();
+        store.bind(&key, "u1", "v1", now);
         store.save(&dir);
-        // SQLite 化（P2）：落盘 = kv `wb_sticky_sessions`
-        let snapshot1 = crate::store::db(&dir).kv_get_raw("wb_sticky_sessions");
-        assert!(snapshot1.is_some(), "落盘应写入 kv");
+        // SQLite 化（P6）：落盘 = sticky_bindings 表
+        let snapshot1 = crate::store::docs::sticky_bindings_load(&crate::store::db(&dir)).to_string();
+        assert!(snapshot1.contains("v1"), "落盘应写入 sticky_bindings 表");
         // 1s 内再次 bind + save：落盘被节流跳过，内容不变
-        store.bind(&key, "u2", "v2", 1006);
+        store.bind(&key, "u2", "v2", now + 6);
         store.save(&dir);
-        let snapshot2 = crate::store::db(&dir).kv_get_raw("wb_sticky_sessions");
-        assert_eq!(snapshot1, snapshot2, "距上次成功保存 <1000ms 应跳过落盘");
+        let snapshot2 = crate::store::docs::sticky_bindings_load(&crate::store::db(&dir)).to_string();
+        assert_eq!(snapshot1, snapshot2, "距上次成功保存 <1000ms 应跳过落库");
         // 内存态已更新（resolve 读到新绑定）
-        assert_eq!(store.resolve(&key, 1007).unwrap().uid, "u2");
+        assert_eq!(store.resolve(&key, now + 7).unwrap().uid, "u2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -394,21 +398,28 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(dir.join("data")).unwrap();
-        // SQLite 化（P2）：种子 = kv `wb_sticky_sessions`
-        crate::store::db(&dir)
-            .kv_set(
-                "wb_sticky_sessions",
-                &json!({"version": 1, "bindings": [
-                    {"key": "cid:legacy", "uid": "u9", "conv_id": "c9", "last_seen": 500, "explicit": true}
-                ]}),
-            )
-            .unwrap();
+        // SQLite 化（P6）：种子 = sticky_bindings 表
+        crate::store::docs::sticky_bindings_save(
+            &crate::store::db(&dir),
+            &json!({"version": 1, "bindings": [
+                {"key": "cid:legacy", "uid": "u9", "conv_id": "c9", "last_seen": 500, "explicit": true}
+            ]}),
+        )
+        .unwrap();
         let store = StickyStore::load(&dir);
         let key = SessionKey::Explicit("legacy".into());
-        assert_eq!(store.resolve(&key, 600).unwrap().conv_id, "c9");
-        // save 落 kv
+        // 种子 last_seen=500 为历史值（会过期失效），重新绑定到真实时钟后再验证
+        let now = chrono::Utc::now().timestamp();
+        store.bind(&key, "u9", "c9", now);
+        assert_eq!(store.resolve(&key, now + 1).unwrap().conv_id, "c9");
+        // save 落 sticky_bindings 表
         store.save(&dir);
-        assert!(crate::store::db(&dir).kv_get_raw("wb_sticky_sessions").is_some());
+        assert!(crate::store::db(&dir)
+            .with_conn(|c| {
+                let n: i64 = c.query_row("SELECT COUNT(*) FROM sticky_bindings", [], |r| r.get(0))?;
+                Ok(n > 0)
+            })
+            .unwrap_or(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

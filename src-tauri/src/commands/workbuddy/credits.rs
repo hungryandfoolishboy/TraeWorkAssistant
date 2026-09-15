@@ -133,13 +133,9 @@ pub fn workbuddy_editions_backfill(state: State<AppState>) -> Result<usize, Stri
     Ok(backfill_edition_from_payment_type(&state))
 }
 
-/// 追加每日积分余额快照（F-27）：kv `workbuddy_credits_history`，同日覆盖最新
+/// 追加每日积分余额快照（F-27）：SQLite 化 P6 → wb_credits_history 表，同日覆盖最新 + 365 天裁剪
 fn append_credits_snapshot(state: &AppState, parsed: &Value) {
     let store = crate::store::db(&state.data_dir);
-    let mut hist: Value = store.kv_get("workbuddy_credits_history");
-    if !hist.is_object() {
-        hist = serde_json::json!({});
-    }
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let accounts: Vec<Value> = parsed
         .get("accounts")
@@ -162,19 +158,11 @@ fn append_credits_snapshot(state: &AppState, parsed: &Value) {
         "total_balance": total,
         "accounts": accounts,
     });
-    let Some(obj) = hist.as_object_mut() else { return };
-    let arr = obj.entry("snapshots".to_string()).or_insert_with(|| serde_json::json!([]));
-    if let Some(list) = arr.as_array_mut() {
-        match list.iter().position(|s| s.get("date").and_then(Value::as_str) == Some(today.as_str())) {
-            Some(pos) => list[pos] = snap,
-            None => list.push(snap),
-        }
-        let len = list.len();
-        if len > 365 {
-            list.drain(..len - 365);
-        }
+    if let Err(e) = crate::store::docs::wb_credits_history_upsert(&store, &snap) {
+        fs_utils::app_log(&state.data_dir, &format!("workbuddy 积分快照写入失败: {e}"));
+        return;
     }
-    let _ = store.kv_set("workbuddy_credits_history", &hist);
+    let _ = crate::store::docs::wb_credits_history_prune(&store);
 }
 
 // ── 积分用量快照回退（T4.3/F-27）────────────────────────────────────────────
@@ -184,7 +172,7 @@ fn append_credits_snapshot(state: &AppState, parsed: &Value) {
 /// 负差值（充值包到账/快照波动）记 0。口径明示「快照回退」，非官方逐请求统计。
 #[tauri::command]
 pub fn workbuddy_usage_fallback(state: State<AppState>) -> Result<serde_json::Value, String> {
-    let hist: Value = crate::store::db(&state.data_dir).kv_get("workbuddy_credits_history");
+    let hist: Value = crate::store::docs::wb_credits_history_load(&crate::store::db(&state.data_dir));
     let snapshots = hist.get("snapshots").and_then(Value::as_array).cloned().unwrap_or_default();
     if snapshots.len() < 2 {
         return Err(

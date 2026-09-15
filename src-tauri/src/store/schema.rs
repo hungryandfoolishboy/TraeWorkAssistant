@@ -9,7 +9,7 @@
 
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// 行文档表白名单（rows_* 原语允许操作的表，防表名拼接注入）
 pub const ROW_TABLES: &[&str] = &[
@@ -138,6 +138,36 @@ const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS doubao_health_events (
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
         payload TEXT NOT NULL
+    )",
+    // P6 流水迁出：WB 每日积分快照（原 kv workbuddy_credits_history，同日覆盖 + 365 天）
+    "CREATE TABLE IF NOT EXISTS wb_credits_history (
+        date         TEXT PRIMARY KEY,
+        ts           INTEGER NOT NULL DEFAULT 0,
+        total_balance REAL NOT NULL DEFAULT 0,
+        accounts     TEXT NOT NULL DEFAULT '[]'
+    )",
+    // P6 流水迁出：消耗明细增量拉取缓存（原 kv usage_history，per-account/per-day 行）
+    "CREATE TABLE IF NOT EXISTS usage_history_accounts (
+        uid              TEXT PRIMARY KEY,
+        name             TEXT NOT NULL DEFAULT '',
+        last_fetch_end_ts INTEGER,
+        updated_at       TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    "CREATE TABLE IF NOT EXISTS usage_history_days (
+        uid  TEXT NOT NULL,
+        date TEXT NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (uid, date)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_usage_history_days_date ON usage_history_days(date)",
+    // P6 流水迁出：会话粘性绑定（原 kv wb_sticky_sessions；过期项落库前清理）
+    "CREATE TABLE IF NOT EXISTS sticky_bindings (
+        key        TEXT PRIMARY KEY,
+        uid        TEXT NOT NULL,
+        conv_id    TEXT NOT NULL DEFAULT '',
+        last_seen  INTEGER NOT NULL DEFAULT 0,
+        explicit   INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
     )",
     "CREATE INDEX IF NOT EXISTS idx_credits_history_date ON credits_history(date)",
     "CREATE INDEX IF NOT EXISTS idx_wb_checkin_results_date ON wb_checkin_results(date)",

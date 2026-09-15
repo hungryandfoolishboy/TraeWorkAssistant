@@ -267,7 +267,10 @@ pub fn usage_history_fetch(
     let fresh = fresh.unwrap_or(false);
     let now_ts = chrono::Local::now().timestamp();
     let accounts = crate::vault::load_accounts(&state);
-    let mut cache: CacheFile = crate::store::db(&state.data_dir).kv_get("usage_history");
+    let mut cache: CacheFile = serde_json::from_value(
+        crate::store::docs::usage_history_load(&crate::store::db(&state.data_dir)),
+    )
+    .unwrap_or_default();
 
     // 纯缓存读取（零网络；尚未拉取过的账号如实提示）
     if !fresh {
@@ -343,7 +346,9 @@ pub fn usage_history_fetch(
     }
 
     cache.fetched_at = Some(now_ts);
-    let _ = crate::store::db(&state.data_dir).kv_set("usage_history", &cache);
+    let _ = serde_json::to_value(&cache)
+        .map_err(|e| e.to_string())
+        .and_then(|v| crate::store::docs::usage_history_save(&crate::store::db(&state.data_dir), &v));
 
     let mut out = Vec::new();
     for a in &accounts.accounts {

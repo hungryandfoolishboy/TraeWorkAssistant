@@ -47,15 +47,20 @@
 
 ### 2.2 表模型（三组）
 
-#### ① KV 文档表（29 键）——content 保持原 serde JSON 结构，key = 文件名去 .json
+#### ① KV 文档表（26 键）——content 保持原 serde JSON 结构，key = 文件名去 .json
+
+> **P6 修订**：复审发现 `workbuddy_credits_history`（每日快照追加）、`usage_history`
+> （per-account/per-day 明细无界增长）、`wb_sticky_sessions`（会话绑定持续累积）三键
+> 为**流水型数据而非配置**，已迁出为表（见 ②③），并补齐原 JSON 时代缺失的裁剪
+> （usage_history 365 天 / sticky 绑定落库前 evict 过期项）。schema v2 含 v1→v2 增量迁移。
 
 ```sql
 CREATE TABLE kv (key TEXT PRIMARY KEY, content TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
 ```
 
-文件键（24）：`app_settings`、`api_pool`、`dispatch_policy`、`api_gateway_settings`、`api_models`、`wb_model_catalog`、`trae_model_meta`、`wb_model_route`、`wb_template_map`、`wb_sticky_sessions`、`checkin_summary`、`workbuddy_settings`、`workbuddy_credits_history`、`workbuddy_credits_cache`、`workbuddy_usage_official_cache`、`workbuddy_usage_official_all_cache`、`workbuddy_activity_cache`、`wb_cli_rotate_state`、`token_stats_files`、`doubao_renew_result`、`usage_history`、`oauth_device`、`scheduler_state`、`doubao_captured_credentials`（单对象凭据快照，MITM 捕获写 / 命令读，整存整取）。
-标量/元数据键（5）：`api_keys_auth_disabled`、`custom_models_updated_at`、`remaining_credits_updated_at`、`wb_tokens_meta`（version 闸门）、`doubao_pool_meta`（last_keepalive_at）。
+文件键（21）：`app_settings`、`api_pool`、`dispatch_policy`、`api_gateway_settings`、`api_models`、`wb_model_catalog`、`trae_model_meta`、`wb_model_route`、`wb_template_map`、`checkin_summary`、`workbuddy_settings`、`workbuddy_credits_cache`、`workbuddy_usage_official_cache`、`workbuddy_usage_official_all_cache`、`workbuddy_activity_cache`、`wb_cli_rotate_state`、`token_stats_files`、`doubao_renew_result`、`oauth_device`、`scheduler_state`、`doubao_captured_credentials`（单对象凭据快照，MITM 捕获写 / 命令读，整存整取）。
+标量/元数据键（5）：`api_keys_auth_disabled`、`custom_models_updated_at`、`remaining_credits_updated_at`、`wb_tokens_meta`（version 闸门）、`doubao_pool_meta`（last_keepalive_at）、`usage_history_meta`（fetched_at）。
 
 #### ② 行文档实体表（10 表）——(pk TEXT PRIMARY KEY, data TEXT NOT NULL JSON, updated_at)
 
@@ -85,6 +90,10 @@ CREATE TABLE kv (key TEXT PRIMARY KEY, content TEXT NOT NULL,
 | `checkin_results` | checkin_results.json | PK(day, uid); name/status/updated_at TEXT；裁剪改 DELETE 超 90 天 |
 | `wb_checkin_results` | workbuddy_checkin_results.json | id INTEGER PK AUTOINCREMENT; date/time/user_id/name/status/message TEXT; reward REAL 可空；裁剪改 DELETE 超 90 天 |
 | `doubao_health_events` | doubao_health_history.json | id INTEGER PK AUTOINCREMENT; payload TEXT(JSON)（原 events 数组元素）；裁剪改 DELETE 超 HISTORY_MAX |
+| `wb_credits_history`（P6） | kv workbuddy_credits_history | date TEXT PK; ts INTEGER; total_balance REAL; accounts TEXT(JSON)；同日覆盖 + 365 天裁剪 |
+| `usage_history_days`（P6） | kv usage_history | PK(uid, date); data TEXT(JSON=UsageDayStat)；**补齐原缺失的 365 天裁剪**（原 JSON 实现无界增长） |
+| `usage_history_accounts`（P6） | kv usage_history | uid TEXT PK; name; last_fetch_end_ts |
+| `sticky_bindings`（P6） | kv wb_sticky_sessions | key TEXT PK; uid/conv_id/last_seen/explicit；save 落库前 evict 过期绑定（修复原过期项滞留缓慢增长） |
 
 ### 2.3 排除项（不迁移）
 

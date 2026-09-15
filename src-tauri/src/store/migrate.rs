@@ -27,7 +27,6 @@ const KV_ENTRIES: &[(&str, &str)] = &[
     ("data/wb_sticky_sessions.json", "wb_sticky_sessions"),
     ("data/checkin_summary.json", "checkin_summary"),
     ("data/workbuddy_settings.json", "workbuddy_settings"),
-    ("data/workbuddy_credits_history.json", "workbuddy_credits_history"),
     ("data/workbuddy_credits_cache.json", "workbuddy_credits_cache"),
     ("data/workbuddy_usage_official_cache.json", "workbuddy_usage_official_cache"),
     ("data/workbuddy_usage_official_all_cache.json", "workbuddy_usage_official_all_cache"),
@@ -35,11 +34,13 @@ const KV_ENTRIES: &[(&str, &str)] = &[
     ("data/wb_cli_rotate_state.json", "wb_cli_rotate_state"),
     ("data/token_stats_files.json", "token_stats_files"),
     ("data/doubao_renew_result.json", "doubao_renew_result"),
-    ("data/usage_history.json", "usage_history"),
     ("data/oauth_device.json", "oauth_device"),
     ("data/scheduler_state.json", "scheduler_state"),
     ("data/doubao_captured_credentials.json", "doubao_captured_credentials"),
 ];
+// P6：workbuddy_credits_history / usage_history / wb_sticky_sessions 三键为流水型数据，
+// 已从 kv 组移出为表（wb_credits_history / usage_history_* / sticky_bindings），
+// 由下方 DOC_ENTRIES / v1→v2 增量迁移处理。
 
 /// 结构化组：（相对路径 → 导入函数）
 const DOC_ENTRIES: &[(&str, fn(&Store, &Path) -> ImportStatus)] = &[
@@ -60,6 +61,10 @@ const DOC_ENTRIES: &[(&str, fn(&Store, &Path) -> ImportStatus)] = &[
     ("data/checkin_results.json", import_checkin_results),
     ("data/workbuddy_checkin_results.json", import_wb_checkin_results),
     ("data/doubao_health_history.json", import_doubao_health),
+    // P6 流水迁出
+    ("data/workbuddy_credits_history.json", import_wb_credits_history),
+    ("data/usage_history.json", import_usage_history),
+    ("data/wb_sticky_sessions.json", import_sticky_bindings),
 ];
 
 /// 遗留根路径兜底（存在才迁移；含 wb_upstream 死引用曾写出的根路径 token store）。
@@ -68,7 +73,6 @@ const LEGACY_ROOT: &[(&str, Option<&str>)] = &[
     ("workbuddy_token_store.json", None),
     ("wb_template_map.json", Some("wb_template_map")),
     ("api_models.json", Some("api_models")),
-    ("wb_sticky_sessions.json", Some("wb_sticky_sessions")),
     ("wb_model_route.json", Some("wb_model_route")),
     ("checkin_accounts.json", None),
 ];
@@ -162,7 +166,11 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
         let result = match kv_key {
             Some(key) => import_kv(&store, data_dir, name, key),
             None => {
-                let importer = if *name == "checkin_accounts.json" { import_accounts } else { import_wb_token_store };
+                let importer = match *name {
+                    "checkin_accounts.json" => import_accounts,
+                    "wb_sticky_sessions.json" => import_sticky_bindings,
+                    _ => import_wb_token_store,
+                };
                 to_item(run_importer(&store, &path, importer))
             }
         };
@@ -186,6 +194,13 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
     }
 
     // 全部条目处理完且零失败才置版本号（有失败保留原位，下次启动重试）
+    if failed == 0 {
+        // P6 v1→v2 增量：老库 kv 中三个流水键搬入表（v0 全新导入路径键已由 DOC_ENTRIES 处理，此处空转）
+        if let Err(e) = migrate_kv_flows_v1_to_v2(&store) {
+            failed += 1;
+            items.push(json!({"file": "<kv_flows_v1_to_v2>", "result": "error", "detail": e}));
+        }
+    }
     if failed == 0 {
         let _ = store.with_conn(|c| {
             schema::set_user_version(c, schema::SCHEMA_VERSION);
@@ -437,6 +452,51 @@ fn import_doubao_health(store: &Store, path: &Path) -> ImportStatus {
         let events = v.get("events").and_then(Value::as_array).unwrap_or(&empty);
         docs::doubao_health_save(store, events)
     })
+}
+
+// ── P6 流水迁出导入器 ────────────────────────────────────────────────────────
+
+fn import_wb_credits_history(store: &Store, path: &Path) -> ImportStatus {
+    parse_then(path, |v| docs::wb_credits_history_save(store, &v))
+}
+
+fn import_usage_history(store: &Store, path: &Path) -> ImportStatus {
+    parse_then(path, |v| docs::usage_history_save(store, &v))
+}
+
+fn import_sticky_bindings(store: &Store, path: &Path) -> ImportStatus {
+    parse_then(path, |v| docs::sticky_bindings_save(store, &v))
+}
+
+/// v1→v2 增量迁移：kv 中三个流水键搬入对应表（v1 老库升级路径）
+fn migrate_kv_flows_v1_to_v2(store: &Store) -> Result<(), String> {
+    let importers: [(&str, fn(&Store, &Value) -> Result<(), String>); 3] = [
+        ("workbuddy_credits_history", import_wb_credits_history_value),
+        ("usage_history", import_usage_history_value),
+        ("wb_sticky_sessions", import_sticky_bindings_value),
+    ];
+    for (key, importer) in importers {
+        let Some(text) = store.kv_get_raw(key) else {
+            continue; // v1 老库无此键（全新安装）→ 跳过
+        };
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| format!("kv {key} 解析失败: {e}"))?;
+        importer(store, &v)?;
+        store.kv_delete(key)?;
+    }
+    Ok(())
+}
+
+fn import_wb_credits_history_value(store: &Store, v: &Value) -> Result<(), String> {
+    docs::wb_credits_history_save(store, v)
+}
+
+fn import_usage_history_value(store: &Store, v: &Value) -> Result<(), String> {
+    docs::usage_history_save(store, v)
+}
+
+fn import_sticky_bindings_value(store: &Store, v: &Value) -> Result<(), String> {
+    docs::sticky_bindings_save(store, v)
 }
 
 // ── 工具 ─────────────────────────────────────────────────────────────────────

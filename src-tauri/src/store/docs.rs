@@ -6,6 +6,250 @@
 // P1 阶段仅迁移器消费 save 侧；load 侧随 P2/P3 调用点切换启用（红线：最终交付无警告）
 #![allow(dead_code)]
 
+// ── P6 流水迁出：WB 每日积分快照（原 kv workbuddy_credits_history）───────────
+
+/// 读回 {snapshots:[{date,ts,total_balance,accounts}]}（按日期升序；原文件形状兼容）
+pub fn wb_credits_history_load(s: &Store) -> Value {
+    let rows = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT date, ts, total_balance, accounts FROM wb_credits_history ORDER BY date",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let accounts: String = r.get(3)?;
+                    Ok(json!({
+                        "date": r.get::<_, String>(0)?,
+                        "ts": r.get::<_, i64>(1)?,
+                        "total_balance": r.get::<_, f64>(2)?,
+                        "accounts": serde_json::from_str::<Value>(&accounts)
+                            .unwrap_or(Value::Array(vec![])),
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    json!({ "snapshots": rows })
+}
+
+/// 同日覆盖 UPSERT（append_credits_snapshot 的落库等价物）
+pub fn wb_credits_history_upsert(s: &Store, snap: &Value) -> Result<(), String> {
+    let date = snap.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+    if date.is_empty() {
+        return Err("快照缺 date 字段".into());
+    }
+    let ts = snap.get("ts").and_then(Value::as_i64).unwrap_or(0);
+    let total = snap.get("total_balance").and_then(Value::as_f64).unwrap_or(0.0);
+    let accounts = serde_json::to_string(
+        snap.get("accounts").unwrap_or(&Value::Array(vec![])),
+    )
+    .map_err(|e| format!("序列化失败: {e}"))?;
+    s.with_conn(move |c| {
+        c.execute(
+            "INSERT INTO wb_credits_history(date, ts, total_balance, accounts) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(date) DO UPDATE SET ts = excluded.ts, total_balance = excluded.total_balance, accounts = excluded.accounts",
+            rusqlite::params![date, ts, total, accounts],
+        )?;
+        Ok(())
+    })
+}
+
+/// 365 天滚动裁剪（原 cap 语义）
+pub fn wb_credits_history_prune(s: &Store) -> Result<(), String> {
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(365))
+        .format("%Y-%m-%d")
+        .to_string();
+    s.with_conn(|c| {
+        c.execute("DELETE FROM wb_credits_history WHERE date < ?1", [cutoff.as_str()])?;
+        Ok(())
+    })
+}
+
+/// 全量导入（迁移器用）：{snapshots:[...]} → 逐日 upsert
+pub fn wb_credits_history_save(s: &Store, root: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = root.get("snapshots").and_then(Value::as_array).unwrap_or(&empty);
+    for snap in arr {
+        wb_credits_history_upsert(s, snap)?;
+    }
+    wb_credits_history_prune(s)
+}
+
+// ── P6 流水迁出：消耗明细增量缓存（原 kv usage_history）──────────────────────
+
+/// 读回 CacheFile 形状 Value：{fetched_at, accounts:{uid:{name,last_fetch_end_ts,daily:{date:stat}}}}
+pub fn usage_history_load(s: &Store) -> Value {
+    let mut out = serde_json::Map::new();
+    let metas = s
+        .with_conn(|c| {
+            let mut stmt = c
+                .prepare("SELECT uid, name, last_fetch_end_ts FROM usage_history_accounts")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    for (uid, name, ts) in metas {
+        out.insert(
+            uid.clone(),
+            json!({"name": name, "last_fetch_end_ts": ts, "daily": {}}),
+        );
+    }
+    let days = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare("SELECT uid, date, data FROM usage_history_days")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    for (uid, date, data) in days {
+        if let Some(acc) = out.get_mut(&uid).and_then(Value::as_object_mut) {
+            if let Some(daily) = acc.get_mut("daily").and_then(Value::as_object_mut) {
+                daily.insert(
+                    date,
+                    serde_json::from_str::<Value>(&data).unwrap_or(Value::Null),
+                );
+            }
+        }
+    }
+    let meta: Value = s.kv_get("usage_history_meta");
+    json!({
+        "fetched_at": meta.get("fetched_at").and_then(Value::as_i64),
+        "accounts": out,
+    })
+}
+pub fn usage_history_save(s: &Store, root: &Value) -> Result<(), String> {
+    let empty_map = serde_json::Map::new();
+    let accounts = root.get("accounts").and_then(Value::as_object).unwrap_or(&empty_map);
+    let fetched_at = root.get("fetched_at").cloned().unwrap_or(Value::Null);
+    // 序列化在事务外完成（闭包内仅做 rusqlite 操作）
+    let mut metas: Vec<(String, String, Option<i64>)> = Vec::with_capacity(accounts.len());
+    let mut day_rows: Vec<(String, String, String)> = Vec::new();
+    for (uid, acc) in accounts {
+        metas.push((
+            uid.clone(),
+            acc.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+            acc.get("last_fetch_end_ts").and_then(Value::as_i64),
+        ));
+        if let Some(daily) = acc.get("daily").and_then(Value::as_object) {
+            for (date, stat) in daily {
+                day_rows.push((
+                    uid.clone(),
+                    date.clone(),
+                    serde_json::to_string(stat).map_err(|e| format!("序列化失败: {e}"))?,
+                ));
+            }
+        }
+    }
+    s.with_conn(move |c| {
+        c.execute_batch("BEGIN; DELETE FROM usage_history_accounts; DELETE FROM usage_history_days;")?;
+        {
+            let mut meta = c.prepare(
+                "INSERT INTO usage_history_accounts(uid, name, last_fetch_end_ts, updated_at) VALUES(?1, ?2, ?3, datetime('now','localtime'))",
+            )?;
+            let mut day = c.prepare(
+                "INSERT INTO usage_history_days(uid, date, data) VALUES(?1, ?2, ?3)",
+            )?;
+            for (uid, name, ts) in &metas {
+                meta.execute(rusqlite::params![uid, name, ts])?;
+            }
+            for (uid, date, text) in &day_rows {
+                day.execute(rusqlite::params![uid, date, text])?;
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })?;
+    // 365 天滚动裁剪（原实现无界增长，P6 修复）
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(365))
+        .format("%Y-%m-%d")
+        .to_string();
+    s.with_conn(|c| {
+        c.execute("DELETE FROM usage_history_days WHERE date < ?1", [cutoff.as_str()])?;
+        Ok(())
+    })?;
+    // fetched_at 回写 kv（原文件顶层字段）
+    s.kv_set("usage_history_meta", &json!({ "fetched_at": fetched_at }))
+}
+
+/// 读顶层 fetched_at（原 CacheFile.fetched_at；预留扩展）
+#[allow(dead_code)]
+pub fn usage_history_fetched_at(s: &Store) -> Option<i64> {
+    let meta: Value = s.kv_get("usage_history_meta");
+    meta.get("fetched_at").and_then(Value::as_i64)
+}
+
+// ── P6 流水迁出：会话粘性绑定（原 kv wb_sticky_sessions）─────────────────────
+
+/// 读回 {version, bindings:[...]}（按 last_seen 升序 = 原内存序近似）
+pub fn sticky_bindings_load(s: &Store) -> Value {
+    let rows = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT key, uid, conv_id, last_seen, explicit FROM sticky_bindings ORDER BY last_seen",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(json!({
+                        "key": r.get::<_, String>(0)?,
+                        "uid": r.get::<_, String>(1)?,
+                        "conv_id": r.get::<_, String>(2)?,
+                        "last_seen": r.get::<_, i64>(3)?,
+                        "explicit": r.get::<_, i64>(4)? != 0,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    json!({ "version": 1, "bindings": rows })
+}
+
+/// 整表替换（save 的落库等价物；过期项由调用方 evict 后传入）
+pub fn sticky_bindings_save(s: &Store, root: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = root.get("bindings").and_then(Value::as_array).unwrap_or(&empty);
+    s.with_conn(|c| {
+        c.execute_batch("BEGIN; DELETE FROM sticky_bindings;")?;
+        {
+            let mut stmt = c.prepare(
+                "INSERT INTO sticky_bindings(key, uid, conv_id, last_seen, explicit, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, datetime('now','localtime'))",
+            )?;
+            for b in arr {
+                stmt.execute(rusqlite::params![
+                    b.get("key").and_then(Value::as_str).unwrap_or(""),
+                    b.get("uid").and_then(Value::as_str).unwrap_or(""),
+                    b.get("conv_id").and_then(Value::as_str).unwrap_or(""),
+                    b.get("last_seen").and_then(Value::as_i64).unwrap_or(0),
+                    (b.get("explicit").and_then(Value::as_bool).unwrap_or(false)) as i64,
+                ])?;
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +345,42 @@ mod tests {
         // upsert 覆盖
         wb_token_store_upsert(&s, "a1", &json!({"access_token": "t2"})).unwrap();
         assert_eq!(wb_token_store_load(&s)["tokens"]["a1"]["access_token"], "t2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p6_flow_tables_roundtrip() {
+        use serde_json::json;
+        let (dir, s) = tmp_store("p6");
+        // WB 每日积分快照：upsert 同日覆盖 + prune
+        wb_credits_history_upsert(&s, &json!({"date":"2026-09-14","ts":1,"total_balance":10.0,"accounts":[{"user_id":"u","balance":10.0}]})).unwrap();
+        wb_credits_history_upsert(&s, &json!({"date":"2026-09-15","ts":2,"total_balance":8.5,"accounts":[]})).unwrap();
+        wb_credits_history_upsert(&s, &json!({"date":"2026-09-15","ts":3,"total_balance":8.0,"accounts":[]})).unwrap();
+        let hist = wb_credits_history_load(&s);
+        let snaps = hist["snapshots"].as_array().unwrap();
+        assert_eq!(snaps.len(), 2, "同日覆盖");
+        assert_eq!(snaps[1]["total_balance"], 8.0);
+        wb_credits_history_prune(&s).unwrap();
+
+        // usage_history：save/load 回环（含 365 天裁剪语义由 save 内执行）
+        let root = json!({
+            "fetched_at": 12345,
+            "accounts": {"u1": {"name": "甲", "last_fetch_end_ts": 999,
+                                "daily": {"2026-09-15": {"date": "2026-09-15", "credits": 1.5, "sessions": 2}}}}
+        });
+        usage_history_save(&s, &root).unwrap();
+        let got = usage_history_load(&s);
+        assert_eq!(got["fetched_at"], 12345);
+        assert_eq!(got["accounts"]["u1"]["name"], "甲");
+        assert_eq!(got["accounts"]["u1"]["daily"]["2026-09-15"]["credits"], 1.5);
+
+        // sticky bindings：save/load 回环
+        sticky_bindings_save(&s, &json!({"bindings": [
+            {"key": "cid:a", "uid": "u1", "conv_id": "c1", "last_seen": 10, "explicit": true}
+        ]})).unwrap();
+        let b = sticky_bindings_load(&s);
+        assert_eq!(b["bindings"][0]["uid"], "u1");
+        assert_eq!(b["bindings"][0]["explicit"], true);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
