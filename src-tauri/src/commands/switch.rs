@@ -9,7 +9,7 @@ use crate::fs_utils;
 use crate::state::AppState;
 use crate::switcher::{Action, RunArgs, TauriSink, TargetApp};
 
-use super::workbuddy::{pool_account_id_by_auth_uid, BuddyApp};
+use super::workbuddy::BuddyApp;
 
 /// switch-progress 事件单行 NDJSON（与 switcher::step_line 字段序/语义一致）
 fn emit_switch_step(app: &AppHandle, stage: &str, status: &str, message: &str) {
@@ -153,20 +153,40 @@ pub fn switch_account(
     // current_account.txt 一致时才把"当前态"回写进该账号槽。豆包走严格版（还要求
     // Live Cookies 里验证到登录会话——uid 检测可能被快照 localStorage 残留骗过，
     // Cookie 存在性无法伪造）；icube 布局（TraeWork/Trae）走本机使用证据推导（见下）
+    let is_buddy = matches!(target_app.as_deref(), Some("WorkBuddy") | Some("CodeBuddy"));
+    let buddy_app = match target_app.as_deref() {
+        Some("CodeBuddy") => BuddyApp::CodeBuddy,
+        _ => BuddyApp::WorkBuddy,
+    };
     let expected_uid = if is_doubao {
         crate::commands::doubao::detect_guard_uid_strict(&state)
     } else if is_trae {
-        // icube 布局（TraeWork/Trae）切换守卫：复用 trae_apps 的本机使用证据推导
-        //（apps_accounts_discover 同源实现）填充当前 uid；推导失败（None）→ 维持
-        // 空串 fail-open 不阻断切换。switch_account 为 async 命令，vscdb/storage
-        // 同步读取在工作线程执行，不冻结 UI
+        // icube 布局（TraeWork/Trae）切换守卫：混合推导（本机使用证据 + 桥标记切换
+        // 时刻，F2-6）——纯证据推导会被快照冻结的旧时间戳误导（实测指向一个月前的
+        // 历史账号，守卫恒误判不一致而跳过回写）。推导失败（None）→ 维持空串
+        // fail-open 不阻断切换。switch_account 为 async 命令，vscdb/storage 同步读取
+        // 在工作线程执行，不冻结 UI
         let kind = target_app.as_deref().unwrap_or("TraeWork");
-        crate::commands::trae_apps::infer_current_cloud_uid(kind).unwrap_or_default()
-    } else if matches!(target_app.as_deref(), Some("WorkBuddy") | Some("CodeBuddy")) {
-        // F1-3 authfile 布局（WorkBuddy/CodeBuddy）切换守卫：以共享 auth 文件当前 uid
-        // 在账号池反查账号 id 填充（与 current_account.txt 同命名空间）；
-        // 反查失败 → 空串 fail-open 不阻断
-        pool_account_id_by_auth_uid(&state).unwrap_or_default()
+        crate::commands::trae_apps::current_cloud_uid_hybrid(kind, &state.data_dir)
+            .unwrap_or_default()
+    } else if is_buddy {
+        // F1-3/F2-5 authfile 布局切换守卫：按端取「当前登录账号 id」——
+        // WorkBuddy 由共享 auth 文件驱动 → auth 文件 uid 在池反查优先，桥标记兜底；
+        // CodeBuddy 登录真源信号 = live storage.json genie.userId（共享 auth 文件属
+        // WorkBuddy，会被其覆盖，不能作为 CodeBuddy 登录证据；桥标记只反映上次切换
+        // 目标，客户端手动重登后失真）→ genie 实测优先，桥标记兜底。
+        // 取不到 → 空串 fail-open 不阻断
+        match buddy_app {
+            BuddyApp::CodeBuddy => crate::commands::workbuddy::codebuddy_live_uid()
+                .and_then(|uid| crate::commands::workbuddy::pool_account_id_by_uid(&state, &uid))
+                .or_else(|| {
+                    crate::commands::workbuddy::current_account_marker(&state, "CodeBuddy")
+                })
+                .unwrap_or_default(),
+            BuddyApp::WorkBuddy => {
+                buddy_current_account_id(&state, buddy_app).unwrap_or_default()
+            }
+        }
     } else {
         String::new()
     };
@@ -175,11 +195,7 @@ pub fn switch_account(
     // 迁移必须在桥的 Stop→Restore→Start 窗口之前完成全部 db/文件动作：先备份当前账号
     // 三件套，再以新 id 复制到目标账号名下（复制后 live 同时含 A 原件 + B 副本，桥重启
     // 客户端后目标账号登录即可见，源副本残留由下游清理）。
-    let is_buddy = matches!(target_app.as_deref(), Some("WorkBuddy") | Some("CodeBuddy"));
-    let buddy_app = match target_app.as_deref() {
-        Some("CodeBuddy") => BuddyApp::CodeBuddy,
-        _ => BuddyApp::WorkBuddy,
-    };
+    // （is_buddy / buddy_app 已在防误覆盖守卫处定义，此处直接复用）
     let migrate_job: Option<Box<dyn FnOnce(&AppHandle) + Send>> = if is_buddy
         && state.settings().buddy_switch_migrate_chats
         && buddy_target_slot_exists(&state.data_dir, buddy_app, user_id.trim())
@@ -286,6 +302,30 @@ pub fn save_current_login(
         // （客户端内退出过/被新登录顶替），存进去就是死会话，之后每次切换该账号都未登录
         //（实测 A 槽事故：20:43 保存的快照当时已是/随后被吊销的死会话）。expired 拒绝保存。
         crate::commands::doubao::probe_live_session_alive(&user_id)?;
+    }
+
+    // F2-5 保存守卫（authfile 布局，WorkBuddy/CodeBuddy）：校验客户端**实际登录**与
+    // 目标账号一致，防止把 A 的登录态存进 B 的槽位——实测根源事故：CodeBuddy 槽位
+    // 互相污染后（wb-45c 与 wb-98e 内容完全相同），「切换」怎么切都是同一个账号。
+    // 登录信号：WorkBuddy = 共享 auth 文件 uid → 池反查；CodeBuddy = live storage.json
+    // genie.userId → 池反查。检测不可用（未登录/解析失败/池中无此 uid）→ fail-open
+    // 放行，交由备份流程既有兜底（auth 缺失整体跳过等）。
+    if matches!(target_app.as_deref(), Some("WorkBuddy") | Some("CodeBuddy")) {
+        let live_id = match target_app.as_deref() {
+            Some("CodeBuddy") => crate::commands::workbuddy::codebuddy_live_uid()
+                .and_then(|uid| crate::commands::workbuddy::pool_account_id_by_uid(&state, &uid)),
+            _ => crate::commands::workbuddy::pool_account_id_by_auth_uid(&state),
+        };
+        if let Some(live) = live_id {
+            if !live.is_empty() && live != user_id.trim() {
+                let msg = format!(
+                    "客户端当前登录的是账号 {live}，与要保存的账号 {user_id} 不一致，已拒绝保存（防止账号槽位被互相覆盖污染）。\
+                     请先「切换」到目标账号并在客户端确认登录，再点「保存当前登录态」。"
+                );
+                fs_utils::app_log(&state.data_dir, &format!("保存登录态被守卫拦截: {msg}"));
+                return Err(msg);
+            }
+        }
     }
 
     fs_utils::app_log(&state.data_dir, &format!("开始保存当前登录态: user_id={user_id}"));

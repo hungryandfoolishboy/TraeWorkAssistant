@@ -17,8 +17,27 @@ fn snapshot() -> System {
 }
 
 /// 进程名是否 ∈ 精确白名单（Get-Process -Name 语义，大小写不敏感）
+/// 审查修复（实测 2026-09-15）：sysinfo（NtQuerySystemInformation ImageName）在
+/// Windows 上返回的映像名**带 .exe 后缀**（如 "Doubao.exe"），而白名单为不带后缀
+/// 形态——精确比较恒不命中 → list_procs 恒空 → stop_app 恒报「未运行」从不关闭
+/// 客户端，快照在运行中被覆盖 + 启动变多开（豆包/CodeBuddy/TRAE 全线「切换不生效」
+/// 的根因）。匹配前统一剥离 .exe 后缀（大小写不敏感）。
 fn name_matches(prof: &AppProfile, name: &str) -> bool {
-    prof.proc_names.iter().any(|n| name.eq_ignore_ascii_case(n))
+    let base = strip_exe_suffix(name);
+    prof.proc_names.iter().any(|n| base.eq_ignore_ascii_case(n))
+}
+
+/// 剥离映像名尾部的 ".exe"（大小写不敏感；无后缀原样返回）。
+/// 用 get 防多字节字符下标越界（非字符边界时 get 返回 None → 原样返回）。
+fn strip_exe_suffix(name: &str) -> &str {
+    if name.len() > 4 {
+        if let Some(base) = name.get(..name.len() - 4) {
+            if name[base.len()..].eq_ignore_ascii_case(".exe") {
+                return base;
+            }
+        }
+    }
+    name
 }
 
 /// 枚举目标应用进程（精确映像名匹配）。返回 (pid, exe 全路径)——
@@ -210,6 +229,26 @@ mod tests {
 
     fn prof(app: TargetApp) -> AppProfile {
         profile::profile_for(app, std::env::temp_dir().as_path())
+    }
+
+    #[test]
+    fn name_matches_兼容sysinfo带exe后缀() {
+        // 实测根因回归：sysinfo ImageName 带 .exe 后缀，白名单不带——必须能命中
+        let p = prof(TargetApp::Doubao);
+        assert!(name_matches(&p, "Doubao.exe"));
+        assert!(name_matches(&p, "DOUBAO.EXE"));
+        assert!(name_matches(&p, "Doubao"));
+        assert!(!name_matches(&p, "DoubaoUpdate.exe"));
+        let tw = prof(TargetApp::TraeWork);
+        assert!(name_matches(&tw, "TRAE SOLO CN.exe"));
+        assert!(name_matches(&tw, "Trae.exe"));
+        // Trae 档案的白名单不含 Trae CN（防串台）
+        let trae = prof(TargetApp::Trae);
+        assert!(name_matches(&trae, "Trae CN.exe"));
+        assert!(!name_matches(&trae, "TRAE SOLO CN.exe"));
+        // 自身应用不应命中任何白名单
+        let cb = prof(TargetApp::CodeBuddy);
+        assert!(!name_matches(&cb, "ai-work-assistant.exe"));
     }
 
     #[test]

@@ -238,6 +238,24 @@ export default function BuddyAccounts() {
     void refresh();
   }, [refresh]);
 
+  // 切换/保存完成自动刷新（审查修复 2026-09-15）：切换是后台长流程，switch-done /
+  // save-login-done 事件迟到时列表的「当前 / 在线 / WB当前 / CB当前」徽标不会自行更新，
+  // 用户感知为「切换了但徽标不变」。 disposed 语义与 DoubaoAccounts 一致（卸载早于
+  // listen promise resolve 时避免监听器泄漏）。
+  useEffect(() => {
+    const cleanups: Array<() => void> = [];
+    let disposed = false;
+    const track = (p: Promise<() => void>) =>
+      void p.then((u) => (disposed ? u() : cleanups.push(u)));
+    track(listen('switch-done', () => void refresh()));
+    track(listen('save-login-done', () => void refresh()));
+    return () => {
+      disposed = true;
+      cleanups.forEach((u) => u());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // OAuth 事件监听（F-50）：弹框打开或流程 pending 期间订阅；弹框提前关闭仍能收到结果提示
   useEffect(() => {
     if (!oauthOpen && !oauthBusy) return;
@@ -832,7 +850,7 @@ export default function BuddyAccounts() {
                             </Badge>
                           )}
                           {a.is_current_codebuddy && (
-                            <Badge tone="violet" title="CodeBuddy 端当前账号（切换桥标记，与 WorkBuddy 端相互独立）">
+                            <Badge tone="violet" title="CodeBuddy 端当前登录账号（客户端 genie.userId 实测，与 WorkBuddy 端相互独立）">
                               CB当前
                             </Badge>
                           )}

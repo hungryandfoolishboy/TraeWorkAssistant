@@ -140,6 +140,16 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
     let snap_cb_path = state.data_dir.join("data").join("profiles_codebuddy");
     let cur_wb = read_current_account_marker(&snap_path);
     let cur_cb = read_current_account_marker(&snap_cb_path);
+    // F2-5（实测 2026-09-15）：CodeBuddy 端「当前账号」以 live 登录信号为准——
+    // genie.userId（客户端随登录/切换改写，池内按 uid 反查账号 id）。桥标记只反映
+    // 上次切换目标：客户端内手动重登、切换后客户端未接受恢复（守卫跳过回写）时均失真，
+    // 徽标会指向未登录的账号。genie 不可读（客户端未装/storage.json 缺失）回退桥标记。
+    // WorkBuddy 端不受影响：is_current 用 auth 文件 uid（本就是 WorkBuddy 登录真源）。
+    let cb_live_id = codebuddy_live_uid()
+        .and_then(|uid| {
+            pool.accounts.iter().find(|a| a.uid == uid).map(|a| a.id.clone())
+        })
+        .or(cur_cb.clone());
     let store: serde_json::Value = crate::tasks::wb_common::load_token_store(state);
     let store_tokens = store.get("tokens").cloned().unwrap_or(serde_json::Value::Null);
 
@@ -170,7 +180,7 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                 has_snapshot: has_snapshot,
                 has_snapshot_codebuddy: snap_cb_path.join(&a.id).is_dir(),
                 is_current_workbuddy: cur_wb.as_deref() == Some(a.id.as_str()),
-                is_current_codebuddy: cur_cb.as_deref() == Some(a.id.as_str()),
+                is_current_codebuddy: cb_live_id.as_deref() == Some(a.id.as_str()),
             }
         })
         .collect();
@@ -307,6 +317,37 @@ pub fn pool_account_id_by_auth_uid(state: &AppState) -> Option<String> {
     }
     let pool = load_pool(state);
     pool.accounts.iter().find(|a| a.uid == uid).map(|a| a.id.clone())
+}
+
+/// 池内按真实账号 uid（auth/genie 体系 uuid）反查账号 id（wb-<hash>）。
+/// F2-5（switch.rs 保存/切换守卫用）：把客户端 live 登录 uid 映射到账号池 id。
+pub fn pool_account_id_by_uid(state: &AppState, uid: &str) -> Option<String> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return None;
+    }
+    load_pool(state)
+        .accounts
+        .into_iter()
+        .find(|a| a.uid == uid)
+        .map(|a| a.id)
+}
+
+/// CodeBuddy 客户端 live 登录 uid：`%APPDATA%\CodeBuddy CN\User\globalStorage\storage.json`
+/// 的 `genie.userId`。F2-5：这是 CodeBuddy 当前登录的**真源信号**——共享 auth 文件属
+/// WorkBuddy（会被其覆盖），不能作为 CodeBuddy 的登录证据；genie.userId 由客户端随
+/// 登录/切换改写（实测：恢复某账号快照启动后该值变为该账号 uid）。
+/// None = 文件不存在/未登录/解析失败（调用方 fail-open）。
+pub fn codebuddy_live_uid() -> Option<String> {
+    let appdata = std::env::var("APPDATA").ok()?;
+    let p = std::path::PathBuf::from(appdata)
+        .join("CodeBuddy CN")
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    let raw = fs_utils::read_json::<serde_json::Value>(&p);
+    let uid = as_str(fs_utils::dig(&raw, &["genie.userId"]))?;
+    (!uid.is_empty()).then_some(uid.to_string())
 }
 
 /// auth 文件导入的池合并输入（从 auth 文件解析出的可覆盖字段集合）

@@ -275,6 +275,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         );
         void get().refreshAccounts();
         void get().refreshProxy();
+        // 登录中徽标（localEntitlement）刷新：切换完成后本机登录 uid 已变，
+        // 立即刷新一次；客户端启动写入本机使用证据需数秒，延迟再刷一次兜底
+        void get().refreshLocalEntitlement();
+        setTimeout(() => void get().refreshLocalEntitlement(), 8000);
       },
       onSaveLoginProgress: (line) =>
         set((s) => ({ saveLoginProgress: [...s.saveLoginProgress.slice(-49), line] })),

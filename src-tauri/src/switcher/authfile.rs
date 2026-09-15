@@ -5,6 +5,9 @@
 //!   L1 必选  %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info
 //!           （登录态明文 JSON；客户端启动时会重写并生成历史快照
 //!             workbuddy-desktop.<ts>.<pid>.<uuid>.info，作交叉校验，不入快照槽）
+//!           注意：该文件为 **WorkBuddy 专属登录驱动源**（F2-4）——恢复仅对 WorkBuddy
+//!           回写；CodeBuddy 登录真源在自身 vscdb（L3），回写共享 auth 会连带切换
+//!           WorkBuddy（实测端隔离缺陷），已跳过
 //!   L2 体验  ~\<app_data_dir>\storage\user-<uid>* 目录（用户级数据，随账号迁移）
 //!   L3（仅 CodeBuddy）state.vscdb 登录真源（含 -wal/-shm 边车/.backup/storage.json
 //!     + tencent-cloud.coding-copilot 扩展存储目录）——PS 审查修复点：-wal/-shm 必须
@@ -265,28 +268,42 @@ pub fn restore_authfile(
     }
     let mut restored = 0usize;
 
-    // L1 必选：回写 auth 文件
-    if let Err(e) = {
-        let _ = std::fs::create_dir_all(&auth_dir);
-        std::fs::copy(&auth_src, &auth_file)
-    } {
-        sink.step("restore", StepStatus::Error, &format!("auth 文件恢复失败: {e}"));
-        return Err(super::thrown(sink, "auth 文件恢复失败"));
-    }
-    restored += 1;
-    sink.step("restore", StepStatus::Ok, "L1 auth 文件已恢复");
+    // F2-4 端隔离（实测 2026-09-15）：共享 auth 文件是 **WorkBuddy** 的登录驱动源，
+    // CodeBuddy 不消费它（登录真源在自身 vscdb，见 L3）——切/存 CodeBuddy 时回写
+    // 共享 auth 会把 WorkBuddy 的登录一并切走（实测「切 CodeBuddy 时 WorkBuddy
+    // 伴随切换」根因）。CodeBuddy 恢复跳过 L1 回写，仅走 L3 vscdb；
+    // WorkBuddy 恢复保持原语义。
+    let is_codebuddy = sess.prof.app_name == "CodeBuddy";
+    if is_codebuddy {
+        sink.step(
+            "restore",
+            StepStatus::Skip,
+            "L1 共享 auth 文件跳过回写（CodeBuddy 登录真源在自身 vscdb；该文件为 WorkBuddy 登录驱动源，回写会连带切换 WorkBuddy）",
+        );
+    } else {
+        // L1 必选：回写 auth 文件
+        if let Err(e) = {
+            let _ = std::fs::create_dir_all(&auth_dir);
+            std::fs::copy(&auth_src, &auth_file)
+        } {
+            sink.step("restore", StepStatus::Error, &format!("auth 文件恢复失败: {e}"));
+            return Err(super::thrown(sink, "auth 文件恢复失败"));
+        }
+        restored += 1;
+        sink.step("restore", StepStatus::Ok, "L1 auth 文件已恢复");
 
-    // 回写校验：确认落盘内容确为目标账号（防复制中途失败或复制后立即被其他进程回写）
-    let want_uid = auth_file_uid(&auth_src);
-    let got_uid = auth_file_uid(&auth_file);
-    if let (Some(want), Some(got)) = (&want_uid, &got_uid) {
-        if got != want {
-            sink.step(
-                "restore",
-                StepStatus::Error,
-                "auth 文件恢复后 uid 不一致（疑似被其他进程回写），已中止启动",
-            );
-            return Err(super::thrown(sink, "auth 文件恢复后校验失败（uid 不一致）"));
+        // 回写校验：确认落盘内容确为目标账号（防复制中途失败或复制后立即被其他进程回写）
+        let want_uid = auth_file_uid(&auth_src);
+        let got_uid = auth_file_uid(&auth_file);
+        if let (Some(want), Some(got)) = (&want_uid, &got_uid) {
+            if got != want {
+                sink.step(
+                    "restore",
+                    StepStatus::Error,
+                    "auth 文件恢复后 uid 不一致（疑似被其他进程回写），已中止启动",
+                );
+                return Err(super::thrown(sink, "auth 文件恢复后校验失败（uid 不一致）"));
+            }
         }
     }
 
@@ -355,7 +372,7 @@ pub fn restore_authfile(
                     "restore",
                     StepStatus::Warn,
                     &format!(
-                        "槽位 {slot} 为旧版快照（无 vscdb 登录态），仅恢复 auth 文件——CodeBuddy 客户端登录可能不变，请登录后重新「保存当前登录态」升级快照"
+                        "槽位 {slot} 为旧版快照（无 vscdb 登录态），CodeBuddy 无登录数据可恢复（共享 auth 文件属 WorkBuddy，F2-4 起不回写）——请在客户端登录目标账号后重新「保存当前登录态」升级快照"
                     ),
                 );
             }
@@ -403,6 +420,9 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
     }
     let expect_uid = expect_uid.unwrap_or_default();
     let has_snap_dir = snap_file.parent().map(|p| p.exists()).unwrap_or(false);
+    // F2-4 端隔离：CodeBuddy 恢复不再回写共享 auth 文件（该文件属 WorkBuddy 登录
+    // 驱动源），信号②对其恒无意义且会误报「疑似被其他进程回写」——仅 WorkBuddy 检查
+    let check_auth = sess.prof.app_name != "CodeBuddy";
 
     // F1-2 因果信号锚点：记录"恢复落盘后"的 auth 文件 mtime
     let restore_mtime = std::fs::metadata(&auth_file).and_then(|m| m.modified()).ok();
@@ -448,8 +468,8 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
     let mut revert_warned = false;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_secs(2));
-        // 信号②：共享 auth 文件 uid（两个布局通用；连续两次命中才确认）
-        let auth_uid = auth_file_uid(&auth_file);
+        // 信号②：共享 auth 文件 uid（仅 WorkBuddy；连续两次命中才确认）
+        let auth_uid = if check_auth { auth_file_uid(&auth_file) } else { None };
         let mut auth_rewritten = true;
         if !has_snap_dir {
             auth_rewritten = std::fs::metadata(&auth_file)
@@ -481,7 +501,7 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
             }
         } else {
             auth_hits = 0;
-            if auth_uid.is_some() && !revert_warned {
+            if check_auth && auth_uid.is_some() && !revert_warned {
                 revert_warned = true;
                 let short: String = auth_uid
                     .as_deref()

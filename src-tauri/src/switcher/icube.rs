@@ -26,6 +26,11 @@ impl Item {
 const ICUBE_ITEMS: &[Item] = &[
     Item::File("User\\globalStorage\\storage.json"), // 1. 设备标识/遥测/认证信息
     Item::File("User\\globalStorage\\state.vscdb"), // 2. 登录令牌数据库
+    // 2b. WAL/SHM 边车随主库快照（审查修复 2026-09-15）：优雅关闭超时强杀是常态
+    //（switcher.log 实测 TRAE 每次切换都强杀），最新登录写入可能尚未 checkpoint 进
+    // 主库——漏拷丢数据，且恢复侧依赖边车与主库成对回放（见 restore_icube）
+    Item::File("User\\globalStorage\\state.vscdb-wal"),
+    Item::File("User\\globalStorage\\state.vscdb-shm"),
     Item::File("User\\globalStorage\\state.vscdb.backup"),
     Item::File("machineid"),                        // 3. 机器标识
     Item::Dir("aha"),                               // 4. 设备认证数据
@@ -76,10 +81,29 @@ pub fn restore_icube(sess: &mut Session, slot: &str, sink: &dyn ProgressSink) ->
     // 删除 code.lock 防止启动冲突
     let _ = std::fs::remove_file(dest.join("code.lock"));
 
+    // 审查修复（实测 2026-09-15，Trae「切换后账号不变/本机识别错乱」根因）：
+    // 强杀后现场残留 state.vscdb-wal/-shm，SQLite WAL 模式下客户端启动打开恢复后的
+    // 主库会把旧 WAL 回放，把切换前账号的登录/使用证据写回新库（authfile 布局同款
+    // 问题已在 restore_authfile 处理）。恢复前必须先删边车。
+    let gs_dir = dest.join("User").join("globalStorage");
+    for stale in ["state.vscdb-wal", "state.vscdb-shm"] {
+        let _ = std::fs::remove_file(gs_dir.join(stale));
+    }
+
+    // 对称恢复：槽位有的项覆盖，槽位没有的项删除现场残留——恢复后 Live 恒等于槽位
+    // 内容，不携带上一账号的残留（如槽位缺 state.vscdb.backup 而现场有旧账号的）
     let mut restored = 0usize;
     for item in ICUBE_ITEMS {
-        if copy::copy_snapshot_item(&src.join(item.rel()), &dest.join(item.rel())) {
-            restored += 1;
+        let src_item = src.join(item.rel());
+        let dst_item = dest.join(item.rel());
+        if src_item.exists() {
+            if copy::copy_snapshot_item(&src_item, &dst_item) {
+                restored += 1;
+            }
+        } else if dst_item.is_dir() {
+            let _ = std::fs::remove_dir_all(&dst_item);
+        } else if dst_item.exists() {
+            let _ = std::fs::remove_file(&dst_item);
         }
     }
     sess.last_restored_count = restored as i64;

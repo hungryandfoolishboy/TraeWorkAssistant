@@ -86,7 +86,9 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             data_dir: PathBuf::from(format!("{appdata}\\Trae CN")),
             profiles_dir: data.join("data").join("profiles_trae"),
             settings_path_key: "trae_cn_path",
-            graceful_wait_secs: 3,
+            // 审查修复（2026-09-15）：3s 实测恒超时 → 每次切换都强杀，vscdb WAL 残留
+            // 被客户端启动重放导致旧账号复活（与豆包 8s 同理：落盘/退出需要时间）
+            graceful_wait_secs: 8,
             proc_names: &["Trae CN"],
             proc_patterns: &["Trae*", "TRAE*"],
             exe_names: &["Trae CN.exe"],
@@ -169,7 +171,8 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             data_dir: PathBuf::from(format!("{appdata}\\TRAE SOLO CN")),
             profiles_dir: data.join("data").join("profiles"),
             settings_path_key: "trae_path",
-            graceful_wait_secs: 3,
+            // 同 Trae：3s 恒超时强杀 → WAL 残留回放，提至 8s 优雅落盘
+            graceful_wait_secs: 8,
             proc_names: &["TRAE SOLO CN", "TRAE SOLO", "Trae"],
             proc_patterns: &["Trae*", "TRAE*"],
             exe_names: &["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe"],
@@ -206,7 +209,7 @@ mod tests {
         assert_eq!(tw.data_dir, PathBuf::from(std::env::var("APPDATA").unwrap()).join("TRAE SOLO CN"));
         assert_eq!(tw.profiles_dir, data.join("data").join("profiles"));
         assert_eq!(tw.settings_path_key, "trae_path");
-        assert_eq!(tw.graceful_wait_secs, 3);
+        assert_eq!(tw.graceful_wait_secs, 8);
         assert_eq!(tw.proc_names, &["TRAE SOLO CN", "TRAE SOLO", "Trae"]);
         assert_eq!(tw.exe_candidates.len(), 7);
         assert!(tw.cb_global_storage_dir.is_none());

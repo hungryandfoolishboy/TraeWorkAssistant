@@ -230,17 +230,19 @@ fn storage_uid_evidence(storage: &serde_json::Value) -> HashMap<String, UidEvide
 
 /// 合并证据并选出当前登录账号的 Cloud-IDE uid：
 /// 主排序 = 最新时间戳（无时间戳证据按 count 折算），次排序 = 证据数。
-fn select_cloud_uid(evidence: HashMap<String, UidEvidence>) -> Option<String> {
+/// 返回 (uid, 该证据的真实 latest_ts_ms；无时间戳证据为 0)。
+fn select_cloud_uid(evidence: HashMap<String, UidEvidence>) -> Option<(String, i64)> {
     // 近似折算：无时间戳的证据视作 3 个月前，保证带真实时间戳的证据优先
     let fallback_ts = chrono::Utc::now().timestamp_millis() - 90 * 24 * 3600 * 1000;
     evidence
         .into_iter()
         .max_by_key(|(_, e)| (if e.latest_ts_ms > 0 { e.latest_ts_ms } else { fallback_ts }, e.count))
-        .map(|(uid, _)| uid)
+        .map(|(uid, e)| (uid, e.latest_ts_ms))
 }
 
-/// 推导应用当前登录账号的 Cloud-IDE uid（合并 storage.json 与 state.vscdb 证据）
-fn infer_cloud_uid(app_kind: &str, storage: &serde_json::Value) -> Option<String> {
+/// 推导应用当前登录账号的 Cloud-IDE uid（合并 storage.json 与 state.vscdb 证据），
+/// 返回 (uid, 中选证据的真实时间戳)
+fn infer_cloud_uid(app_kind: &str, storage: &serde_json::Value) -> Option<(String, i64)> {
     let mut merged = vscdb_uid_evidence(app_kind);
     for (uid, e) in storage_uid_evidence(storage) {
         let slot = merged.entry(uid).or_default();
@@ -250,12 +252,53 @@ fn infer_cloud_uid(app_kind: &str, storage: &serde_json::Value) -> Option<String
     select_cloud_uid(merged)
 }
 
-/// 推导指定 Trae 应用当前登录账号的 Cloud-IDE uid（switch.rs 切换守卫复用，
-/// 与 apps_accounts_discover 同源实现）。同步实现（读本机 storage.json + state.vscdb），
-/// 调用方应在 async 命令/后台线程中使用；推导失败返回 None（调用方 fail-open）。
-pub(crate) fn infer_current_cloud_uid(app_kind: &str) -> Option<String> {
-    let storage = read_storage_json(app_kind)?;
-    infer_cloud_uid(app_kind, &storage)
+/// 桥标记 + 切换时刻（F2-6 sidecar）：switcher `set_current_account` 在写
+/// current_account.txt 时同步写同目录 current_account.meta.json {"switchedAtMs"}；
+/// 旧版无 sidecar → ts=0（视为很旧，证据优先）。
+fn marker_with_ts(app_kind: &str, data_dir: &std::path::Path) -> Option<(String, i64)> {
+    let profiles_dir = crate::switcher::profile::profile_for(
+        crate::switcher::TargetApp::parse(app_kind),
+        data_dir,
+    )
+    .profiles_dir;
+    let uid = std::fs::read_to_string(profiles_dir.join("current_account.txt"))
+        .ok()
+        .map(|s| s.trim().trim_start_matches('\u{feff}').trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let ts = std::fs::read_to_string(profiles_dir.join("current_account.meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("switchedAtMs").and_then(|t| t.as_i64()))
+        .unwrap_or(0);
+    Some((uid, ts))
+}
+
+/// F2-6（审查修复 2026-09-15）：当前登录 uid **混合推导**（本机使用证据 + 桥标记切换
+/// 时刻）。背景（本机实测）：切换器恢复快照后，live 数据目录的 per-uid 使用证据是
+/// **快照冻结时的旧数据**（实测最新 ts 落后真实登录一个月，纯证据推导指向历史账号
+/// ——切换守卫曾因此把标记 4487… 误判为「实际登录 1335…」而跳过回写）；而桥标记在
+/// 客户端手动重登后失真。规则：
+/// - 证据比上次切换**新** → 客户端在切换后有过真实使用（含手动重登）→ 信证据；
+/// - 否则（快照冻结旧证据 / 无证据）→ 信标记；
+/// - 平局（ets == mts）信标记（标记写入时刻即切换动作时刻，证据不可能同毫秒产生）。
+pub(crate) fn current_cloud_uid_hybrid(
+    app_kind: &str,
+    data_dir: &std::path::Path,
+) -> Option<String> {
+    let evidence = read_storage_json(app_kind).and_then(|s| infer_cloud_uid(app_kind, &s));
+    let marker = marker_with_ts(app_kind, data_dir);
+    match (marker, evidence) {
+        (Some((muid, mts)), Some((euid, ets))) => {
+            if ets > mts {
+                Some(euid)
+            } else {
+                Some(muid)
+            }
+        }
+        (Some((muid, _)), None) => Some(muid),
+        (None, Some((euid, _))) => Some(euid),
+        (None, None) => None,
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -325,7 +368,7 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
             continue;
         }
         // 推导当前登录账号的 Cloud-IDE uid；失败则回退 dc uid（标记不置信，禁止入池）
-        match infer_cloud_uid(kind, &storage) {
+        match current_cloud_uid_hybrid(kind, &state.data_dir) {
             Some(cloud_uid) => {
                 out.push(DiscoveredAccount {
                     in_pool: known.contains(&cloud_uid),
@@ -560,11 +603,15 @@ fn pool_name_for(accounts: &crate::models::AccountsFile, uid: &str) -> Option<St
     })
 }
 
-/// 单应用的当前登录信息 + 套餐：登录信息（uid/账号名）来自本机使用证据推导，
-/// 套餐来自 storage.json 明文缓存；套餐解析失败不影响登录信息展示。
-fn app_login(kind: &str, accounts: &crate::models::AccountsFile) -> Option<AppEntitlement> {
+/// 单应用的当前登录信息 + 套餐：登录信息（uid/账号名）来自混合推导（证据 + 桥标记，
+/// F2-6），套餐来自 storage.json 明文缓存；套餐解析失败不影响登录信息展示。
+fn app_login(
+    kind: &str,
+    accounts: &crate::models::AccountsFile,
+    data_dir: &std::path::Path,
+) -> Option<AppEntitlement> {
     let storage = read_storage_json(kind)?;
-    let uid = infer_cloud_uid(kind, &storage);
+    let uid = current_cloud_uid_hybrid(kind, data_dir);
     let account_name = uid.as_deref().and_then(|u| pool_name_for(accounts, u));
     let ent = parse_entitlement(kind, &storage);
     Some(AppEntitlement {
@@ -584,8 +631,8 @@ fn app_login(kind: &str, accounts: &crate::models::AccountsFile) -> Option<AppEn
 pub fn apps_entitlement_read(state: State<AppState>) -> Result<LocalEntitlement, String> {
     let accounts = crate::vault::load_accounts(&state);
     Ok(LocalEntitlement {
-        work: app_login("TraeWork", &accounts),
-        cn: app_login("Trae", &accounts),
+        work: app_login("TraeWork", &accounts, &state.data_dir),
+        cn: app_login("Trae", &accounts, &state.data_dir),
     })
 }
 
@@ -682,4 +729,63 @@ pub fn refresh_pay_status(state: State<AppState>) -> Result<usize, String> {
     file.updated_at = Some(fs_utils::now_iso());
     crate::store::docs::pay_status_save(&crate::store::db(&state.data_dir), &file)?;
     Ok(ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::marker_with_ts;
+
+    /// marker_with_ts：标记 uid + sidecar 切换时刻（缺失 sidecar → ts=0；
+    /// BOM 剥离与 profiles 目录路由按档案表）
+    #[test]
+    fn marker_with_ts_读取标记与切换时刻() {
+        let data = std::env::temp_dir().join(format!(
+            "trae-apps-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&data);
+        // TraeWork → data/data/profiles（档案表路由）
+        let dir = crate::switcher::profile::profile_for(
+            crate::switcher::TargetApp::TraeWork,
+            &data,
+        )
+        .profiles_dir;
+        std::fs::create_dir_all(&dir).unwrap();
+        // 无标记 → None
+        assert_eq!(marker_with_ts("TraeWork", &data), None);
+        // 带侧标记（PS 时代 BOM）无 sidecar → uid 有、ts=0
+        std::fs::write(dir.join("current_account.txt"), "\u{feff}4487568582777872").unwrap();
+        assert_eq!(
+            marker_with_ts("TraeWork", &data),
+            Some(("4487568582777872".into(), 0))
+        );
+        // sidecar 写入切换时刻
+        std::fs::write(
+            dir.join("current_account.meta.json"),
+            "{\"switchedAtMs\":1789500000000}",
+        )
+        .unwrap();
+        assert_eq!(
+            marker_with_ts("TraeWork", &data),
+            Some(("4487568582777872".into(), 1_789_500_000_000))
+        );
+        // Trae → data/data/profiles_trae（互不串台）
+        let dir2 = crate::switcher::profile::profile_for(crate::switcher::TargetApp::Trae, &data)
+            .profiles_dir;
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("current_account.txt"), "2328112497170937").unwrap();
+        assert_eq!(
+            marker_with_ts("Trae", &data),
+            Some(("2328112497170937".into(), 0))
+        );
+        assert_eq!(
+            marker_with_ts("TraeWork", &data),
+            Some(("4487568582777872".into(), 1_789_500_000_000))
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
 }

@@ -316,7 +316,8 @@ export default function Settings() {
 
           <h3 className="mb-1 font-medium">每日定时签到</h3>
           <p className="mb-3 text-xs text-slate-400">
-            通过 Windows 计划任务在指定时间自动运行签到脚本，无需启动应用界面。注册/删除需要管理员权限。
+            应用内置 Rust 定时调度器：应用运行期间每日 09:00 自动签到（晚于该时刻启动会自动补跑，无需管理员权限）。
+            下方可注册 Windows 计划任务作为兜底，在应用未启动时于指定时间直接运行签到（注册/删除需要管理员权限）。
           </p>
           <div className="flex flex-wrap items-center gap-2">
             <div className="relative flex items-center">

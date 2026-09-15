@@ -303,8 +303,16 @@ pub fn get_current_account(sess: &Session) -> Option<String> {
 /// PS Set-CurrentAccount 对译（-NoNewline -Encoding UTF8 等价：Rust fs::write 无 BOM 无换行）
 pub fn set_current_account(sess: &Session, uid: &str) {
     let f = sess.prof.current_account_file();
-    let _ = std::fs::create_dir_all(f.parent().unwrap_or_else(|| Path::new(".")));
+    let dir = f.parent().unwrap_or_else(|| Path::new("."));
+    let _ = std::fs::create_dir_all(dir);
     let _ = std::fs::write(&f, uid);
+    // F2-6 sidecar（审查修复 2026-09-15）：同步记录切换时刻。背景：切换器恢复快照后，
+    // live 数据目录的 per-uid 使用证据是快照冻结时的旧数据，trae_apps 纯证据推导会指向
+    // 历史账号；客户端手动重登又会写新证据让标记失真。有了切换时刻，读侧可判别
+    // 「标记 vs 证据谁更新」（见 trae_apps::current_cloud_uid_hybrid）。
+    // 新增文件不改动既有 current_account.txt 格式，快照/标记零迁移红线不破。
+    let meta = dir.join("current_account.meta.json");
+    let _ = std::fs::write(&meta, format!("{{\"switchedAtMs\":{}}}", chrono::Utc::now().timestamp_millis()));
 }
 
 // ── 终态行构造 ──────────────────────────────────────────────────────────────
@@ -691,6 +699,9 @@ mod tests {
 
     #[test]
     fn run_action_缺少userid_输出init错误并返回fatal载荷() {
+        // 两个 run_action 测试并行执行会争抢全局 action_gate（try_lock 失败路径
+        // 不发任何步骤 → steps[0] 越界），用测试串行锁排队
+        let _guard = test_io_lock();
         let sink = MemSink::new();
         let r = run_action(
             RunArgs {
@@ -712,6 +723,8 @@ mod tests {
 
     #[test]
     fn run_action_uid非法_文案逐字保留() {
+        // 同上：与另一 run_action 测试经串行锁互斥，避免 action_gate 争抢
+        let _guard = test_io_lock();
         let sink = MemSink::new();
         let r = run_action(
             RunArgs {
