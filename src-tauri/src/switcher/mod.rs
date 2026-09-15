@@ -20,6 +20,7 @@ pub mod locate;
 pub mod machine;
 pub mod proc;
 pub mod profile;
+pub mod vscdb;
 
 use std::path::{Path, PathBuf};
 
@@ -340,11 +341,48 @@ fn restore_profile(sess: &mut Session, slot: &str, sink: &dyn ProgressSink) -> R
     // 恢复项计数（Switch 恢复后校验用）：每次恢复先重置为 -1；仅 icube 结尾写实际值。
     // 校验处用 -le 0 拦截：icube 下等价于 0 项拷贝=快照空/损坏；-1 作为防御一并拦下。
     sess.last_restored_count = -1;
-    match sess.prof.layout {
+    // F-68：icube 布局（TraeWork/Trae）恢复前抽出 state.vscdb 的两个全局键
+    //（项目列表 / 最近打开），恢复后按条目合并回写——账号分区键零改动。
+    // 仅在恢复成功时合并；失败已由布局实现侧处理，合并失败按 warn 处理不阻断。
+    let keep_keys = if sess.prof.layout == Layout::Icube {
+        let p = icube_vscdb_path(&sess.prof.data_dir);
+        let snap = vscdb::snapshot_global_keys(&p);
+        if snap.project_folders.is_some() || snap.recent_paths.is_some() {
+            Some((p, snap))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let r = match sess.prof.layout {
         Layout::Authfile => authfile::restore_authfile(sess, slot, sink),
         Layout::Chromium => chromium::restore_chromium(sess, slot, sink),
         Layout::Icube => icube::restore_icube(sess, slot, sink),
+    };
+    if r.is_ok() {
+        if let Some((p, snap)) = keep_keys {
+            match vscdb::merge_global_keys(&p, &snap) {
+                Ok(Some(summary)) => sink.step(
+                    "restore",
+                    StepStatus::Ok,
+                    &format!("项目列表/最近打开已跨账号保留（{summary}）"),
+                ),
+                Ok(None) => {}
+                Err(e) => sink.step(
+                    "restore",
+                    StepStatus::Warn,
+                    &format!("项目列表/最近打开保留失败（已回滚，不影响登录态）: {e}"),
+                ),
+            }
+        }
     }
+    r
+}
+
+/// icube 布局的 state.vscdb 路径（F-68 合并目标）
+fn icube_vscdb_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("User").join("globalStorage").join("state.vscdb")
 }
 
 // ── Action 编排 ─────────────────────────────────────────────────────────────
