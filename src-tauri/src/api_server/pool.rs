@@ -1052,6 +1052,7 @@ mod tests {
             refresh_token_expires_at: None,
             refresh_token_fails: 0,
             refresh_token_invalid: false,
+            auth_saved_at: None,
         }
     }
 

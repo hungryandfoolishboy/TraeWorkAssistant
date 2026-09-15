@@ -107,6 +107,68 @@ fn short_agent() -> ureq::Agent {
         .build()
 }
 
+/// 交换/用户信息请求 Agent（F-78 批次 3 抓包调试）：
+/// 默认与 short_agent 同款直连；设置环境变量 AIWORK_OAUTH_DEBUG_PROXY（值如
+/// `127.0.0.1:8899`，即本软件 MITM 代理端口）时改走该代理并信任本地 CA
+/// （%APPDATA%/AIWorkAssistant/certs/ca.crt，目录解析与 state.rs::new 同源），
+/// ExchangeToken/GetUserInfo 流量落入代理日志（api.trae.com.cn 已默认入抓包域名），
+/// 供抓包固化 client_secret 校验行为与 refresh_token 轮换语义。
+/// 仅影响 OAuth 交换链路，签到/续期等其余直连请求不受影响。
+fn exchange_agent() -> Result<ureq::Agent, String> {
+    let addr = std::env::var("AIWORK_OAUTH_DEBUG_PROXY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let Some(addr) = addr else {
+        return Ok(short_agent());
+    };
+    let ca_path = std::env::var("APPDATA")
+        .map(|d| {
+            std::path::PathBuf::from(d)
+                .join(crate::state::DATA_DIR_NAME)
+                .join("certs")
+                .join("ca.crt")
+        })
+        .map_err(|e| format!("AIWORK_OAUTH_DEBUG_PROXY 已设置但解析 APPDATA 失败: {e}"))?;
+    let ca_pem = std::fs::read_to_string(&ca_path).map_err(|e| {
+        format!(
+            "AIWORK_OAUTH_DEBUG_PROXY 已设置但读取本地 CA 失败（先启动一次代理生成证书）: {} ({e})",
+            ca_path.display()
+        )
+    })?;
+    let der = pem_cert_der(&ca_pem)?;
+    let mut roots = ureq::rustls::RootCertStore::empty();
+    roots
+        .add(ureq::rustls::pki_types::CertificateDer::from(der))
+        .map_err(|e| format!("本地 CA 载入失败: {e}"))?;
+    let config = ureq::rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(120))
+        .max_idle_connections(4)
+        .proxy(
+            ureq::Proxy::new(&addr)
+                .map_err(|e| format!("AIWORK_OAUTH_DEBUG_PROXY 值无效（{addr}）: {e}"))?,
+        )
+        .tls_config(std::sync::Arc::new(config))
+        .build())
+}
+
+/// PEM(CERTIFICATE) → DER（与 device_proxy/ca.rs::pem_to_der 同实现，避免跨模块 pub 暴露）
+fn pem_cert_der(pem: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let body = pem
+        .split("-----BEGIN CERTIFICATE-----")
+        .nth(1)
+        .and_then(|s| s.split("-----END CERTIFICATE-----").next())
+        .ok_or_else(|| "本地 CA 文件缺少 CERTIFICATE PEM 块".to_string())?;
+    let cleaned: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(cleaned.as_bytes())
+        .map_err(|e| format!("本地 CA base64 解码失败: {e}"))
+}
+
 /// 生成随机 hex 字符串。
 /// 熵源：OS CSPRNG（Windows BCryptGenRandom 系统首选 RNG）。旧 LCG 以时间戳作种子，
 /// 输出可预测，不适合 OAuth state / machine_id 等安全场景（审查 P2）；BCrypt 失败时
@@ -337,7 +399,7 @@ pub fn oauth_parse_callback(callback_url: String) -> Result<OAuthCallbackInfo, S
 /// ExchangeToken 端点按授权码语义（Code 字段）尝试；响应必须同时含 access_token 与
 /// refresh_token 才视为交换成功，否则交由调用方报「暂不支持」。
 fn exchange_code(code: &str) -> Result<(String, String), String> {
-    let resp = short_agent()
+    let resp = exchange_agent()?
         .post(&oauth_client().exchange_url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
@@ -379,7 +441,7 @@ fn exchange_code(code: &str) -> Result<(String, String), String> {
 
 /// ExchangeToken：用 refresh_token 换取 access_token
 fn exchange_token(refresh_token: &str) -> Result<(String, Option<String>), String> {
-    let resp = short_agent()
+    let resp = exchange_agent()?
         .post(&oauth_client().exchange_url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
@@ -427,7 +489,7 @@ fn get_user_info(access_token: &str) -> Result<(String, String), String> {
         format!("Cloud-IDE-JWT {}", access_token)
     };
 
-    let resp = short_agent()
+    let resp = exchange_agent()?
         .post("https://api.trae.com.cn/cloudide/api/v3/trae/GetUserInfo")
         .set("authorization", &auth)
         .set("content-type", "application/json")
@@ -552,6 +614,8 @@ pub fn oauth_login(
             refresh_token_expires_at: None,
             refresh_token_fails: 0,
             refresh_token_invalid: false,
+            // 凭证最近落盘时间（F-78 批次 3 收尾，对齐 Buddy auth_saved_at）
+            auth_saved_at: Some(fs_utils::now_iso()),
         });
         crate::vault::save_accounts(&state, &mut accounts)?;
 

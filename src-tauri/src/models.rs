@@ -46,6 +46,10 @@ pub struct AccountView {
     /// refresh_token 是否已判定失效（连续 3 次失败或服务端明确拒绝；重新 OAuth 登录重置）
     #[serde(default)]
     pub refresh_token_invalid: bool,
+    /// 凭证（JWT/refresh_token）最近一次落盘时间（OAuth 登录/导入/刷新成功时更新；
+    /// F-78 批次 3 收尾，对齐 Buddy 侧 auth_saved_at 先例）
+    #[serde(default)]
+    pub auth_saved_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -74,6 +78,9 @@ pub struct RawAccount {
     /// refresh_token 是否已判定失效（连续 3 次失败或服务端明确拒绝；重新 OAuth 登录重置）
     #[serde(default)]
     pub refresh_token_invalid: bool,
+    /// 凭证最近一次落盘时间（OAuth 登录/导入/刷新成功时更新，仅展示用途）
+    #[serde(default)]
+    pub auth_saved_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -205,6 +212,9 @@ fn default_notify() -> String {
 fn default_retention() -> i32 {
     30
 }
+/// 解密域名白名单默认值（Charles SSL Proxying Locations 语义：列表内 MITM 解密，
+/// 其余透明直通）。完整覆盖字节系九组域；带证书锁定的客户端域（豆包 ttnet 原生栈）
+/// 由自适应降级兜底：连续 3 次握手被客户端中止自动转透明直通（重启代理复位）。
 pub fn default_proxy_domains() -> String {
     "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com".into()
 }
@@ -212,6 +222,18 @@ pub fn default_proxy_domains() -> String {
 /// 旧版默认域名列表（未含 doubao.com）：用于把升级前已持久化的旧默认无缝迁移到新默认
 pub fn legacy_proxy_domains() -> String {
     "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com".into()
+}
+
+/// 上一版默认域名列表（含 doubao.com 宽后缀）：该版本会让豆包客户端 ttnet 原生栈
+/// 的证书锁定域全部被 MITM 拒绝（页面空白/接口挂），迁移到新默认（用户自定义过则不动）
+pub fn legacy_proxy_domains_with_doubao() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com".into()
+}
+
+/// 中间版默认域名列表（过度收窄版：移出了 zijieapi.com）：zijieapi 实测可正常
+/// MITM 且 Trae 抓包需要，迁移回新默认（用户自定义过则不动）
+pub fn legacy_proxy_domains_narrow() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,www.doubao.com,accounts.doubao.com".into()
 }
 
 /// 豆包保活端点默认值：GET /info/v2/（通知未读数，轻量、必须登录，200=有效 / 302=过期）。

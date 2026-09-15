@@ -23,7 +23,7 @@
 | F-68 ✅ | Trae 项目列表/最近打开跨账号保留 | Trae 生态 | **P1** | 1~2 天 | 已完成（2026-09-15） |
 | F-74 ✅ | Buddy 切换时自动迁移会话到目标账号 | Buddy 生态 | **P2** | 2~3 天（含实测） | 已完成（2026-09-15，含 B2 CodeBuddy 会话域扩展） |
 | F-78 ✅ | Trae OAuth 授权闭环补全（回环监听 + 代理豁免 + code 交换） | Trae 生态 | **P1** | 1~2 天（批次1）/ 3~4 天（全链路） | 已完成（2026-09-14） |
-| F-24-余 | 豆包会员额度端点抓包固化 | 豆包 | **P1** | 0.5~1 天（含抓包） | 框架已完成，仅剩前置 |
+| F-24-余 ✅ | 豆包会员额度端点抓包固化 | 豆包 | **P1** | 0.5~1 天（含抓包） | 已完成（2026-09-15：端点经代理实测固化 quota/summary，doubao.com 已入抓包域名；剩真机复验） |
 | F-38 | Trae → DSH 引导（不自研） | Trae 生态 | **P1** | ≈0（装即用） | 待开发 |
 | E-01 | 豆包对话网关（OpenAI 兼容 doubao provider） | 豆包/网关 | **P2** | 8~12 天（含 E-02） | 待开发（方案 B 已论证，含探测实验前置） |
 | E-02 | 豆包指纹嗅探持久化 + a_bogus 纯算法生成器 | 豆包 | **P2** | 并入 E-01 批次 | 待开发（E-01 前置） |
@@ -129,11 +129,13 @@
   3. **批次 3（1 天，健壮性）**：`oauth_parse_callback` 增加 `code` → token 交换分支；MITM 抓包固化 ExchangeToken 真实参数（client_secret 校验行为、refresh_token 轮换语义）；machine_id/device_id 改为从 `device_map.json` 按账号稳定读取；refresh_token 生命周期字段对齐 Buddy 侧（expires_at / 失败计数 / 失效标记）。
 - **参考开源项目**：`dingminhua/dsh-connect-trae`（loopback shim 接收回调的成熟形态，F-38 已引）；本项目 Buddy 侧 `workbuddy_oauth_login`（后端开浏览器 + 轮询 + 自动入池，直接对照实现）；`BlueChonk/trae-credential-reverse-engineering`（token 刷新签名情报，见 F-70，批次 3 联动核对）。
 - **验收**：MITM 代理运行中（复现 issue #10 环境）发起 OAuth 登录 → 浏览器完成授权 → 应用自动弹出"账号已添加"，全程无需手动复制 URL；粘贴回调 URL 兜底路径保留可用；登录页不再出现证书告警；OAuth 账号的签到/续期与 MITM 捕获账号行为一致。
+- **批次 3 收尾落地（2026-09-15）**：①`auth_saved_at` 凭证落盘时间字段补齐（RawAccount/AccountView + OAuth 登录/导入/手动添加/刷新成功四处写入，前端两处徽标展示，对齐 Buddy auth_saved_at；`access_token_expires_at` 经评估无需落盘——`jwt_exp_timestamp` 已实时解析 JWT exp 并展示）；②新增抓包调试路由 `AIWORK_OAUTH_DEBUG_PROXY` 环境变量（`oauth.rs::exchange_agent`）：设为本软件 MITM 端口时 ExchangeToken/GetUserInfo 改走代理并信任本地 CA，流量落入代理日志供固化 client_secret 校验行为与 refresh_token 轮换语义（默认不设＝直连不变）。**待抓包验证项**：client_secret `"-"` 是否强校验（可用 `conf/oauth_client.json` 覆盖做对照实验）、回调形态（refreshToken vs code，浏览器 DevTools 看 302 Location 即可）、refresh_token 轮换语义（同值二次交换是否失效）。
 
-### F-24-余 豆包会员额度端点抓包固化（P1，框架已完成）
+### F-24-余 豆包会员额度端点抓包固化（P1）✅ 已完成（2026-09-15）
 
 - **需求概述**：豆包会员额度（套餐/到期/赠送额度）展示框架已就绪，仅剩把会员额度 XHR 端点经 MITM 抓包固化。
 - **实现路径**：`device_proxy.py` 开启 + `open_doubao_app(proxyPort)` 注入 `--proxy-server` 拉起豆包客户端 → 会员页触发额度请求 → 抓包关键词 `membership|entitlement|quota|remaining|benefit` 定位端点 → 填入 `settings.doubao_quota_url` 即用。
+- **落地落点（2026-09-15 收尾确认）**：端点已固化 `POST https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/`（`models.rs::default_doubao_quota_url`，代理日志实测确认；`doubao_session.rs::DEFAULT_PROBE_URL` 同源复用）；`tasks/doubao_quota.rs::parse_quota` 精确解析 2026-09 实测结构（`current_subscription` 套餐/到期/赠送 + `window_limit_section` 时段/近7天窗口百分比与重置时间）+ 宽容 dig 回退，5 条单测含实测样本；`doubao.com` 已入 `DEFAULT_TARGETS` 与 settings 默认抓包域名（旧默认自动迁移）。剩余仅真机复验：概述页额度卡/单账号查询出数即为闭环。
 - **参考开源项目**：无（端点为豆包私有；抓包链路复用本项目 MITM 基建）。
 
 ### F-38 Trae → DSH 引导（P1，不自研）

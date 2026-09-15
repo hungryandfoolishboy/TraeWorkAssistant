@@ -42,6 +42,7 @@ fn offline_ctx(state: &AppState) -> ProxyCtx {
         targets: Vec::new(),
         auto_capture_jwt: true,
         data_dir: state.data_dir.clone(),
+        pin_state: std::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 

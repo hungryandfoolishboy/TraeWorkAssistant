@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
 use crate::device_proxy::ca::{ensure_ca, CaAuthority};
-use crate::device_proxy::handler::{serve_mitm, HOP_BY_HOP_REQ, ProxyCtx};
+use crate::device_proxy::handler::{serve_mitm, HOP_BY_HOP_REQ, PIN_FAIL_THRESHOLD, ProxyCtx};
 use crate::device_proxy::logger::{ProxyLog, RequestLogger};
 use crate::device_proxy::upstream::{
     connect_direct, connect_via_upstream, UpstreamConnector, UpstreamProxy,
@@ -45,12 +45,21 @@ const CONN_TIMEOUT: Duration = Duration::from_secs(300);
 const PLAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// 分发阶段头缓冲上限（Python 无上限仅靠超时兜底，此处防御性 64KB）
 const MAX_DISPATCH_HEAD: usize = 64 * 1024;
-/// 并发连接上限（对齐 Python `_CONN_SEMAPHORE` 信号量 128）
-const MAX_CONNS: usize = 128;
+/// 并发连接上限（对齐 Python `_CONN_SEMAPHORE` 信号量 128）。
+/// 512：桌面客户端（豆包 = Chromium + cronet/ttnet 双网络栈）全量流量过代理时，
+/// 启动风暴轻松超百条并发 CONNECT，另有长轮询/WS 常驻连接占槽——实测 128 上限
+/// 启动 1 分钟即打满并触发客户端重试风暴（「以此账号打开豆包」整体卡死，
+/// proxy.log 2026-09-15 19:14）。信号量仍兜底防代理自身被打挂。
+const MAX_CONNS: usize = 512;
+/// [overload] 日志节流秒数：重试风暴下每连接一条会刷屏（实测 40+ 条/秒），节流到 5 秒一条
+const OVERLOAD_LOG_INTERVAL_SECS: u64 = 5;
 /// CONNECT 200 应答后的 TLS 握手超时（客户端不发 ClientHello 时及时释放连接与并发槽）
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 默认监听域名（对齐 Python `TARGET_DOMAINS`；桌面端设置页 PROXY_DOMAINS 可覆盖）
+/// 默认解密域名白名单（语义对齐 Charles SSL Proxying Locations：列表内域解密，
+/// 其余 CONNECT 透明直通；桌面端设置页 PROXY_DOMAINS 可覆盖）。
+/// 证书锁定的客户端域（豆包 ttnet 原生栈等）由自适应降级兜底：连续 3 次握手被
+/// 客户端中止即自动转透明直通（见 ProxyCtx::pin_state，重启代理复位）。
 pub const DEFAULT_TARGETS: &[&str] = &[
     "trae.cn",
     "trae.com.cn",
@@ -116,6 +125,7 @@ impl ProxyServer {
             targets,
             auto_capture_jwt: cfg.auto_capture_jwt,
             data_dir: cfg.data_dir.clone(),
+            pin_state: Mutex::new(std::collections::HashMap::new()),
         });
 
         // 升级历史假占位符设备标识（对齐 Python sync_account_devices，仅自动捕获开启时）
@@ -144,7 +154,12 @@ impl ProxyServer {
         if let Some(up) = &cfg.upstream {
             log.log(&format!("上游代理(用户VPN)透传: {}", up.addr()));
         }
-        log.log("请把 CA 证书 certs/ca.cer 安装到 Windows 受信任根证书颁发机构(管理员)。");
+        // CA 安装状态如实探测输出（原为无条件提示，已安装也提示安装，误导用户）
+        if ca::installed_in_windows_root() {
+            log.log("CA 证书已安装到 Windows 受信任根（TraeDeviceProxyCA）✅");
+        } else {
+            log.log("⚠ CA 证书未安装：请在顶部「证书未信任」徽标或引导页一键安装（certs/ca.cer → Windows 受信任根），否则被代理的客户端会因证书不受信而无法加载页面");
+        }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         // 退出通知：accept 循环结束（无论主动 stop 还是意外崩溃）时置 true，
@@ -192,7 +207,14 @@ async fn accept_loop(
         Client::builder(TokioExecutor::new()).build(UpstreamConnector::new(upstream.clone(), ctx.log.clone()));
     let direct_client: Client<UpstreamConnector, Full<Bytes>> =
         Client::builder(TokioExecutor::new()).build(UpstreamConnector::new(None, ctx.log.clone()));
+    // MITM 解密后的上游转发 Client（进程级共享）：跨连接复用 hyper 连接池
+    // （TCP/TLS keep-alive）。原实现在 serve_mitm 内每连接新建 Client，连接池
+    // 无法跨连接复用——桌面客户端高频请求下每请求都重新建连，显著拖慢转发。
+    let mitm_client: Client<UpstreamConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(UpstreamConnector::new(None, ctx.log.clone()));
     let mut conns: Vec<JoinHandle<()>> = Vec::new();
+    // [overload] 日志节流锚点（Unix 秒）
+    let mut last_overload_log: u64 = 0;
     // 空闲期定时回收已结束的连接句柄（审查修复：conns 仅在新 accept 时清理，
     // 长连接高频场景下已完成任务的 JoinHandle 会随 Vec 无界增长）
     let mut reap = tokio::time::interval(Duration::from_secs(60));
@@ -211,9 +233,17 @@ async fn accept_loop(
                     let permit = match Arc::clone(&permits).try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => {
-                            ctx.log.log(&format!(
-                                "[overload] 并发连接已达上限 {MAX_CONNS}，拒绝来自 {peer} 的新连接"
-                            ));
+                            // 节流：重试风暴下同秒可达百条，间隔记一条足够定位
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            if now_secs >= last_overload_log + OVERLOAD_LOG_INTERVAL_SECS {
+                                last_overload_log = now_secs;
+                                ctx.log.log(&format!(
+                                    "[overload] 并发连接已达上限 {MAX_CONNS}，拒绝来自 {peer} 的新连接（后续同类日志 5 秒节流一条）"
+                                ));
+                            }
                             continue;
                         }
                     };
@@ -223,9 +253,14 @@ async fn accept_loop(
                     let task_up = upstream.clone();
                     let task_client = plain_client.clone();
                     let task_direct = direct_client.clone();
+                    let task_mitm = mitm_client.clone();
                     conns.push(tokio::spawn(async move {
                         let _guard = permit; // 释放即归还信号量
-                        handle_conn(stream, peer, task_ctx, task_ca, task_up, task_client, task_direct).await;
+                        handle_conn(
+                            stream, peer, task_ctx, task_ca, task_up, task_client, task_direct,
+                            task_mitm,
+                        )
+                        .await;
                     }));
                 }
                 Err(e) => {
@@ -256,6 +291,7 @@ async fn handle_conn(
     upstream: Option<UpstreamProxy>,
     plain_client: Client<UpstreamConnector, Full<Bytes>>,
     direct_client: Client<UpstreamConnector, Full<Bytes>>,
+    mitm_client: Client<UpstreamConnector, Full<Bytes>>,
 ) {
     let head = match timeout(CONN_TIMEOUT, read_head(&mut stream)).await {
         Ok(Ok(h)) => h,
@@ -284,7 +320,9 @@ async fn handle_conn(
         // 否则握手从空流开始将挂死（明文路径已用 init 注入，此处此前被直接丢弃）
         let overflow = head_after_head_end(&head);
         let mut client = PrefixedStream::new(stream, overflow);
-        if !ctx.host_in_targets(&host) {
+        if !ctx.host_in_targets(&host) || ctx.is_pinned(&host) {
+            // 未配置解密的域名 / 已判定证书锁定的域：透明直通隧道（不解密不记请求日志）。
+            // Charles「SSL Proxying Locations」/ mitmproxy「--ignore-hosts」同款语义。
             tunnel_raw(client, &host, port, &upstream, &ctx.log).await;
             return;
         }
@@ -303,8 +341,27 @@ async fn handle_conn(
         let acceptor = TlsAcceptor::from(ca.gen_server_config(&host));
         // 握手超时（审查修复：原无超时，客户端不发 ClientHello 时任务永久挂起）
         match timeout(HANDSHAKE_TIMEOUT, acceptor.accept(client)).await {
-            Ok(Ok(tls)) => serve_mitm(tls, host, port, ctx).await,
-            Ok(Err(e)) => ctx.log.log(&format!("  [MITM] TLS 握手失败 {host}:{port}: {e}")),
+            Ok(Ok(tls)) => {
+                ctx.note_handshake_ok(&host);
+                serve_mitm(tls, host, port, ctx, mitm_client).await;
+            }
+            Ok(Err(e)) => {
+                // 客户端主动中止（10053/eof）= 证书锁定或连接池竞争；节流记录防刷屏
+                let aborted = e.to_string().contains("10053")
+                    || e.to_string().contains("handshake eof")
+                    || e.to_string().contains("close_notify")
+                    || e.to_string().contains("unexpected EOF");
+                if aborted && ctx.note_handshake_fail(&host) {
+                    // 自适应降级：连续 PIN_FAIL_THRESHOLD 次中止 → 判定证书锁定，
+                    // 后续该域 CONNECT 透明直通（进程内生效，重启代理复位）
+                    ctx.log.log(&format!(
+                        "  [MITM] {host} 连续 {PIN_FAIL_THRESHOLD} 次握手被客户端中止，疑似证书锁定，已自动降级为透明直通"
+                    ));
+                } else if !aborted {
+                    ctx.log
+                        .log(&format!("  [MITM] TLS 握手失败 {host}:{port}: {e}"));
+                }
+            }
             Err(_) => ctx.log.log(&format!(
                 "  [MITM] TLS 握手超时 ({}s) {host}:{port}",
                 HANDSHAKE_TIMEOUT.as_secs()
@@ -712,7 +769,55 @@ mod tests {
             targets: DEFAULT_TARGETS.iter().map(|s| s.to_string()).collect(),
             auto_capture_jwt: true,
             data_dir: dir.clone(),
+            pin_state: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// 解密白名单宽后缀语义（对齐 Python host_in_targets）：配置 `trae.cn` 需同时
+    /// 命中根域名（@/trae.cn 自身）与任意层级子域名（*.trae.cn）；大小写不敏感；
+    /// 非相关域名与「以配置域为尾部但不构成独立标签」的域名不得命中
+    #[test]
+    fn host_in_targets_wide_suffix_semantics() {
+        let dir = temp_dir("targets");
+        let ctx = test_ctx(&dir);
+        // 根域名（@）
+        assert!(ctx.host_in_targets("trae.cn"));
+        assert!(ctx.host_in_targets("mchost.guru"));
+        // 任意层级子域名（*）
+        assert!(ctx.host_in_targets("api.trae.cn"));
+        assert!(ctx.host_in_targets("a.b.api5-normal.trae.cn"));
+        assert!(ctx.host_in_targets("www.doubao.com"));
+        // 大小写不敏感（CONNECT host 大小写由客户端决定）
+        assert!(ctx.host_in_targets("API.TRAE.CN"));
+        assert!(ctx.host_in_targets("Www.Doubao.COM"));
+        // 非相关域名
+        assert!(!ctx.host_in_targets("example.com"));
+        // 尾部字符串相同但非独立标签的域名不得命中（防 eviltrae.cn 绕过/误伤）
+        assert!(!ctx.host_in_targets("eviltrae.cn"));
+        assert!(!ctx.host_in_targets("notdoubao.com"));
+    }
+
+    /// 自适应证书锁定降级：连续失败达阈值判 pinned，成功清零
+    #[test]
+    fn adaptive_pin_downgrade() {
+        let dir = temp_dir("pin");
+        let ctx = test_ctx(&dir);
+        assert!(!ctx.is_pinned("mcs.doubao.com"));
+        assert!(ctx.note_handshake_fail("mcs.doubao.com") == (PIN_FAIL_THRESHOLD == 1));
+        assert!(!ctx.is_pinned("mcs.doubao.com"));
+        ctx.note_handshake_fail("mcs.doubao.com");
+        // 阈值（3）达到 → pinned，CONNECT 分流将转透明直通
+        assert!(ctx.note_handshake_fail("mcs.doubao.com"));
+        assert!(ctx.is_pinned("mcs.doubao.com"));
+        // 其他域不受影响
+        assert!(!ctx.is_pinned("www.doubao.com"));
+        // 混布域：一次成功即清零（webview 成功连接不应被 cronet 失败连坐）
+        ctx.note_handshake_fail("www.doubao.com");
+        ctx.note_handshake_fail("www.doubao.com");
+        ctx.note_handshake_ok("www.doubao.com");
+        assert!(!ctx.is_pinned("www.doubao.com"));
+        ctx.note_handshake_fail("www.doubao.com");
+        assert!(!ctx.is_pinned("www.doubao.com"));
     }
 
     /// 假占位符（旧算法）设备字段应被刷新为当前算法值，且二次同步幂等

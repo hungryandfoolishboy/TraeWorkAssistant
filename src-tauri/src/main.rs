@@ -591,6 +591,17 @@ fn main() {
                     fs_utils::app_log(&state.data_dir, &format!("应用退出：还原系统代理失败(可手动关闭): {e}"));
                 }
             }
+            // 兜底强制退出（Python 版为独立进程 kill 瞬退、无此问题；Rust 进程内化后，
+            // 析构阶段的 WebView2 销毁/异步运行时 drop 可能卡死——实测退出停留在
+            // 「正在停止进程内代理」后进程挂死，用户重复点关闭 9 次）。上方清理均为
+            // 同步快操作且已完成，2 秒后无条件 process::exit 保证必然退出。
+            if let Some(state) = app_handle.try_state::<AppState>() {
+                fs_utils::app_log(&state.data_dir, "应用退出：清理完成，2 秒内强制退出（兜底防析构卡死）");
+            }
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                std::process::exit(0);
+            });
         }
     });
 }

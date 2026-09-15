@@ -43,25 +43,12 @@ fn explain_certutil_exit(code: Option<i32>) -> String {
     }
 }
 
-/// 查询指定根存储是否含 TraeDeviceProxyCA（args 形如 ["-store","Root"] /
-/// ["-user","-store","Root"]；查询失败一律视为未安装）
-fn store_contains_cn(args: &[&str]) -> bool {
-    let out = Command::new("certutil")
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).contains("TraeDeviceProxyCA"),
-        Err(_) => false,
-    }
-}
-
 #[tauri::command(async)]
 pub fn cert_status(_app: AppHandle, _state: State<AppState>) -> CertStatus {
     // Chrome/Edge 走 Windows 证书 API，HKLM 与 HKCU Root 合并参与链验证，
-    // 任一命中即视为已安装（HKCU 降级安装的用户态路径）
-    let installed =
-        store_contains_cn(&["-store", "Root"]) || store_contains_cn(&["-user", "-store", "Root"]);
+    // 任一命中即视为已安装（HKCU 降级安装的用户态路径）；检测实现收口至
+    // device_proxy::ca::installed_in_windows_root（与代理启动日志同源）
+    let installed = crate::device_proxy::ca::installed_in_windows_root();
     CertStatus { installed }
 }
 

@@ -453,6 +453,7 @@ mod tests {
                     refresh_token_expires_at: None,
                     refresh_token_fails: 0,
                     refresh_token_invalid: false,
+                    auth_saved_at: None,
                 },
                 // 无 uid 的账号不占位（vault 无法按 uid 键存储）
                 RawAccount {
@@ -466,6 +467,7 @@ mod tests {
                     refresh_token_expires_at: None,
                     refresh_token_fails: 0,
                     refresh_token_invalid: false,
+                    auth_saved_at: None,
                 },
             ],
         };

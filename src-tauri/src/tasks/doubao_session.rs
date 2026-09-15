@@ -125,7 +125,23 @@ fn copy_cookies_db(prof: &Path) -> Result<(PathBuf, PathBuf), String> {
     let td = std::env::temp_dir().join(format!("aw_ck_{}_{nanos}", std::process::id()));
     std::fs::create_dir_all(&td).map_err(|e| format!("临时目录创建失败: {e}"))?;
     let tmp_db = td.join("Cookies");
-    std::fs::copy(&db, &tmp_db).map_err(|e| format!("Cookies 复制失败: {e}"))?;
+    // 客户端运行中会独占 Cookies 锁（os error 32）：短重试两次，仍失败返回明确的
+    // 「运行中占用」语义（上层按此静默跳过，不再当作错误刷屏）
+    let mut copied = Err("unreached".into());
+    for _ in 0..3 {
+        copied = std::fs::copy(&db, &tmp_db).map(|_| ()).map_err(|e| {
+            if e.to_string().contains("32") {
+                "Cookies 被豆包客户端运行占用，跳过本轮探测".to_string()
+            } else {
+                format!("Cookies 复制失败: {e}")
+            }
+        });
+        if copied.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    copied?;
     // -wal/-shm 一并复制，尽量避免读到未 checkpoint 的空库
     for suffix in ["-wal", "-shm"] {
         let side = db.with_file_name(format!("Cookies{suffix}"));

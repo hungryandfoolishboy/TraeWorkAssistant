@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// 凭证头脱敏清单（键比较不区分大小写）：命中即掩码，禁止明文落盘。
 /// x-cloudide-token / x-icube-token 与 handler::auth_header_value 嗅探的 JWT 承载头
@@ -168,10 +168,12 @@ pub(crate) fn extract_sse_summary(resp_headers: &[(String, String)], body: &[u8]
 /// 超过 10MB 滚动为 proxy.log.1（审查修复：原 append-only 无上限，长跑高频 WS 帧日志可无限增长）
 #[derive(Clone)]
 pub struct ProxyLog {
-    file: Arc<Mutex<Option<std::fs::File>>>,
-    log_path: PathBuf,
-    app: Option<tauri::AppHandle>,
-    captured: Arc<AtomicI64>,
+    /// (带时间戳行, 原始行) 投递给专用落盘线程。写文件+滚动+前端 emit 全部移出
+    /// tokio worker——此前同步写盘（Mutex + flush + Tauri IPC emit）跑在异步上下文，
+    /// 桌面客户端启动风暴（百级连接、每请求 3~4 行日志）会阻塞 worker，导致 TLS
+    /// accept / 上游转发排队超时（实测 forward 30s 超时 + 客户端握手中止恶性循环；
+    /// Python 版 thread-per-connection 无此问题）
+    tx: std::sync::mpsc::Sender<(String, String)>,
 }
 
 /// proxy.log 单文件滚动上限
@@ -186,44 +188,51 @@ impl ProxyLog {
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let file = open_append(&log_path).or_else(|| {
-            let fallback = std::env::temp_dir().join("aiwork_proxy.log");
-            open_append(&fallback)
-        });
-        Self { file: Arc::new(Mutex::new(file)), log_path, app, captured }
+        let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
+        std::thread::Builder::new()
+            .name("proxy-log-drainer".into())
+            .spawn(move || {
+                use tauri::Emitter;
+                let mut path = log_path;
+                let mut file = open_append(&path).or_else(|| {
+                    path = std::env::temp_dir().join("aiwork_proxy.log");
+                    open_append(&path)
+                });
+                while let Ok((stamped, raw)) = rx.recv() {
+                    if file.is_none() {
+                        file = open_append(&path);
+                    }
+                    if let Some(f) = file.as_mut() {
+                        // 滚动：超限先关句柄（Windows rename 需独占）→ 换名 .1 → 重开
+                        if f.metadata().map(|m| m.len()).unwrap_or(0) >= PROXY_LOG_MAX {
+                            let _ = file.take(); // 关闭旧句柄（drop 副作用，非赋值）
+                            let rotated = path.with_extension("log.1");
+                            let _ = std::fs::remove_file(&rotated);
+                            let _ = std::fs::rename(&path, &rotated);
+                            file = open_append(&path);
+                        }
+                    }
+                    if let Some(f) = file.as_mut() {
+                        let _ = writeln!(f, "{stamped}");
+                        let _ = f.flush();
+                    }
+                    if let Some(app) = &app {
+                        let _ = app.emit("proxy-log", &raw);
+                        if let Some(uid) = extract_uid(&raw) {
+                            captured.fetch_add(1, Ordering::Relaxed);
+                            let _ = app.emit("account-captured", &uid);
+                        }
+                    }
+                }
+            })
+            .expect("spawn proxy log drainer");
+        Self { tx }
     }
 
-    /// 记录一行操作日志（自动加时间戳前缀）
+    /// 记录一行操作日志（自动加时间戳前缀；非阻塞投递给落盘线程，顺序有保证）
     pub fn log(&self, line: &str) {
         let stamped = format!("[{}] {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), line);
-        {
-            let mut g = self.file.lock().unwrap_or_else(|e| e.into_inner());
-            if g.is_none() {
-                *g = open_append(&self.log_path);
-            }
-            if let Some(f) = g.as_mut() {
-                // 滚动：超限先关句柄（Windows rename 需独占）→ 换名 .1 → 重开
-                if f.metadata().map(|m| m.len()).unwrap_or(0) >= PROXY_LOG_MAX {
-                    let _ = g.take();
-                    let rotated = self.log_path.with_extension("log.1");
-                    let _ = std::fs::remove_file(&rotated);
-                    let _ = std::fs::rename(&self.log_path, &rotated);
-                    *g = open_append(&self.log_path);
-                }
-            }
-            if let Some(f) = g.as_mut() {
-                let _ = writeln!(f, "{stamped}");
-                let _ = f.flush();
-            }
-        }
-        if let Some(app) = &self.app {
-            use tauri::Emitter;
-            let _ = app.emit("proxy-log", line);
-            if let Some(uid) = extract_uid(line) {
-                self.captured.fetch_add(1, Ordering::Relaxed);
-                let _ = app.emit("account-captured", &uid);
-            }
-        }
+        let _ = self.tx.send((stamped, line.to_string()));
     }
 }
 
@@ -255,24 +264,35 @@ struct RollingState {
 }
 
 pub struct RequestLogger {
-    dir: PathBuf,
-    max_size: u64,
-    state: Mutex<RollingState>,
+    /// 格式化后的整块日志投递给专用落盘线程（滚动+写盘+flush 移出 tokio worker，
+    /// 理由同 ProxyLog 异步化）
+    tx: std::sync::mpsc::Sender<String>,
 }
 
 impl RequestLogger {
     pub fn new(dir: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&dir);
-        Self {
-            dir,
-            max_size: 100 * 1024 * 1024,
-            state: Mutex::new(RollingState {
-                file: None,
-                day: String::new(),
-                seq: 0,
-                size: 0,
-            }),
-        }
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::Builder::new()
+            .name("proxy-reqlog-drainer".into())
+            .spawn(move || {
+                let mut state = RollingState {
+                    file: None,
+                    day: String::new(),
+                    seq: 0,
+                    size: 0,
+                };
+                let max_size = 100 * 1024 * 1024;
+                while let Ok(data) = rx.recv() {
+                    if let Ok(f) = Self::ensure_file(&mut state, &dir, max_size) {
+                        let _ = f.write_all(data.as_bytes());
+                        let _ = f.flush();
+                        state.size += data.len() as u64;
+                    }
+                }
+            })
+            .expect("spawn proxy req-log drainer");
+        Self { tx }
     }
 
     /// 确保当日文件可写（跨日/超限换文件），返回已定位的写入口
@@ -306,12 +326,8 @@ impl RequestLogger {
     }
 
     fn write_block(&self, data: &str) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Ok(f) = Self::ensure_file(&mut st, &self.dir, self.max_size) {
-            let _ = f.write_all(data.as_bytes());
-            let _ = f.flush();
-            st.size += data.len() as u64;
-        }
+        // 非阻塞投递（丢失容忍：日志非关键数据；线程退出即停）
+        let _ = self.tx.send(data.to_string());
     }
 
     /// 记录一次完整请求/响应（脱敏红线：凭证头与体级凭证键值掩码后落盘）

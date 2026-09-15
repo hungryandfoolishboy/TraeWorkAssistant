@@ -81,6 +81,8 @@ export interface AccountView {
   refresh_token_fails?: number;
   /** refresh_token 是否已判定失效（连续 3 次失败或服务端明确拒绝，需重新 OAuth 登录） */
   refresh_token_invalid?: boolean;
+  /** 凭证最近一次落盘时间（OAuth 登录/导入/刷新成功时更新，F-78 批次 3 收尾） */
+  auth_saved_at?: string | null;
 }
 
 // ---- 积分消耗历史（Trae Work query_user_usage_group_by_session，按本地日聚合 + 增量拉取） ----

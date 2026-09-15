@@ -8,6 +8,7 @@
 //! 5. 其余转发上游：非流式整体缓冲 + 凭据抓取（refresh_token / 豆包会话）；
 //!    流式（SSE）逐块 chunked 转发 + 全量摘要落日志
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -16,7 +17,6 @@ use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::Request;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
@@ -91,7 +91,13 @@ pub struct ProxyCtx {
     pub auto_capture_jwt: bool,
     /// 数据根目录（SQLite 化 P3：accounts/cooldowns/凭证快照均经 store 读写）
     pub data_dir: PathBuf,
+    /// 自适应证书锁定降级：host → 连续握手被客户端中止次数（成功清零；
+    /// 达 PIN_FAIL_THRESHOLD 即 pinned，该域 CONNECT 转透明直通，重启复位）
+    pub pin_state: Mutex<HashMap<String, u32>>,
 }
+
+/// 自适应降级阈值：连续 N 次握手被客户端中止即判定证书锁定
+pub const PIN_FAIL_THRESHOLD: u32 = 3;
 
 impl ProxyCtx {
     /// 域名后缀匹配（对齐 Python host_in_targets）
@@ -100,6 +106,32 @@ impl ProxyCtx {
         self.targets
             .iter()
             .any(|d| h == *d || h.ends_with(&format!(".{d}")))
+    }
+
+    /// 握手成功：清除该域的中止计数（混布域——webview 成功/cronet 失败——不被误判）
+    pub fn note_handshake_ok(&self, host: &str) {
+        self.pin_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(host);
+    }
+
+    /// 握手被客户端中止：累加连续计数，返回 true 表示刚达到阈值（首次判定为锁定）
+    pub fn note_handshake_fail(&self, host: &str) -> bool {
+        let mut m = self.pin_state.lock().unwrap_or_else(|e| e.into_inner());
+        let c = m.entry(host.to_string()).or_insert(0);
+        *c = c.saturating_add(1);
+        *c == PIN_FAIL_THRESHOLD
+    }
+
+    /// 该域是否已判定证书锁定（CONNECT 转透明直通）
+    pub fn is_pinned(&self, host: &str) -> bool {
+        self.pin_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(host)
+            .map(|c| *c >= PIN_FAIL_THRESHOLD)
+            .unwrap_or(false)
     }
 
     /// path 子串匹配已知接口（对齐 Python classify_path）
@@ -691,7 +723,7 @@ fn try_capture_doubao_credentials(ctx: &ProxyCtx, host: &str, req_headers: &[(St
 async fn forward_upstream<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut tokio_rustls::server::TlsStream<S>,
     client: &Client<UpstreamConnector, Full<Bytes>>,
-    ctx: &ProxyCtx,
+    ctx: &Arc<ProxyCtx>,
     host: &str,
     port: u16,
     req: &RawRequest,
@@ -775,9 +807,25 @@ async fn forward_upstream<S: AsyncRead + AsyncWrite + Unpin>(
             if send_response(io, status, reason, &resp_pairs, &resp_body).await.is_err() {
                 return false;
             }
-            // 凭据抓取 + 请求日志
-            try_capture_refresh_token(ctx, &req.path, &resp_body);
-            try_capture_doubao_credentials(ctx, host, &req.headers, &resp_pairs);
+            // 凭据抓取：refresh_token / 豆包 cookie 命中时涉及 SQLite 全量账号读写 +
+            // vault 加密写盘，移出 tokio worker 防风暴期阻塞 accept/上游转发
+            {
+                let ctx2 = Arc::clone(ctx);
+                let path2 = req.path.clone();
+                let body2 = resp_body.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    try_capture_refresh_token(&ctx2, &path2, &body2);
+                });
+            }
+            {
+                let ctx2 = Arc::clone(ctx);
+                let host2 = host.to_string();
+                let req_h = req.headers.clone();
+                let resp_h = resp_pairs.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    try_capture_doubao_credentials(&ctx2, &host2, &req_h, &resp_h);
+                });
+            }
             ctx.req_logger.log_request(
                 &method,
                 host,
@@ -905,13 +953,12 @@ pub async fn serve_mitm<S: AsyncRead + AsyncWrite + Unpin>(
     host: String,
     port: u16,
     ctx: Arc<ProxyCtx>,
+    // 进程级共享上游 Client（mod.rs 创建）：跨连接复用 hyper 连接池（TCP/TLS
+    // keep-alive），避免每连接/每请求重新建连——桌面客户端高频请求下显著提速
+    client: Client<UpstreamConnector, Full<Bytes>>,
 ) {
     ctx.log
         .log(&format!("  [MITM] 进入 HTTPS 解密隧道: {host}:{port}"));
-    // Python forward_upstream 每请求新建 HTTPSConnection（无连接池）；
-    // 此处每连接建一个 Client 等价复用，MITM 上游恒为直连（对齐 Python）
-    let client: Client<UpstreamConnector, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(UpstreamConnector::new(None, ctx.log.clone()));
 
     loop {
         // 首读给 300s 超时（对齐握手期 _CONN_TIMEOUT；keep-alive 空闲由客户端断开驱动）
@@ -960,7 +1007,11 @@ pub async fn serve_mitm<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 if let (true, Some(valid)) = (is_valid, valid_cloud_ide_jwt(raw)) {
                     if let Some(uid) = extract_user_id(&valid) {
-                        update_account_jwt(&ctx, &uid, &valid);
+                        // 重 DB 写盘（SQLite 全量账号读写）移出 async worker
+                        let ctx2 = Arc::clone(&ctx);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            update_account_jwt(&ctx2, &uid, &valid);
+                        });
                     }
                 }
             }
@@ -1111,6 +1162,7 @@ mod tests {
             targets: vec![],
             auto_capture_jwt: true,
             data_dir: dir.clone(),
+            pin_state: Mutex::new(HashMap::new()),
         }
     }
 

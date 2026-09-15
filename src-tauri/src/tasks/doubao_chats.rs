@@ -503,12 +503,30 @@ fn read_profile_session(prof: &Path) -> Value {
 
     let work = || -> Result<Value, String> {
         std::fs::create_dir_all(&td).map_err(|e| format!("临时目录创建失败: {e}"))?;
-        // Cookies 及其 -journal/-wal 一并复制，避免读到未恢复的事务状态
+        // Cookies 及其 -journal/-wal 一并复制，避免读到未恢复的事务状态。
+        // 客户端运行中会独占 Cookies 锁（os error 32）：短重试两次，仍失败返回明确的
+        // 「运行中占用」语义（上层按此静默跳过，不再当作错误刷屏）
         let entries = std::fs::read_dir(&src_dir).map_err(|e| format!("读取目录失败: {e}"))?;
         for e in entries.flatten() {
             let name = e.file_name();
             if name.to_string_lossy().starts_with("Cookies") {
-                std::fs::copy(e.path(), td.join(&name)).map_err(|e| format!("Cookies 复制失败: {e}"))?;
+                let src = e.path();
+                let dst = td.join(&name);
+                let mut copied = Err("unreached".into());
+                for _ in 0..3 {
+                    copied = std::fs::copy(&src, &dst).map(|_| ()).map_err(|err| {
+                        if err.to_string().contains("32") {
+                            "Cookies 被豆包客户端运行占用，跳过本轮探测".to_string()
+                        } else {
+                            format!("Cookies 复制失败: {err}")
+                        }
+                    });
+                    if copied.is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                copied?;
             }
         }
         let conn = rusqlite::Connection::open_with_flags(
@@ -569,7 +587,10 @@ fn read_profile_session(prof: &Path) -> Value {
         Ok(v) => v,
         Err(e) => {
             let pname = prof.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            eprintln!("[check-login] {pname} Cookies 读取失败: {e}");
+            // 客户端运行中占用 Cookies 锁 = 预期状态（探测不可用非故障），静默跳过不刷屏
+            if !e.contains("跳过本轮探测") {
+                eprintln!("[check-login] {pname} Cookies 读取失败: {e}");
+            }
             json!({
                 "doubao_cookies": 0, "has_session": false,
                 "sessionid_remaining_sec": null,
@@ -640,7 +661,7 @@ pub fn check_login_cookie(profile_dir: &Path) -> Value {
             .unwrap_or(Value::Null);
         result["has_session"] = e["has_session"].clone();
         result["sessionid_remaining_sec"] = e["sessionid_remaining_sec"].clone();
-        if !e["error"].is_null() {
+        if !e["error"].is_null() && !e["error"].as_str().unwrap_or("").contains("跳过本轮探测") {
             eprintln!("[check-login] 活跃 Profile {a} 读取失败: {}", e["error"]);
         }
     } else {

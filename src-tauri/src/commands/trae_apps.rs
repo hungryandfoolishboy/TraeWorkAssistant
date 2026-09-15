@@ -536,6 +536,8 @@ pub fn apps_account_add(
         refresh_token_expires_at: None,
         refresh_token_fails: 0,
         refresh_token_invalid: false,
+        // 自动发现仅记录元数据，无凭证落盘
+        auth_saved_at: None,
     });
     crate::vault::save_accounts(&state, &mut accounts)?;
     fs_utils::app_log(

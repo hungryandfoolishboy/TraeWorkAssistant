@@ -548,7 +548,21 @@ mod tests {
         );
         let mut f = frame_logger("client_to_up", "h.com".into(), "/ws".into(), log);
         f(0x1, br#"{"token":"secret-jwt-value"}"#, None);
-        let content = std::fs::read_to_string(dir.join("proxy.log")).unwrap();
+        // 日志经专用落盘线程异步写盘（非阻塞投递）：轮询等待内容落盘后再断言
+        let path = dir.join("proxy.log");
+        let content = {
+            let mut s = String::new();
+            for _ in 0..50 {
+                if let Ok(read) = std::fs::read_to_string(&path) {
+                    s = read;
+                    if !s.is_empty() {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            s
+        };
         assert!(!content.contains("secret-jwt-value"), "WS 帧凭证必须脱敏:\n{content}");
         assert!(content.contains("***"));
     }

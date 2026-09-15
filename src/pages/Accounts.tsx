@@ -441,11 +441,12 @@ export default function Accounts() {
                             <Zap size={12} />
                           </span>
                         )}
-                        {/* F-78 批次 3：refresh_token 生命周期（失效/连续失败/即将过期） */}
+                        {/* F-78 批次 3：refresh_token 生命周期（失效/连续失败/即将过期）+ 凭证保存时间 */}
                         <RefreshTokenBadge
                           invalid={a.refresh_token_invalid}
                           fails={a.refresh_token_fails}
                           expiresAt={a.refresh_token_expires_at}
+                          savedAt={a.auth_saved_at}
                         />
                         <button
                           title="查看 JWT"

@@ -209,8 +209,10 @@ export default function GeneralSettingsPanel() {
               placeholder="trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com"
             />
             <p className="mt-1 text-xs text-slate-400">
-              逗号分隔的域名后缀列表，匹配的域名将走 MITM 解密并记录日志。未在列表中的域名请求将透明转发但不记录日志，不影响其他 App
-              正常上网。留空则使用默认值。
+              逗号分隔的域名后缀列表，即 <b>解密白名单</b>（同 Charles SSL Proxying）：列表内域名走
+              MITM 解密并记录日志；未列出的域名透明直通、不记录。注意：做证书锁定（cert pinning）的客户端
+              （如豆包 ttnet 原生栈）对其 API 域解密会被拒，应只列入需要抓取凭证/流量的具体域名
+              （如 www.doubao.com），不要配宽后缀。留空则使用默认值。
             </p>
           </div>
           <div>

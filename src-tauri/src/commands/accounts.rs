@@ -392,6 +392,7 @@ pub fn accounts_import(
             refresh_token_expires_at: None,
             refresh_token_fails: 0,
             refresh_token_invalid: false,
+            auth_saved_at: Some(fs_utils::now_iso()),
         });
         report.added += 1;
     }
@@ -570,6 +571,7 @@ pub fn account_add_manual(
         refresh_token_expires_at: None,
         refresh_token_fails: 0,
         refresh_token_invalid: false,
+        auth_saved_at: Some(fs_utils::now_iso()),
     });
     crate::vault::save_accounts(&state, &mut accounts)?;
     if let Some(g) = group_id {
@@ -1561,6 +1563,7 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
         // 刷新成功：生命周期计数清零、失效标记解除（F-78 批次 3）
         account.refresh_token_fails = 0;
         account.refresh_token_invalid = false;
+        account.auth_saved_at = Some(fs_utils::now_iso());
         // 若响应携带 refresh_token 过期时间则更新（兼容秒/毫秒两种时间戳）
         if let Some(exp) = crate::fs_utils::dig(
             &body,
@@ -1775,6 +1778,7 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
             refresh_token_expires_at: a.refresh_token_expires_at,
             refresh_token_fails: a.refresh_token_fails,
             refresh_token_invalid: a.refresh_token_invalid,
+            auth_saved_at: a.auth_saved_at.clone(),
         });
     }
     out

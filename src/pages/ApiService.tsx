@@ -534,6 +534,7 @@ export default function ApiService() {
                           invalid={a.refresh_token_invalid}
                           fails={a.refresh_token_fails}
                           expiresAt={a.refresh_token_expires_at}
+                          savedAt={a.auth_saved_at}
                         />
                         {poolItem?.disabled && !a.refresh_token_invalid && (
                           <Badge tone="red">已禁用</Badge>

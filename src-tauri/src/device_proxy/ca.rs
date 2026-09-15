@@ -41,12 +41,14 @@ fn next_serial() -> u64 {
 }
 
 /// MITM 证书颁发机构：持有 CA 签发器，按域名在内存内签发叶子证书并缓存 ServerConfig。
-/// 结构对齐 hudsucker 的 RcgenAuthority（叶子复用 CA 密钥对，属于 MITM 代理通行做法）。
 pub struct CaAuthority {
     issuer: Issuer<'static, KeyPair>,
-    /// CA 私钥原始格式 DER（PKCS#8 进 PKCS#8、PKCS#1 进 PKCS#1）：rustls 按
-    /// PrivateKeyDer variant 分派解析，格式错配即「failed to parse private key」
-    ca_key_der: PrivateKeyDer<'static>,
+    /// 叶子证书独立密钥（RSA-2048，启动时生成一次、全部叶子复用，与 CA 密钥严格
+    /// 分离——对齐 Python 版「每叶子独立密钥」结构）。差异修复 2026-09-15：此前
+    /// 叶子复用 CA 密钥（SPKI == 签发 CA SPKI 的畸形结构），豆包客户端 ttnet/cronet
+    /// 原生栈（BoringSSL 定制校验）一律拒之门外（握手中止 os error 10053 → 页面
+    /// 空白）；Python 版独立密钥叶子同 CA 同域被正常接受（leaf_*.key 文件为证）
+    leaf_key: KeyPair,
     provider: Arc<CryptoProvider>,
     cache: Mutex<HashMap<String, Arc<ServerConfig>>>,
 }
@@ -80,20 +82,47 @@ impl CaAuthority {
         params.use_authority_key_identifier_extension = true;
 
         let cert = params
-            .signed_by(&self.issuer.key(), &self.issuer)
+            .signed_by(&self.leaf_key, &self.issuer)
             .expect("failed to sign leaf certificate");
 
-        let mut cfg = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
+        let cfg = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
             .with_safe_default_protocol_versions()
             .expect("protocol versions")
             .with_no_client_auth()
-            .with_single_cert(vec![CertificateDer::from(cert)], self.ca_key_der.clone_key())
+            .with_single_cert(
+                vec![CertificateDer::from(cert)],
+                PrivatePkcs8KeyDer::from(self.leaf_key.serialize_der()).into(),
+            )
             .expect("failed to build server config");
-        // 仅广播 http/1.1：对齐 Python 版（未设置 ALPN，客户端回落 HTTP/1.1），
-        // 避免引入 h2 分支后与请求日志/签到改写逻辑出现行为分叉
-        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        // 不广播 ALPN（对齐 Python 版 ssl.SSLContext 默认行为——ServerHello 不带
+        // ALPN 扩展，客户端一律回落 HTTP/1.1）。差异修复 2026-09-15：此前显式广播
+        // ALPN=[http/1.1]，对只提供 h2 的客户端（豆包 cronet/ttnet 原生栈对其 API
+        // 域常见）服务端选不出共同协议直接握手告警中止（实测 proxy.log 大量
+        // 「TLS 握手失败 os error 10053」，Python 版同域无此现象）。
         cfg
     }
+}
+
+/// 查询 Windows 受信任根存储是否含本代理 CA（TraeDeviceProxyCA）。
+/// HKLM 与 HKCU Root 任一命中即视为已安装（与 commands::cert::cert_status 同语义）；
+/// 查询失败一律视为未安装。供代理启动日志输出真实安装状态（此前为无条件提示，误导）。
+#[cfg(target_os = "windows")]
+pub fn installed_in_windows_root() -> bool {
+    use std::os::windows::process::CommandExt;
+    let run = |args: &[&str]| -> bool {
+        std::process::Command::new("certutil")
+            .args(args)
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("TraeDeviceProxyCA"))
+            .unwrap_or(false)
+    };
+    run(&["-store", "Root"]) || run(&["-user", "-store", "Root"])
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn installed_in_windows_root() -> bool {
+    false
 }
 
 /// 确保数据目录下存在可用 CA：已有则加载（兼容 Python 版 RSA CA），缺失则生成并落盘。
@@ -108,19 +137,19 @@ pub fn ensure_ca(certs_dir: &std::path::Path) -> Result<CaAuthority, String> {
 
     std::fs::create_dir_all(certs_dir).map_err(|e| format!("创建证书目录失败: {e}"))?;
 
-    let (issuer, ca_key_der) = if cert_pem_path.exists() && key_pem_path.exists() {
+    let issuer = if cert_pem_path.exists() && key_pem_path.exists() {
         let cert_pem = std::fs::read_to_string(&cert_pem_path)
             .map_err(|e| format!("读取 CA 证书失败: {e}"))?;
         let key_pem = std::fs::read_to_string(&key_pem_path)
             .map_err(|e| format!("读取 CA 私钥失败: {e}"))?;
-        let (issuer, key_der) = load_issuer(&cert_pem, &key_pem)?;
+        let issuer = load_issuer(&cert_pem, &key_pem)?;
         // ca.cer 缺失则从 ca.crt(PEM) 补导出 DER：老版本/异常过程可能只留下
         // ca.crt+ca.key，certutil 安装依赖 ca.cer，缺失会在 UAC 后立即失败（闪退）
         if !cer_der_path.exists() {
             let der = pem_to_der(&cert_pem)?;
             std::fs::write(&cer_der_path, der).map_err(|e| format!("补写 ca.cer 失败: {e}"))?;
         }
-        (issuer, key_der)
+        issuer
     } else {
         let generated = generate_ca()?;
         // 先落盘再使用：ca.cer(DER) 供 certutil 安装，ca.crt/ca.key 供下次启动加载
@@ -131,11 +160,15 @@ pub fn ensure_ca(certs_dir: &std::path::Path) -> Result<CaAuthority, String> {
         std::fs::write(&cer_der_path, generated.cert_der)
             .map_err(|e| format!("写入 ca.cer 失败: {e}"))?;
         harden_ca_dir(certs_dir);
-        (generated.issuer, generated.key_der)
+        generated.issuer
     };
 
+    // 叶子独立密钥：RSA-2048（与 Python 版叶子同算法），启动时生成一次（约百毫秒）
+    let leaf_key = KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+        .map_err(|e| format!("生成叶子证书密钥失败: {e}"))?;
+
     let provider = Arc::new(load_crypto_provider());
-    Ok(CaAuthority { issuer, ca_key_der, provider, cache: Mutex::new(HashMap::new()) })
+    Ok(CaAuthority { issuer, leaf_key, provider, cache: Mutex::new(HashMap::new()) })
 }
 
 struct GeneratedCa {
@@ -143,16 +176,13 @@ struct GeneratedCa {
     cert_pem: String,
     key_pem: String,
     cert_der: Vec<u8>,
-    /// 生成密钥的 PKCS#8 DER（serialize_der 必须在 key_pair 移交 Issuer 之前调用）
-    key_der: PrivateKeyDer<'static>,
 }
 
 /// 生成自签 CA（CN=TraeDeviceProxyCA，10 年有效期，ECDSA P-256）
 fn generate_ca() -> Result<GeneratedCa, String> {
     let key_pair = KeyPair::generate().map_err(|e| format!("生成 CA 密钥失败: {e}"))?;
-    // 私钥 PEM / PKCS#8 DER 必须在 key_pair 移交 Issuer 之前序列化
+    // 私钥 PEM 必须在 key_pair 移交 Issuer 之前序列化
     let key_pem = key_pair.serialize_pem();
-    let key_der = PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
     let mut params = CertificateParams::default();
     params
         .distinguished_name
@@ -171,24 +201,19 @@ fn generate_ca() -> Result<GeneratedCa, String> {
     let cert_der = cert.der().to_vec();
     let issuer = Issuer::from_ca_cert_pem(&cert_pem, key_pair)
         .map_err(|e| format!("构建 CA 签发器失败: {e}"))?;
-    Ok(GeneratedCa { issuer, cert_pem, key_pem, cert_der, key_der })
+    Ok(GeneratedCa { issuer, cert_pem, key_pem, cert_der })
 }
 
 /// 从 PEM 加载已有 CA（Python cryptography 生成的 RSA PKCS#1 私钥可直接解析）。
 /// 私钥按 PEM 标签解析为原始格式的 PrivateKeyDer 并原样保留（rustls 按 variant
 /// 分派解析）——rcgen 对 PKCS#1 进的密钥 serialize_der 原样返回 PKCS#1，硬包
 /// PrivatePkcs8KeyDer 会在构建 ServerConfig 时报「failed to parse private key」。
-fn load_issuer(
-    cert_pem: &str,
-    key_pem: &str,
-) -> Result<(Issuer<'static, KeyPair>, PrivateKeyDer<'static>), String> {
+fn load_issuer(cert_pem: &str, key_pem: &str) -> Result<Issuer<'static, KeyPair>, String> {
     let key_der = PrivateKeyDer::from_pem_reader(&mut key_pem.as_bytes())
         .map_err(|e| format!("解析 CA 私钥 PEM 失败: {e}"))?;
     let key_pair = KeyPair::try_from(&key_der)
         .map_err(|_| "解析 CA 私钥失败: Could not parse key pair".to_string())?;
-    let issuer = Issuer::from_ca_cert_pem(cert_pem, key_pair)
-        .map_err(|e| format!("解析 CA 证书失败: {e}"))?;
-    Ok((issuer, key_der))
+    Issuer::from_ca_cert_pem(cert_pem, key_pair).map_err(|e| format!("解析 CA 证书失败: {e}"))
 }
 
 /// PEM(CERTIFICATE) → DER：提取 base64 主体并解码（供补写 ca.cer）
@@ -323,7 +348,8 @@ mod tests {
         let _ = ca2.gen_server_config("api.trae.cn");
 
         let cfg = ca.gen_server_config("api.trae.cn");
-        assert!(!cfg.alpn_protocols.is_empty());
+        // 不广播 ALPN：对齐 Python 版行为（客户端回落 HTTP/1.1）
+        assert!(cfg.alpn_protocols.is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -343,7 +369,8 @@ mod tests {
         let ca = ensure_ca(&tmp).expect("legacy PKCS#1 CA must load");
         // 签发器可用：复用 RSA CA 密钥签发叶子证书
         let cfg = ca.gen_server_config("api.trae.cn");
-        assert!(!cfg.alpn_protocols.is_empty());
+        // 不广播 ALPN：对齐 Python 版行为（客户端回落 HTTP/1.1）
+        assert!(cfg.alpn_protocols.is_empty());
         // 加载路径不得重写 CA 文件（换 CA = 强制所有用户重装证书）
         assert_eq!(
             std::fs::read_to_string(tmp.join("ca.crt")).unwrap(),

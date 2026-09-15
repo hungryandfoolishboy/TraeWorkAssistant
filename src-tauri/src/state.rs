@@ -209,10 +209,14 @@ impl AppState {
         // SQLite 化（docs/sqllite-storage-plan.md P2）：kv 文档读取，
         // 缺失/为空/解析失败均回退默认（与原 fs_utils::read_json 语义一致）
         let mut s: Settings = crate::store::db(&self.data_dir).kv_get("app_settings");
-        // proxy_domains 为空时回填默认值，确保设置页始终展示默认监听域名；
-        // 仍为旧默认（未含 doubao.com）时也迁移到新默认（用户未自定义过才替换）
+        // proxy_domains 为空时回填默认值，确保设置页始终展示默认解密白名单；
+        // 仍为历届旧默认时也迁移到新默认（用户未自定义过才替换）。新默认移出
+        // doubao.com 宽后缀：豆包客户端 ttnet 原生栈对其证书锁定，解密会被拒
+        // （页面空白）；zijieapi.com 实测可正常 MITM，保留（Trae 抓包需要）
         if s.proxy_domains.trim().is_empty()
             || s.proxy_domains == crate::models::legacy_proxy_domains()
+            || s.proxy_domains == crate::models::legacy_proxy_domains_with_doubao()
+            || s.proxy_domains == crate::models::legacy_proxy_domains_narrow()
         {
             s.proxy_domains = crate::models::default_proxy_domains();
         }
