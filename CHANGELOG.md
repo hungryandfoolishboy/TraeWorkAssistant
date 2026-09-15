@@ -4,7 +4,7 @@
 
 ---
 
-## [未发布] · SQLite 存储迁移 + Python/PowerShell 全量 Rust 化 + F-68 / F-74 / F-76~F-78 落地
+## [3.5.1] · 2026-09-15 · SQLite 存储迁移 + Python/PowerShell 全量 Rust 化 + F-68 / F-74 / F-76~F-78 落地
 
 > 范围：自 [3.4.5]（commit 651b056）以来的全部变更。
 
