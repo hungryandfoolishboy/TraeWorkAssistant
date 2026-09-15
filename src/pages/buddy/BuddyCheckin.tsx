@@ -280,8 +280,14 @@ export default function BuddyCheckin() {
             {growthRunning && <Badge tone="blue">执行中</Badge>}
             {growthSummary && !growthRunning && <span className="text-xs text-slate-400">{growthSummary}</span>}
           </div>
-          <button className="btn-outline !px-3 !py-1 text-xs" onClick={() => void runGrowth()} disabled={growthRunning}>
-            <Sparkles size={13} /> {growthRunning ? '执行中…' : '立即执行成长任务'}
+          <button
+            className="btn-outline !px-3 !py-1 text-xs"
+            onClick={() => void runGrowth()}
+            // 后端 WB_ROUND_LOCK 轮次锁互斥：签到/成长共享一轮，任一运行中均不可再发起
+            disabled={growthRunning || running}
+            title={running ? '签到任务执行中，请等待完成后再执行成长任务' : undefined}
+          >
+            <Sparkles size={13} /> {growthRunning ? '执行中…' : running ? '签到中，请稍候' : '立即执行成长任务'}
           </button>
         </div>
         <p className="mb-3 text-xs text-slate-400">
@@ -439,10 +445,20 @@ export default function BuddyCheckin() {
         {/* 操作区：按钮右下角（对齐 Trae） */}
         <div className="mt-3 flex items-center justify-between">
           <span className="text-xs text-slate-400">
-            {running ? '签到进行中，逐账号结果见下方实时进度…' : '签到结果与获取积分将展示在下方实时进度卡'}
+            {running
+              ? '签到进行中，逐账号结果见下方实时进度…'
+              : growthRunning
+              ? '成长任务执行中，请等待完成后再开始签到'
+              : '签到结果与获取积分将展示在下方实时进度卡'}
           </span>
-          <button className="btn-outline" onClick={() => void startCheckin()} disabled={running}>
-            <PlayCircle size={15} /> {running ? '签到中…' : '开始签到'}
+          <button
+            className="btn-outline"
+            onClick={() => void startCheckin()}
+            // 后端 WB_ROUND_LOCK 轮次锁互斥：成长任务运行中时签到会被直接拒绝，禁用防闪烁
+            disabled={running || growthRunning}
+            title={growthRunning ? '成长任务执行中，请等待完成后再开始签到' : undefined}
+          >
+            <PlayCircle size={15} /> {running ? '签到中…' : growthRunning ? '成长任务执行中' : '开始签到'}
           </button>
         </div>
       </div>

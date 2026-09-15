@@ -583,8 +583,8 @@ export default function Accounts() {
             </div>
             <div className="grid grid-cols-2 gap-2 p-3 pt-1.5">
               {([
-                { app: 'Trae', label: 'Trae CN', desc: 'Trae CN IDE 客户端', Icon: SquareTerminal },
                 { app: 'TraeWork', label: 'TRAE SOLO CN', desc: 'Trae Work 桌面端', Icon: AppWindow },
+                { app: 'Trae', label: 'Trae CN', desc: 'Trae CN IDE 客户端', Icon: SquareTerminal },
               ] as const).map((opt) => (
                 <button
                   key={opt.app}

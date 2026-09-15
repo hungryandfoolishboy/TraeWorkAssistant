@@ -404,6 +404,17 @@ export default function ApiService() {
                 <RefreshCw size={13} className={refreshingPool ? 'animate-spin' : ''} />
                 {refreshingPool ? '刷新中…' : '刷新'}
               </button>
+              {poolAccounts.length > 0 && (
+                <button
+                  className="btn-ghost flex items-center gap-1 text-xs"
+                  onClick={() => void savePool()}
+                  disabled={savingPool}
+                  title="保存账号池"
+                >
+                  <Save size={13} className={savingPool ? 'animate-pulse' : ''} />
+                  {savingPool ? '保存中…' : '保存'}
+                </button>
+              )}
             </div>
           </div>
 
@@ -540,15 +551,6 @@ export default function ApiService() {
                   );
                 })}
               </div>
-
-              <button
-                className="btn-outline mt-3 flex w-full items-center justify-center gap-2"
-                onClick={() => void savePool()}
-                disabled={savingPool}
-              >
-                <Save size={15} />
-                {savingPool ? '保存中…' : '保存账号池'}
-              </button>
             </>
           )}
         </div>
