@@ -5,7 +5,7 @@
 //! ② 行文档实体表 —— (pk TEXT PK, data JSON, updated_at)；
 //! ③ 列化流水表 —— 追加/裁剪/按日聚合。
 //!
-//! 版本约定：`PRAGMA user_version = 1` 表示本迁移完成；<1 触发启动迁移。
+//! 版本约定：`PRAGMA user_version >= SCHEMA_VERSION` 表示本迁移完成；<SCHEMA_VERSION 触发启动迁移。
 
 use rusqlite::Connection;
 
@@ -175,12 +175,12 @@ const DDL: &[&str] = &[
 ];
 
 /// 建库（幂等：IF NOT EXISTS）。user_version 由迁移器负责写入。
-pub fn init(conn: &Connection) {
+/// 返回错误供 Store::try_open 判定库不可用（触发隔离重建自愈）。
+pub fn init(conn: &Connection) -> Result<(), String> {
     for sql in DDL {
-        if let Err(e) = conn.execute_batch(sql) {
-            eprintln!("[store] 建表失败: {e}");
-        }
+        conn.execute_batch(sql).map_err(|e| format!("建表失败: {e}"))?;
     }
+    Ok(())
 }
 
 pub fn user_version(conn: &Connection) -> i32 {

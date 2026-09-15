@@ -74,6 +74,7 @@ const LEGACY_ROOT: &[(&str, Option<&str>)] = &[
     ("wb_template_map.json", Some("wb_template_map")),
     ("api_models.json", Some("api_models")),
     ("wb_model_route.json", Some("wb_model_route")),
+    ("wb_sticky_sessions.json", None),
     ("checkin_accounts.json", None),
 ];
 
@@ -193,7 +194,9 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
         }
     }
 
-    // 全部条目处理完且零失败才置版本号（有失败保留原位，下次启动重试）
+    // 全部条目处理完且零失败才置版本号（有失败保留原位，下次启动重试）。
+    // 设计取舍：单文件失败 → 整体重跑（已导入文件已移入 backup 记 missing，幂等无害；
+    // 代价是失败期间每次启动重写 manifest，属可接受日志噪音）。
     if failed == 0 {
         // P6 v1→v2 增量：老库 kv 中三个流水键搬入表（v0 全新导入路径键已由 DOC_ENTRIES 处理，此处空转）
         if let Err(e) = migrate_kv_flows_v1_to_v2(&store) {
@@ -234,7 +237,8 @@ enum ItemResult {
     Error(String),
 }
 
-/// KV 导入：文件文本校验为合法 JSON 后原样入库
+/// KV 导入：文件文本校验为合法 JSON 后入库（serde 解析→重序列化，键序规范化，
+/// 语义与原文件等价；解析失败 = Corrupt）
 fn import_kv(store: &Store, data_dir: &Path, rel: &str, key: &str) -> ItemResult {
     let path = data_dir.join(rel);
     if !path.exists() {
@@ -270,7 +274,7 @@ fn to_item(s: ImportStatus) -> ItemResult {
     }
 }
 
-/// 原文件移入 backup/（corrupt=true 时入 backup/corrupt/，按文件名平铺）
+/// 原文件移入 backup/（保留 conf/data 相对路径前缀；corrupt=true 时入 backup/corrupt/）
 fn move_to_backup(data_dir: &Path, rel: &str, corrupt: bool) {
     let src = data_dir.join(rel);
     let file_name = Path::new(rel)
@@ -281,8 +285,8 @@ fn move_to_backup(data_dir: &Path, rel: &str, corrupt: bool) {
         .join("data")
         .join("backup")
         .join(if corrupt { "corrupt" } else { "" });
-    let _ = std::fs::create_dir_all(&backup_dir);
-    let dst = backup_dir.join(&file_name);
+    let dst = backup_dir.join(rel);
+    let _ = std::fs::create_dir_all(dst.parent().unwrap_or(&backup_dir));
     if dst.exists() {
         // 同名冲突：加时间戳后缀，绝不覆盖既有备份
         let stamped = format!(
@@ -290,7 +294,7 @@ fn move_to_backup(data_dir: &Path, rel: &str, corrupt: bool) {
             file_name.trim_end_matches(".json"),
             chrono::Local::now().format("%Y%m%d%H%M%S")
         );
-        let _ = std::fs::rename(&src, backup_dir.join(format!("{stamped}.json")));
+        let _ = std::fs::rename(&src, dst.with_file_name(format!("{stamped}.json")));
         return;
     }
     let _ = std::fs::rename(&src, dst);
@@ -579,11 +583,10 @@ mod tests {
         let v = store.with_conn(|c| Ok(schema::user_version(c))).unwrap();
         assert_eq!(v, schema::SCHEMA_VERSION);
 
-        // 原文件移入 backup/
-        assert!(dir.join("data/backup/conf").join("app_settings.json").exists() || dir.join("data/backup/app_settings.json").exists()
-            || dir.join("data/backup").join("app_settings.json").exists());
+        // 原文件移入 backup/（保留 conf/data 相对路径前缀）
+        assert!(dir.join("data/backup/conf/app_settings.json").exists());
         assert!(dir.join("data/backup/legacy_root/workbuddy_token_store.json").exists());
-        assert!(dir.join("data/backup/corrupt/pay_status.json").exists());
+        assert!(dir.join("data/backup/corrupt/data/pay_status.json").exists());
         assert!(!dir.join("data/checkin_accounts.json").exists());
         // manifest 落盘
         assert!(dir.join("data/backup/migration_manifest.json").exists());
@@ -616,6 +619,29 @@ mod tests {
         assert!(summary.contains("导入 0"));
         assert!(dir.join("data/aiwork.sqlite").exists());
         assert!(migrate_on_startup(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P7 验收：历史 JSON 遗留的重复 user_id 不得卡死迁移（accounts.user_id UNIQUE
+    /// 防线去重、保序取首条），更不得让运行期 accounts 表为空。
+    #[test]
+    fn duplicate_uid_accounts_import_dedups_not_fails() {
+        let dir = tmp_dir("dup");
+        write(
+            &dir.join("data/checkin_accounts.json"),
+            r#"{"accounts":[
+                {"name":"a","UserID":"u1","jwt":"j1"},
+                {"name":"b","UserID":"u1","jwt":"j2"},
+                {"name":"c","jwt":""}]}"#,
+        );
+        let summary = migrate_on_startup(&dir).expect("迁移应完成");
+        assert!(!summary.contains("失败 1"), "重复 uid 不得计为失败: {summary}");
+        let store = db(&dir);
+        let acc = docs::accounts_load(&store);
+        assert_eq!(acc.accounts.len(), 2, "重复 uid 去重，占位账号保留");
+        assert_eq!(acc.accounts[0].name, "a");
+        assert_eq!(acc.accounts[0].jwt, "j1", "保序取首条");
+        assert_eq!(acc.accounts[1].name, "c");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

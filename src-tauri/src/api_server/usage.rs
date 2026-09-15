@@ -217,6 +217,16 @@ impl UsageFile {
         }
     }
 
+    /// 按桶只读取指定日的统计（记账后持久化当日行用）
+    pub fn day_stats(&self, bucket: UsageBucket, day: &str) -> Option<&DayStats> {
+        let b = match bucket {
+            UsageBucket::Trae => &self.days,
+            UsageBucket::Wb => &self.wb_days,
+            UsageBucket::Custom => &self.custom_days,
+        };
+        b.get(day)
+    }
+
     /// 记录一次请求（无 TTFT 的简写，仅测试用；生产路径一律走 record_ttfb/record_in）
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
@@ -330,16 +340,29 @@ pub fn today_key() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// 从磁盘加载用量数据（缺失/损坏回退空结构；SQLite 化 P3：api_usage 表）
+/// 从存储加载用量数据（缺失/损坏回退空结构），并裁剪过期日期。
+/// SQLite 化 P3：api_usage 表；P7 修订：记账改为当日单行 upsert 后，
+/// 存储侧保留期裁剪在启动 load 时一次性执行。
 pub fn load(data_dir: &Path) -> UsageFile {
     let mut f = crate::store::docs::api_usage_load(&crate::store::db(data_dir));
     f.trim(RETENTION_DAYS);
+    let _ = crate::store::docs::api_usage_prune(&crate::store::db(data_dir), RETENTION_DAYS);
     f
 }
 
-/// 原子写盘（事务内整表替换）
-pub fn save(data_dir: &Path, usage: &UsageFile) {
-    let _ = crate::store::docs::api_usage_save(&crate::store::db(data_dir), usage);
+/// 持久化当日单行（每请求记账热路径：单行 UPSERT 替代原整表 DELETE+重插）。
+/// 内存 `UsageFile`（RuntimeState.usage）为权威态，启动时由 load 全量回读。
+pub fn save_day(data_dir: &Path, bucket: UsageBucket, day: &str, stats: &DayStats) {
+    let text = match serde_json::to_string(stats) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let b = match bucket {
+        UsageBucket::Trae => "trae",
+        UsageBucket::Wb => "wb",
+        UsageBucket::Custom => "custom",
+    };
+    let _ = crate::store::docs::api_usage_upsert_day(&crate::store::db(data_dir), b, day, &text);
 }
 
 // ==================== 命令返回结构 ====================
@@ -666,10 +689,33 @@ mod tests {
         let _ = std::fs::create_dir_all(dir.join("data"));
         let mut f = UsageFile::default();
         f.record(false, "m", "u", "k", true, false, 10, 1, 2);
-        save(&dir, &f);
+        let day = today_key();
+        let stats = f.day_stats(UsageBucket::Trae, &day).unwrap().clone();
+        save_day(&dir, UsageBucket::Trae, &day, &stats);
         let loaded = load(&dir);
-        let d = loaded.days.get(&today_key()).expect("应能读回当日数据");
+        let d = loaded.days.get(&day).expect("应能读回当日数据");
         assert_eq!(d.total.requests, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// save_day 单行 upsert 后，启动 load 应裁剪保留期之外的存储行
+    #[test]
+    fn load_prunes_rows_beyond_retention() {
+        let dir = std::env::temp_dir().join(format!("twa_usage_prune_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("data"));
+        // 种一条 91 天前的旧行 + 当日行
+        let old_day = (chrono::Local::now().date_naive() - chrono::Duration::days(RETENTION_DAYS + 1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let today = today_key();
+        save_day(&dir, UsageBucket::Trae, &old_day, &DayStats::default());
+        save_day(&dir, UsageBucket::Trae, &today, &DayStats::default());
+        let loaded = load(&dir);
+        assert!(loaded.days.contains_key(&today), "当日行应保留");
+        assert!(!loaded.days.contains_key(&old_day), "保留期外行应被裁剪");
+        // 存储侧确认已删（下次 load 不再读回）
+        let again = load(&dir);
+        assert!(!again.days.contains_key(&old_day));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

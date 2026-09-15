@@ -6,8 +6,7 @@
 //!
 //! 连接策略：按 data_dir 缓存的单 `Mutex<Connection>`（个人应用 QPS 低，免连接池）；
 //! WAL + busy_timeout=5000 支撑主进程与 `--task-run` CLI 子进程并发访问。
-// 部分原语（row_upsert/row_delete/kv_delete 等）随 P2/P3 调用点切换启用（红线：最终交付无警告）
-#![allow(dead_code)]
+//! 打开失败自愈：库文件损坏时隔离现场（*.corrupt-<ts>）后重建空库，不 panic 闪退。
 
 pub mod docs;
 pub mod migrate;
@@ -44,32 +43,32 @@ pub fn db(data_dir: &Path) -> Arc<Store> {
     store
 }
 
-/// 测试专用：按显式路径注册（避免与生产 db() 冲突）
-#[cfg(test)]
-pub fn db_at(path: &Path) -> Arc<Store> {
-    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(s) = reg.get(path) {
-        return s.clone();
-    }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let store = Store::open(path);
-    reg.insert(path.to_path_buf(), store.clone());
-    store
-}
-
 impl Store {
     fn open(path: &Path) -> Arc<Store> {
-        let conn = rusqlite::Connection::open(path).unwrap_or_else(|e| {
-            panic!("SQLite 打开失败 {}: {e}", path.display());
-        });
+        match Self::try_open(path) {
+            Ok(s) => s,
+            Err(e) => {
+                // 库损坏/不可用自愈：隔离现场后重建空库再试一次。个人应用数据可由
+                // data/backup/ 与各上游重新拉取兜底；隔离件保留待人工诊断，绝不静默删除。
+                eprintln!("[store] SQLite 打开失败 {}: {e}，隔离损坏库并重建", path.display());
+                quarantine_corrupt_db(path, &e);
+                Self::try_open(path)
+                    .unwrap_or_else(|e2| panic!("SQLite 重建仍失败 {}: {e2}", path.display()))
+            }
+        }
+    }
+
+    fn try_open(path: &Path) -> Result<Arc<Store>, String> {
+        let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.pragma_update(None, "synchronous", "NORMAL").ok();
         conn.busy_timeout(std::time::Duration::from_millis(5000)).ok();
         conn.pragma_update(None, "foreign_keys", "ON").ok();
-        schema::init(&conn);
-        Arc::new(Store { conn: Mutex::new(conn) })
+        schema::init(&conn)?;
+        // 健康探针：损坏库可能 open 成功但任何查询失败（页损坏等），在此暴露
+        conn.query_row("SELECT count(*) FROM kv", [], |r| r.get::<_, i64>(0))
+            .map_err(|e| format!("库健康探针失败: {e}"))?;
+        Ok(Arc::new(Store { conn: Mutex::new(conn) }))
     }
 
     /// 在连接上执行（串行化访问的统一出口）
@@ -195,15 +194,27 @@ impl Store {
             Ok(())
         })
     }
+}
 
-    pub fn row_delete(&self, table: &str, pk: &str) -> Result<(), String> {
-        if !schema::ROW_TABLES.contains(&table) {
-            return Err(format!("非法表名: {table}"));
+/// 损坏库隔离：主库/-wal/-shm 改名 `<原名>.corrupt-<时间戳>`（保留现场，不删除），
+/// 随后重建空库。隔离原因尽量落应用日志（库路径上两级 = data_dir）。
+fn quarantine_corrupt_db(path: &Path, reason: &str) {
+    let stamp = chrono::Local::now().format("%Y%m%d%H%M%S");
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let src = PathBuf::from(name);
+        if src.exists() {
+            let mut dst = src.as_os_str().to_os_string();
+            dst.push(format!(".corrupt-{stamp}"));
+            let _ = std::fs::rename(&src, PathBuf::from(dst));
         }
-        self.with_conn(|c| {
-            c.execute(&format!("DELETE FROM [{table}] WHERE pk = ?1"), [pk])?;
-            Ok(())
-        })
+    }
+    if let Some(root) = path.parent().and_then(Path::parent) {
+        crate::fs_utils::app_log(
+            root,
+            &format!("SQLite 库损坏已隔离重建: {reason}（原库保留为 *.corrupt-* 文件，可人工抢救）"),
+        );
     }
 }
 
@@ -255,11 +266,9 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].0, "u1");
         assert_eq!(got[1].1["v"], 2);
-        // UPSERT 覆盖 + DELETE
+        // UPSERT 覆盖
         s.row_upsert("device_map", "u1", &json!({"v": 9})).unwrap();
         assert_eq!(s.rows_all("device_map").unwrap()[0].1["v"], 9);
-        s.row_delete("device_map", "u1").unwrap();
-        assert_eq!(s.rows_all("device_map").unwrap().len(), 1);
         // 白名单拦截
         assert!(s.rows_all("sqlite_master").is_err());
         let _ = std::fs::remove_dir_all(&dir);
@@ -271,6 +280,27 @@ mod tests {
         let a = db(&dir);
         let b = db(&dir);
         assert!(Arc::ptr_eq(&a, &b));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 损坏库自愈：垃圾内容库 → 隔离为 *.corrupt-* → 重建空库可用，不 panic
+    #[test]
+    fn corrupt_db_is_quarantined_and_rebuilt() {
+        let dir = tmp_dir("corrupt");
+        let db_path = dir.join("data").join("aiwork.sqlite");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, b"definitely not a sqlite database").unwrap();
+
+        let s = db(&dir); // 应自愈而非 panic
+        s.kv_set("k", &json!({"v": 1})).unwrap();
+        assert_eq!(s.kv_get_raw("k").is_some(), true);
+
+        // 现场保留为 *.corrupt-*（不静默删除，可人工抢救）
+        let quarantined = std::fs::read_dir(db_path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
+        assert!(quarantined, "损坏库应被隔离保留");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

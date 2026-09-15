@@ -3,8 +3,6 @@
 //! 约定：函数签名以「原文件 struct」为边界，调用方（Phase 2/3 切换后）不再感知
 //! 存储介质；行文档表的 data 列 = 对应条目的 serde JSON（struct 演进零成本）。
 //! KV 文档无需类型化包装（调用方直接 kv_get/kv_set 自有 struct）。
-// P1 阶段仅迁移器消费 save 侧；load 侧随 P2/P3 调用点切换启用（红线：最终交付无警告）
-#![allow(dead_code)]
 
 // ── P6 流水迁出：WB 每日积分快照（原 kv workbuddy_credits_history）───────────
 
@@ -188,13 +186,6 @@ pub fn usage_history_save(s: &Store, root: &Value) -> Result<(), String> {
     s.kv_set("usage_history_meta", &json!({ "fetched_at": fetched_at }))
 }
 
-/// 读顶层 fetched_at（原 CacheFile.fetched_at；预留扩展）
-#[allow(dead_code)]
-pub fn usage_history_fetched_at(s: &Store) -> Option<i64> {
-    let meta: Value = s.kv_get("usage_history_meta");
-    meta.get("fetched_at").and_then(Value::as_i64)
-}
-
 // ── P6 流水迁出：会话粘性绑定（原 kv wb_sticky_sessions）─────────────────────
 
 /// 读回 {version, bindings:[...]}（按 last_seen 升序 = 原内存序近似）
@@ -289,6 +280,28 @@ mod tests {
         assert_eq!(got.accounts[0].name, "a1");
         assert_eq!(got.accounts[1].user_id, None); // 占位账号（无 uid）可空
         assert_eq!(got.accounts[2].jwt, "j3");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P7 验收：UNIQUE 防线——保存侧传入重复 user_id 时保序取首条（事务不失败），
+    /// 占位账号（无 uid）不受影响可并存。
+    #[test]
+    fn accounts_save_dedups_duplicate_uids() {
+        let (dir, s) = tmp_store("acc_dup");
+        let f = AccountsFile {
+            accounts: vec![
+                crate::models::RawAccount { name: "a1".into(), user_id: Some("u1".into()), jwt: "j1".into(), ..Default::default() },
+                crate::models::RawAccount { name: "a2".into(), user_id: Some("u1".into()), jwt: "j2".into(), ..Default::default() },
+                crate::models::RawAccount { name: "p1".into(), ..Default::default() },
+                crate::models::RawAccount { name: "p2".into(), ..Default::default() },
+            ],
+        };
+        accounts_save(&s, &f).unwrap();
+        let got = accounts_load(&s);
+        assert_eq!(got.accounts.len(), 3, "重复 u1 去重，两个占位账号保留");
+        assert_eq!(got.accounts[0].jwt, "j1");
+        assert_eq!(got.accounts[1].name, "p1");
+        assert_eq!(got.accounts[2].name, "p2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -431,6 +444,19 @@ use crate::api_server::usage::{DayStats, UsageBucket, UsageFile};
 
 // ── Trae 账号（checkin_accounts.json → accounts 表，seq 保序）────────────────
 
+/// accounts 表 `user_id UNIQUE` 防线：非空 uid 重复时保序取首条（SQLite UNIQUE
+/// 允许多个 NULL/空 uid 占位账号并存）。迁移导入与运行期保存共用——否则历史
+/// JSON 中遗留的重复 uid 会让整个保存事务失败、启动迁移永久卡住（账号「消失」）。
+fn dedup_account_rows(rows: Vec<(Option<String>, String)>) -> Vec<(Option<String>, String)> {
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    rows.into_iter()
+        .filter(|(uid, _)| match uid {
+            Some(u) if !u.is_empty() => seen.insert(u.clone()),
+            _ => true,
+        })
+        .collect()
+}
+
 pub fn accounts_load(s: &Store) -> AccountsFile {
     let rows: Vec<(Option<String>, String)> = s
         .with_conn(|c| {
@@ -449,7 +475,7 @@ pub fn accounts_load(s: &Store) -> AccountsFile {
 }
 
 pub fn accounts_save(s: &Store, f: &AccountsFile) -> Result<(), String> {
-    // 序列化在事务外完成
+    // 序列化在事务外完成；UNIQUE 防线去重（保序取首条）
     let mut rows: Vec<(Option<String>, String)> = Vec::with_capacity(f.accounts.len());
     for a in &f.accounts {
         rows.push((
@@ -457,6 +483,7 @@ pub fn accounts_save(s: &Store, f: &AccountsFile) -> Result<(), String> {
             serde_json::to_string(a).map_err(|e| format!("序列化失败: {e}"))?,
         ));
     }
+    let rows = dedup_account_rows(rows);
     s.with_conn(move |c| {
         c.execute_batch("BEGIN; DELETE FROM accounts;")?;
         {
@@ -513,6 +540,7 @@ pub fn accounts_save_raw(s: &Store, root: &Value) -> Result<(), String> {
             serde_json::to_string(a).map_err(|e| format!("序列化失败: {e}"))?,
         ));
     }
+    let rows = dedup_account_rows(rows);
     s.with_conn(move |c| {
         c.execute_batch("BEGIN; DELETE FROM accounts;")?;
         {
@@ -847,12 +875,14 @@ pub fn wb_pool_save(s: &Store, pool: &Value) -> Result<(), String> {
 
 // ── WorkBuddy token store（workbuddy_token_store.json → wb_tokens 表）────────
 
-/// 读整库（结构 {version, tokens: {id: rec}}；wb_upstream 死引用统一收敛到此）
+/// 读整库（结构 {version, tokens: {id: rec}}；wb_upstream 死引用统一收敛到此）。
+/// 损坏行（data 非 JSON 对象，如手工编辑产生的 NULL）过滤丢弃，不混入消费方。
 pub fn wb_token_store_load(s: &Store) -> Value {
     let tokens: serde_json::Map<String, Value> = s
         .rows_all("wb_tokens")
         .unwrap_or_default()
         .into_iter()
+        .filter(|(_, v)| v.is_object())
         .collect();
     let version = s.kv_get_raw("wb_tokens_meta").and_then(|v| v.parse::<i64>().ok());
     let mut root = serde_json::Map::new();
@@ -963,6 +993,29 @@ pub fn api_usage_save(s: &Store, f: &UsageFile) -> Result<(), String> {
     })
 }
 
+/// 单日行 UPSERT（每请求记账热路径：仅写当日一行，替代整表 DELETE+重插）
+pub fn api_usage_upsert_day(s: &Store, bucket: &str, day: &str, data: &str) -> Result<(), String> {
+    s.with_conn(|c| {
+        c.execute(
+            "INSERT INTO api_usage(bucket, day, data, updated_at) VALUES(?1, ?2, ?3, datetime('now','localtime'))
+             ON CONFLICT(bucket, day) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            rusqlite::params![bucket, day, data],
+        )?;
+        Ok(())
+    })
+}
+
+/// 保留期裁剪（超出 keep_days 的行删除；启动 load 时执行一次）
+pub fn api_usage_prune(s: &Store, keep_days: i64) -> Result<(), String> {
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(keep_days))
+        .format("%Y-%m-%d")
+        .to_string();
+    s.with_conn(|c| {
+        c.execute("DELETE FROM api_usage WHERE day < ?1", [cutoff.as_str()])?;
+        Ok(())
+    })
+}
+
 // ── Trae 积分流水（credits_history.json → credits_history 表）────────────────
 
 pub fn credits_history_load(s: &Store) -> CreditsFile {
@@ -1037,21 +1090,6 @@ pub fn credits_daily_load(s: &Store) -> CreditsDailyFile {
         })
         .unwrap_or_default();
     CreditsDailyFile { snapshots }
-}
-
-/// 同日覆盖 UPSERT（原「按日去重覆盖」语义）
-pub fn credits_daily_upsert(
-    s: &Store,
-    snap: &crate::models::CreditsDailySnapshot,
-) -> Result<(), String> {
-    s.with_conn(|c| {
-        c.execute(
-            "INSERT INTO credits_daily(date, total, earned, consumed) VALUES(?1, ?2, ?3, ?4)
-             ON CONFLICT(date) DO UPDATE SET total = excluded.total, earned = excluded.earned, consumed = excluded.consumed",
-            rusqlite::params![snap.date, snap.total, snap.earned, snap.consumed],
-        )?;
-        Ok(())
-    })
 }
 
 pub fn credits_daily_save(s: &Store, f: &CreditsDailyFile) -> Result<(), String> {

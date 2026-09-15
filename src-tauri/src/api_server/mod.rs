@@ -150,7 +150,12 @@ impl ApiSharedState {
             is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
             completion_tokens, ttfb_ms,
         );
-        usage::save(&self.data_dir, &guard);
+        // P7：仅持久化被写入的当日一行（原整表重写，写放大随历史天数线性增长）
+        let bucket = if is_wb { usage::UsageBucket::Wb } else { usage::UsageBucket::Trae };
+        let day = usage::today_key();
+        if let Some(stats) = guard.day_stats(bucket, &day) {
+            usage::save_day(&self.data_dir, bucket, &day, stats);
+        }
     }
 
     /// 记录一次自定义模型请求用量（独立 custom_days 桶，与 Trae/WB 侧分账）；
@@ -174,7 +179,11 @@ impl ApiSharedState {
             usage::UsageBucket::Custom,
             model, "custom", key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
         );
-        usage::save(&self.data_dir, &guard);
+        // P7：仅持久化被写入的当日一行
+        let day = usage::today_key();
+        if let Some(stats) = guard.day_stats(usage::UsageBucket::Custom, &day) {
+            usage::save_day(&self.data_dir, usage::UsageBucket::Custom, &day, stats);
+        }
     }
 }
 
