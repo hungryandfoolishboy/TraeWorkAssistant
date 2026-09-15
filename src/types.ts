@@ -483,6 +483,8 @@ export interface ApiPoolFile {
   wb_longctx_downgrade?: boolean;
   /** 慢请求竞速对冲阈值毫秒（F-76③）：流式首字节超阈值时向第二账号发对冲请求；0 = 关闭 */
   wb_hedge_threshold_ms?: number;
+  /** Buddy 池入池白名单（wb- 前缀账号 id）；空/缺省 = 全部含凭证账号自动入池 */
+  wb_enabled_uids?: string[];
   /** 账号并发上限（F-77）：单账号在途请求数达到上限视为 busy；0 = 不限 */
   account_concurrency_limit?: number;
   /** 池粘性 TTL 秒（F-76②）：TTL 内同会话落同一池同账号（KV cache 复用） */

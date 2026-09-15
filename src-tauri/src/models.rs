@@ -389,6 +389,12 @@ pub struct ApiPoolFile {
     /// WB 显式绑定 TTL 秒（F-76②；wb_sticky 会话粘性）：覆盖原 1800s 常量
     #[serde(default = "default_wb_sticky_ttl_secs")]
     pub wb_sticky_ttl_secs: u64,
+    /// Buddy 池入池白名单（wb- 前缀账号 id）：空 = 全部含凭证账号自动入池
+    /// （fail-open，对齐 Buddy 页「含凭证账号参与 WB 上游调度」语义；修复 WB 池
+    /// 因误用 Trae 共享白名单而恒空、Buddy 源永远 503 no_healthy_account 的问题）；
+    /// 非空 = 仅列表内账号参与调度
+    #[serde(default)]
+    pub wb_enabled_uids: Vec<String>,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -428,6 +434,7 @@ impl Default for ApiPoolFile {
             account_concurrency_limit: default_account_concurrency_limit(),
             pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
             wb_sticky_ttl_secs: default_wb_sticky_ttl_secs(),
+            wb_enabled_uids: Vec::new(),
         }
     }
 }

@@ -183,9 +183,12 @@ pub async fn do_start(
     );
 
     // ===== WorkBuddy 上游池装配（T2.1）=====
+    // 入池白名单：显式 wb_enabled_uids 优先；空时兼容旧共享 enabled_uids 混存的
+    // wb- 条目；两者皆空 = 全部含凭证账号自动入池（Buddy 页设计语义）
     let wb_accounts = crate::commands::workbuddy::wb_upstream_accounts(state);
+    let wb_uids = effective_wb_uids(&pool_file, &wb_accounts);
     let wb_pool = ApiPool::new();
-    wb_pool.sync_from_wb(&wb_accounts, &pool_file.enabled_uids);
+    wb_pool.sync_from_wb(&wb_accounts, &wb_uids);
     let wb_count = wb_pool.count();
     let wb_healthy = wb_pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     // Buddy 池策略：wb_strategy 独立配置优先；空 = 跟随 Trae 池（与 pool_set 热应用逻辑一致）
@@ -193,11 +196,13 @@ pub async fn do_start(
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "API服务启动-WB上游池: enabled={} accounts={} healthy={} strategy={}",
+            "API服务启动-WB上游池: enabled={} accounts={} healthy={} strategy={} whitelist={} (total_cred={})",
             pool_file.wb_enabled,
             wb_count,
             wb_healthy,
             wb_strategy.as_str(),
+            wb_uids.len(),
+            wb_accounts.len(),
         ),
     );
     wb_pool.set_strategy(wb_strategy);
@@ -381,6 +386,30 @@ pub fn pool_list(state: State<'_, AppState>) -> ApiPoolFile {
     crate::store::db(&state.data_dir).kv_get("api_pool")
 }
 
+/// Buddy 池生效入池白名单（纯函数，便于单测）：显式 wb_enabled_uids 优先；
+/// 空时兼容旧数据——旧版 WB 账号混存于共享 enabled_uids（wb- 前缀条目），有则沿用；
+/// 两者皆空 = 全部含凭证账号自动入池（对齐 Buddy 页「含凭证账号参与 WB 上游调度」
+/// 的设计语义。修复：WB 池此前误用 Trae 共享白名单过滤，而 UI 只能勾选 Trae 账号，
+/// WB 池恒空 → Buddy 源模型永远 503 no_healthy_account、双源模型失去跨池兜底）
+fn effective_wb_uids(
+    pf: &ApiPoolFile,
+    wb_accounts: &[crate::api_server::pool::WbSyncAccount],
+) -> Vec<String> {
+    if !pf.wb_enabled_uids.is_empty() {
+        return pf.wb_enabled_uids.clone();
+    }
+    let legacy: Vec<String> = pf
+        .enabled_uids
+        .iter()
+        .filter(|u| u.starts_with("wb-"))
+        .cloned()
+        .collect();
+    if !legacy.is_empty() {
+        return legacy;
+    }
+    wb_accounts.iter().map(|a| a.uid.clone()).collect()
+}
+
 /// pool_set 字段合并（纯函数，便于单测）：未传（None）保留 existing 原值，传值覆盖。
 /// 注意 strategy/wb_strategy 的显式空串是合法值（"跟随默认"语义），与 None（未传）区分；
 /// group_ids 显式空数组 = 清空分组，None = 保留（语义与其他字段统一）。
@@ -399,9 +428,31 @@ fn merge_pool_set(
     account_concurrency_limit: Option<u32>,
     pool_sticky_ttl_secs: Option<u64>,
     wb_sticky_ttl_secs: Option<u64>,
+    wb_uids: Option<Vec<String>>,
 ) -> ApiPoolFile {
+    // Trae 池白名单剥离 wb- 前缀条目：WB 账号归属独立白名单 wb_enabled_uids，
+    // 旧版混存于共享 enabled_uids（历史兼容形态），保存时迁移归位防丢失
+    let trae_uids: Vec<String> = uids
+        .into_iter()
+        .filter(|u| !u.starts_with("wb-"))
+        .collect();
+    let wb_enabled_uids = wb_uids.unwrap_or_else(|| {
+        // 未显式传 WB 白名单（如仅改 Trae 池配置的保存）：迁移 existing 中混存的
+        // wb- 条目，避免 Trae 页保存把 Buddy 池成员清空
+        let legacy: Vec<String> = existing
+            .enabled_uids
+            .iter()
+            .filter(|u| u.starts_with("wb-"))
+            .cloned()
+            .collect();
+        if existing.wb_enabled_uids.is_empty() && !legacy.is_empty() {
+            legacy
+        } else {
+            existing.wb_enabled_uids.clone()
+        }
+    });
     ApiPoolFile {
-        enabled_uids: uids,
+        enabled_uids: trae_uids,
         strategy: strategy.unwrap_or_else(|| existing.strategy.clone()),
         wb_strategy: wb_strategy.unwrap_or_else(|| existing.wb_strategy.clone()),
         group_ids: group_ids.unwrap_or_else(|| existing.group_ids.clone()),
@@ -416,6 +467,7 @@ fn merge_pool_set(
             .unwrap_or(existing.account_concurrency_limit),
         pool_sticky_ttl_secs: pool_sticky_ttl_secs.unwrap_or(existing.pool_sticky_ttl_secs),
         wb_sticky_ttl_secs: wb_sticky_ttl_secs.unwrap_or(existing.wb_sticky_ttl_secs),
+        wb_enabled_uids,
     }
 }
 
@@ -441,6 +493,9 @@ pub fn pool_set(
     account_concurrency_limit: Option<u32>,
     pool_sticky_ttl_secs: Option<u64>,
     wb_sticky_ttl_secs: Option<u64>,
+    // Buddy 池入池白名单（wb- 前缀账号 id）；None = 保留原值（含旧数据迁移），
+    // Some(list) = 覆盖（Buddy 页账号池勾选保存）
+    wb_uids: Option<Vec<String>>,
 ) -> Result<(), String> {
     let existing: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
     let pool_file = merge_pool_set(
@@ -458,6 +513,7 @@ pub fn pool_set(
         account_concurrency_limit,
         pool_sticky_ttl_secs,
         wb_sticky_ttl_secs,
+        wb_uids,
     );
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     // 热应用：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
@@ -869,6 +925,7 @@ mod pool_merge_tests {
             account_concurrency_limit: 2,
             pool_sticky_ttl_secs: 600,
             wb_sticky_ttl_secs: 3600,
+            wb_enabled_uids: Vec::new(),
         }
     }
 
@@ -878,6 +935,7 @@ mod pool_merge_tests {
         let m = merge_pool_set(
             &existing(),
             vec!["u2".into()],
+            None,
             None,
             None,
             None,
@@ -908,6 +966,94 @@ mod pool_merge_tests {
     }
 
     #[test]
+    fn trae_save_migrates_legacy_wb_uids() {
+        // 旧版共享白名单混存 wb- 条目：Trae 页保存（未传 wb_uids）时 wb- 条目
+        // 从 enabled_uids 剥离并迁移进 wb_enabled_uids，Buddy 池成员不丢失
+        let mut legacy = existing();
+        legacy.enabled_uids = vec!["1001".into(), "wb-abc".into(), "1002".into()];
+        legacy.wb_enabled_uids = Vec::new();
+        let m = merge_pool_set(
+            &legacy,
+            vec!["1001".into(), "wb-abc".into(), "1002".into(), "wb-def".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        // Trae 白名单剥离 wb- 条目
+        assert_eq!(m.enabled_uids, vec!["1001".to_string(), "1002".to_string()]);
+        // 仅 existing 混存的 wb- 条目迁移进 WB 白名单；传入名单中的未知 wb- 条目
+        // （wb-def，非本次迁移来源）不并入，随剥离丢弃（白名单隔离语义）
+        assert_eq!(m.wb_enabled_uids, vec!["wb-abc".to_string()]);
+    }
+
+    #[test]
+    fn explicit_wb_uids_override() {
+        // Buddy 页勾选保存：显式传 wb_uids → 覆盖（不再走旧数据迁移）
+        let mut legacy = existing();
+        legacy.enabled_uids = vec!["u1".into(), "wb-old".into()];
+        let m = merge_pool_set(
+            &legacy,
+            vec!["u1".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(vec!["wb-new".into()]),
+        );
+        assert_eq!(m.wb_enabled_uids, vec!["wb-new".to_string()]);
+        assert_eq!(m.enabled_uids, vec!["u1".to_string()]);
+    }
+
+    #[test]
+    fn effective_wb_uids_priority() {
+        use super::effective_wb_uids;
+        use crate::api_server::pool::WbSyncAccount;
+        let acc = |uid: &str| WbSyncAccount {
+            uid: uid.into(),
+            name: String::new(),
+            token: "t".into(),
+            domain: String::new(),
+            enterprise_id: String::new(),
+            global_region: false,
+            credits: None,
+            needs_relogin: false,
+        };
+        let accounts = vec![acc("wb-a"), acc("wb-b")];
+        // ① 显式白名单优先
+        let mut pf = existing();
+        pf.wb_enabled_uids = vec!["wb-a".into()];
+        assert_eq!(effective_wb_uids(&pf, &accounts), vec!["wb-a".to_string()]);
+        // ② 旧混存 wb- 条目沿用
+        pf.wb_enabled_uids = Vec::new();
+        pf.enabled_uids = vec!["1001".into(), "wb-b".into()];
+        assert_eq!(effective_wb_uids(&pf, &accounts), vec!["wb-b".to_string()]);
+        // ③ 两者皆空 = 全部含凭证账号自动入池（fail-open）
+        pf.enabled_uids = vec!["1001".into()];
+        assert_eq!(
+            effective_wb_uids(&pf, &accounts),
+            vec!["wb-a".to_string(), "wb-b".to_string()]
+        );
+    }
+
+    #[test]
     fn some_fields_override_and_empty_string_is_legal_value() {
         // 显式空串 = "跟随默认"合法值（区别于 None 未传）；显式空数组 = 清空分组
         let m = merge_pool_set(
@@ -925,6 +1071,7 @@ mod pool_merge_tests {
             Some(0),
             Some(60),
             Some(120),
+            None,
         );
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
@@ -959,6 +1106,7 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
@@ -974,6 +1122,7 @@ mod pool_merge_tests {
         let m = merge_pool_set(
             &ApiPoolFile::default(),
             vec!["u1".into()],
+            None,
             None,
             None,
             None,

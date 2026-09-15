@@ -415,6 +415,8 @@ export const api = {
         poolStickyTtlSecs?: number;
         /** F-76② WB 会话粘性 TTL 秒 */
         wbStickyTtlSecs?: number;
+        /** Buddy 池入池白名单（wb- 前缀账号 id）；null/未传 = 保留原值（含旧数据迁移） */
+        wbUids?: string[] | null;
       },
       wbStrategy?: string,
     ) =>
@@ -431,6 +433,7 @@ export const api = {
         accountConcurrencyLimit: wbFlags?.accountConcurrencyLimit ?? null,
         poolStickyTtlSecs: wbFlags?.poolStickyTtlSecs ?? null,
         wbStickyTtlSecs: wbFlags?.wbStickyTtlSecs ?? null,
+        wbUids: wbFlags?.wbUids ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),

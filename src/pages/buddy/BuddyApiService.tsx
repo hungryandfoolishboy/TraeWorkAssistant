@@ -120,6 +120,9 @@ export default function BuddyApiService() {
     wbLongctxDowngrade: false,
   });
   const [wbParams, setWbParams] = useState({ ...WB_PARAM_DEFAULTS });
+  // Buddy 池入池白名单（wb-<hash> 账号 id = a.id，与网关池键/PoolStatus.uid 同域；
+  // 注意不是 a.uid——那是真实账号 uuid）：null = 未自定义（后端按「全部含凭证账号」自动入池）
+  const [wbUids, setWbUids] = useState<string[] | null>(null);
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [catalog, setCatalog] = useState<WbModelInfo[]>([]);
   const [syncing, setSyncing] = useState(false);
@@ -159,6 +162,8 @@ export default function BuddyApiService() {
           poolStickyTtlSecs: pf.pool_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.poolStickyTtlSecs,
           wbStickyTtlSecs: pf.wb_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.wbStickyTtlSecs,
         });
+        // 空数组 = fail-open（全部自动入池）→ 视为未自定义，显示为全选
+        setWbUids(pf.wb_enabled_uids?.length ? pf.wb_enabled_uids : null);
       }
     } catch (err) {
       pushToast('error', `读取资源状态失败：${String(err)}`);
@@ -186,6 +191,8 @@ export default function BuddyApiService() {
   }, [loadTodayUsage]);
 
   // 保存资源开关：uids/strategy/groups 原样回传（本页不改 Trae 池配置）；
+  // WB 白名单随本次保存提交：未自定义传 null（后端保留原值，fail-open 语义不变，
+  // 新增账号可持续自动入池；显式全量名单会冻结 fail-open）；清空传 []（后端同样 fail-open）；
   // F-76②/③/F-77 数值参数随开关一起保存（后端热应用，运行中即时生效）
   const saveFlags = async () => {
     setSaving(true);
@@ -193,6 +200,7 @@ export default function BuddyApiService() {
       await withMinDelay(
         api.apiServer.poolSet(pool?.enabled_uids ?? [], pool?.strategy, pool?.group_ids, {
           ...wbFlags,
+          wbUids,
           wbHedgeThresholdMs: wbParams.wbHedgeThresholdMs,
           accountConcurrencyLimit: wbParams.accountConcurrencyLimit,
           poolStickyTtlSecs: wbParams.poolStickyTtlSecs,
@@ -226,6 +234,13 @@ export default function BuddyApiService() {
   };
 
   const credAccounts = accounts.filter((a) => a.has_credential);
+  // 生效白名单：未自定义（null）= 全量含凭证账号（与后端 fail-open 默认一致）；
+  // 值域 = a.id（wb-<hash>），非 a.uid
+  const wbSelected = wbUids ?? credAccounts.map((a) => a.id);
+  const toggleWbUid = (id: string) => {
+    const base = wbUids ?? credAccounts.map((a) => a.id);
+    setWbUids(base.includes(id) ? base.filter((u) => u !== id) : [...base, id]);
+  };
 
   // 池指标（§6.2 Buddy 口径）：健康 = 含凭证且无需重新登录；今日使用 = 当日被调度使用；池内 = 含凭证账号总数
   const todayKey = new Date().toLocaleDateString('sv-SE');
@@ -383,14 +398,34 @@ export default function BuddyApiService() {
 
         {/* 右列：账号池选择（上）+ 模型目录（Buddy）（下），上下排布 */}
         <div className="col-span-6 space-y-4">
-          {/* 账号池选择卡（现有 WB 池状态卡功能保留迁移） */}
+          {/* 账号池选择卡（现有 WB 池状态卡功能保留迁移；勾选即自定义入池白名单） */}
           <div className="card p-4">
-            <div className="mb-3 flex items-center gap-2">
-              <Activity size={16} className="text-brand-500" />
-              <span className="text-sm font-medium">账号池选择</span>
+            <div className="mb-3 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Activity size={16} className="text-brand-500" />
+                <span className="text-sm font-medium">账号池选择</span>
+                <span className="text-xs text-slate-400">
+                  {credAccounts.length > 0 && `已选 ${wbSelected.length}/${credAccounts.length}`}
+                </span>
+              </div>
+              {credAccounts.length > 0 && (
+                <div className="flex items-center gap-1">
+                  <button
+                    className="btn-ghost px-2 py-0.5 text-xs"
+                    onClick={() => setWbUids(credAccounts.map((a) => a.id))}
+                  >
+                    全选
+                  </button>
+                  <button className="btn-ghost px-2 py-0.5 text-xs" onClick={() => setWbUids([])}>
+                    清空
+                  </button>
+                </div>
+              )}
             </div>
             <p className="mb-2 text-xs text-slate-400">
-              {credAccounts.length} 个含凭证账号参与 WB 上游调度
+              {credAccounts.length === 0
+                ? '暂无含凭证账号'
+                : `勾选账号参与 WB 上游调度（清空 = 全部含凭证账号自动入池）；成员变更需重启 API 服务生效`}
             </p>
             {credAccounts.length === 0 ? (
               <p className="py-4 text-center text-xs text-slate-400">
@@ -399,13 +434,19 @@ export default function BuddyApiService() {
             ) : (
               <div className="space-y-1">
                 {credAccounts.map((a) => {
-                  // F-77⑤ 可观测：实时在途并发（服务未运行/未匹配时为 0）
-                  const inflight = wbPool.find((p) => p.uid === a.uid)?.inflight ?? 0;
+                  // F-77⑤ 可观测：实时在途并发（服务未运行/未匹配时为 0）；
+                  // PoolStatus.uid = 池键 = a.id（wb-<hash>），非 a.uid
+                  const inflight = wbPool.find((p) => p.uid === a.id)?.inflight ?? 0;
                   return (
                     <div
                       key={a.id}
                       className="flex items-center gap-3 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800"
                     >
+                      <input
+                        type="checkbox"
+                        checked={wbSelected.includes(a.id)}
+                        onChange={() => toggleWbUid(a.id)}
+                      />
                       <div className="min-w-0 flex-1 truncate font-medium">{a.nickname || a.id}</div>
                       {a.is_current && <Badge tone="green">在线</Badge>}
                       {a.needs_relogin && <Badge tone="amber">需重新登录</Badge>}
