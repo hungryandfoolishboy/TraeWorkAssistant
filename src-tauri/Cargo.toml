@@ -43,7 +43,9 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 tokio-rustls = { version = "0.26", features = ["logging", "tls12"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 hyper-tungstenite = "0.19"
-rcgen = { version = "0.14", features = ["x509-parser"] }
+# aws_lc_rs：KeyPair 解析需支持 PKCS#1（老版 Python CA 私钥 "BEGIN RSA PRIVATE KEY"），
+# ring 后端只认 PKCS#8，会导致启动代理报「解析 CA 私钥失败: Could not parse key pair」
+rcgen = { version = "0.14", features = ["x509-parser", "aws_lc_rs"] }
 time = "0.3"
 futures-util = "0.3"
 regex = "1"

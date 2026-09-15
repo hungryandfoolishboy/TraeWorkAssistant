@@ -2,7 +2,12 @@
 //!
 //! 兼容性红线：老版本 Python 生成的 CA（RSA 2048、CN=TraeDeviceProxyCA、PKCS#1 私钥）
 //! 必须原样加载——用户已将其安装进 Windows 受信任根存储，换 CA 等于强制所有用户重装证书。
-//! rcgen 的 `KeyPair::from_pem` 支持 "RSA PRIVATE KEY"（PKCS#1）PEM，可直接复用。
+//! 注意：rcgen 0.14 默认 ring 后端的 KeyPair 只接受 PKCS#8；必须启用 aws_lc_rs feature
+//! （Cargo.toml）其 TryFrom 才支持 PKCS#1/SEC1，否则 from_pem 报「Could not parse key pair」。
+//! 另一陷阱：rcgen 对非 PKCS#8 加载的密钥 `serialize_der` **原样返回原格式 DER**
+//! （PKCS#1 进 PKCS#1 出），不能硬包 PrivatePkcs8KeyDer——必须按原始格式传给
+//! rustls（PrivateKeyDer 按 variant 分派解析），否则 ServerConfig 构建报
+//! 「failed to parse private key as RSA, ECDSA, or EdDSA」。
 //! 新生成的 CA 使用 rcgen 默认 ECDSA P-256（根证书算法不影响链校验）。
 //!
 //! 叶子证书不再像 Python 版那样写临时文件：rcgen 在内存内签名 + LRU 缓存 ServerConfig，
@@ -17,8 +22,9 @@ use time::{Duration, OffsetDateTime};
 use tokio_rustls::rustls::{
     ServerConfig,
     crypto::CryptoProvider,
-    pki_types::{CertificateDer, PrivatePkcs8KeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 
 /// 叶子证书 ServerConfig 缓存上限（Python 版为 50，内存内缓存无临时文件可放宽）
 const LEAF_CACHE_MAX: usize = 512;
@@ -38,6 +44,9 @@ fn next_serial() -> u64 {
 /// 结构对齐 hudsucker 的 RcgenAuthority（叶子复用 CA 密钥对，属于 MITM 代理通行做法）。
 pub struct CaAuthority {
     issuer: Issuer<'static, KeyPair>,
+    /// CA 私钥原始格式 DER（PKCS#8 进 PKCS#8、PKCS#1 进 PKCS#1）：rustls 按
+    /// PrivateKeyDer variant 分派解析，格式错配即「failed to parse private key」
+    ca_key_der: PrivateKeyDer<'static>,
     provider: Arc<CryptoProvider>,
     cache: Mutex<HashMap<String, Arc<ServerConfig>>>,
 }
@@ -73,13 +82,12 @@ impl CaAuthority {
         let cert = params
             .signed_by(&self.issuer.key(), &self.issuer)
             .expect("failed to sign leaf certificate");
-        let key_der = PrivatePkcs8KeyDer::from(self.issuer.key().serialize_der());
 
         let mut cfg = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
             .with_safe_default_protocol_versions()
             .expect("protocol versions")
             .with_no_client_auth()
-            .with_single_cert(vec![CertificateDer::from(cert)], key_der.into())
+            .with_single_cert(vec![CertificateDer::from(cert)], self.ca_key_der.clone_key())
             .expect("failed to build server config");
         // 仅广播 http/1.1：对齐 Python 版（未设置 ALPN，客户端回落 HTTP/1.1），
         // 避免引入 h2 分支后与请求日志/签到改写逻辑出现行为分叉
@@ -100,34 +108,34 @@ pub fn ensure_ca(certs_dir: &std::path::Path) -> Result<CaAuthority, String> {
 
     std::fs::create_dir_all(certs_dir).map_err(|e| format!("创建证书目录失败: {e}"))?;
 
-    let issuer = if cert_pem_path.exists() && key_pem_path.exists() {
+    let (issuer, ca_key_der) = if cert_pem_path.exists() && key_pem_path.exists() {
         let cert_pem = std::fs::read_to_string(&cert_pem_path)
             .map_err(|e| format!("读取 CA 证书失败: {e}"))?;
         let key_pem = std::fs::read_to_string(&key_pem_path)
             .map_err(|e| format!("读取 CA 私钥失败: {e}"))?;
-        let issuer = load_issuer(&cert_pem, &key_pem)?;
+        let (issuer, key_der) = load_issuer(&cert_pem, &key_pem)?;
         // ca.cer 缺失则从 ca.crt(PEM) 补导出 DER：老版本/异常过程可能只留下
         // ca.crt+ca.key，certutil 安装依赖 ca.cer，缺失会在 UAC 后立即失败（闪退）
         if !cer_der_path.exists() {
             let der = pem_to_der(&cert_pem)?;
             std::fs::write(&cer_der_path, der).map_err(|e| format!("补写 ca.cer 失败: {e}"))?;
         }
-        issuer
+        (issuer, key_der)
     } else {
-        let issuer = generate_ca()?;
+        let generated = generate_ca()?;
         // 先落盘再使用：ca.cer(DER) 供 certutil 安装，ca.crt/ca.key 供下次启动加载
-        std::fs::write(&cert_pem_path, issuer.cert_pem.as_bytes())
+        std::fs::write(&cert_pem_path, generated.cert_pem.as_bytes())
             .map_err(|e| format!("写入 ca.crt 失败: {e}"))?;
-        std::fs::write(&key_pem_path, issuer.key_pem.as_bytes())
+        std::fs::write(&key_pem_path, generated.key_pem.as_bytes())
             .map_err(|e| format!("写入 ca.key 失败: {e}"))?;
-        std::fs::write(&cer_der_path, issuer.cert_der)
+        std::fs::write(&cer_der_path, generated.cert_der)
             .map_err(|e| format!("写入 ca.cer 失败: {e}"))?;
         harden_ca_dir(certs_dir);
-        issuer.issuer
+        (generated.issuer, generated.key_der)
     };
 
     let provider = Arc::new(load_crypto_provider());
-    Ok(CaAuthority { issuer, provider, cache: Mutex::new(HashMap::new()) })
+    Ok(CaAuthority { issuer, ca_key_der, provider, cache: Mutex::new(HashMap::new()) })
 }
 
 struct GeneratedCa {
@@ -135,13 +143,16 @@ struct GeneratedCa {
     cert_pem: String,
     key_pem: String,
     cert_der: Vec<u8>,
+    /// 生成密钥的 PKCS#8 DER（serialize_der 必须在 key_pair 移交 Issuer 之前调用）
+    key_der: PrivateKeyDer<'static>,
 }
 
 /// 生成自签 CA（CN=TraeDeviceProxyCA，10 年有效期，ECDSA P-256）
 fn generate_ca() -> Result<GeneratedCa, String> {
     let key_pair = KeyPair::generate().map_err(|e| format!("生成 CA 密钥失败: {e}"))?;
-    // 私钥 PEM 必须在 key_pair 移交 Issuer 之前序列化
+    // 私钥 PEM / PKCS#8 DER 必须在 key_pair 移交 Issuer 之前序列化
     let key_pem = key_pair.serialize_pem();
+    let key_der = PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
     let mut params = CertificateParams::default();
     params
         .distinguished_name
@@ -160,13 +171,24 @@ fn generate_ca() -> Result<GeneratedCa, String> {
     let cert_der = cert.der().to_vec();
     let issuer = Issuer::from_ca_cert_pem(&cert_pem, key_pair)
         .map_err(|e| format!("构建 CA 签发器失败: {e}"))?;
-    Ok(GeneratedCa { issuer, cert_pem, key_pem, cert_der })
+    Ok(GeneratedCa { issuer, cert_pem, key_pem, cert_der, key_der })
 }
 
-/// 从 PEM 加载已有 CA（Python cryptography 生成的 RSA PKCS#1 私钥可直接解析）
-fn load_issuer(cert_pem: &str, key_pem: &str) -> Result<Issuer<'static, KeyPair>, String> {
-    let key_pair = KeyPair::from_pem(key_pem).map_err(|e| format!("解析 CA 私钥失败: {e}"))?;
-    Issuer::from_ca_cert_pem(cert_pem, key_pair).map_err(|e| format!("解析 CA 证书失败: {e}"))
+/// 从 PEM 加载已有 CA（Python cryptography 生成的 RSA PKCS#1 私钥可直接解析）。
+/// 私钥按 PEM 标签解析为原始格式的 PrivateKeyDer 并原样保留（rustls 按 variant
+/// 分派解析）——rcgen 对 PKCS#1 进的密钥 serialize_der 原样返回 PKCS#1，硬包
+/// PrivatePkcs8KeyDer 会在构建 ServerConfig 时报「failed to parse private key」。
+fn load_issuer(
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<(Issuer<'static, KeyPair>, PrivateKeyDer<'static>), String> {
+    let key_der = PrivateKeyDer::from_pem_reader(&mut key_pem.as_bytes())
+        .map_err(|e| format!("解析 CA 私钥 PEM 失败: {e}"))?;
+    let key_pair = KeyPair::try_from(&key_der)
+        .map_err(|_| "解析 CA 私钥失败: Could not parse key pair".to_string())?;
+    let issuer = Issuer::from_ca_cert_pem(cert_pem, key_pair)
+        .map_err(|e| format!("解析 CA 证书失败: {e}"))?;
+    Ok((issuer, key_der))
 }
 
 /// PEM(CERTIFICATE) → DER：提取 base64 主体并解码（供补写 ca.cer）
@@ -302,6 +324,31 @@ mod tests {
 
         let cfg = ca.gen_server_config("api.trae.cn");
         assert!(!cfg.alpn_protocols.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 兼容性红线回归：老版 Python 生成的 CA（RSA 2048、PKCS#1 "BEGIN RSA PRIVATE KEY"）
+    /// 必须原样加载。ring 后端 KeyPair 只认 PKCS#8（报「Could not parse key pair」），
+    /// 依赖 Cargo.toml 启用 aws_lc_rs feature；本测试固定夹具锁死该行为。
+    #[test]
+    fn legacy_python_pkcs1_ca_loads() {
+        const LEGACY_CA_CERT: &str = include_str!("fixtures/legacy_ca_pkcs1.crt");
+        const LEGACY_CA_KEY: &str = include_str!("fixtures/legacy_ca_pkcs1.key");
+        let tmp = std::env::temp_dir().join(format!("aiwork_ca_pkcs1_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("ca.crt"), LEGACY_CA_CERT).unwrap();
+        std::fs::write(tmp.join("ca.key"), LEGACY_CA_KEY).unwrap();
+
+        let ca = ensure_ca(&tmp).expect("legacy PKCS#1 CA must load");
+        // 签发器可用：复用 RSA CA 密钥签发叶子证书
+        let cfg = ca.gen_server_config("api.trae.cn");
+        assert!(!cfg.alpn_protocols.is_empty());
+        // 加载路径不得重写 CA 文件（换 CA = 强制所有用户重装证书）
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("ca.crt")).unwrap(),
+            LEGACY_CA_CERT
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
