@@ -1,6 +1,7 @@
 # 数据存储层 SQLite 化：data 目录 JSON 全量迁移落地方案
 
-> **文档版本**: v2.0 · 2026-09-15
+> **文档版本**: v2.1 · 2026-09-15
+> **实施状态**: ✅ P0-P5 全部完成并逐阶段提交。实施结果：38+ JSON 文件全部迁入 `data/aiwork.sqlite`（kv 29 键 / 行文档实体 10 表 / 列化流水 5 表），旧文件移入 `data/backup/`（含 manifest）；`read_json_cached` 解析缓存整体删除；wb_upstream 根路径死引用修复；启动顺序调整为 store 迁移 → vault 迁移（明文凭据先入库再收敛进 Stronghold 并占位化抹除，已有专项测试覆盖）。验证：cargo test 381 通过、cargo build 0 warning（仅第三方 libsodium 链接器 PDB 提示）、tsc 通过、前端契约零改动。
 > **定位**: 数据存储层 SQLite 化（data 目录 JSON 全量迁移）的唯一权威执行文档。取代 `docs/tmp/sqlite-migration.md`（v1 会话稿）；`docs/rust-migration-and-storage-plan.md` §二「选择性迁移」立场已被全量迁移决策取代。
 > **来源**: v1 计划 + 2026-09-15 全仓代码实测盘点（92 个 .rs、~250 处 JSON 读写调用面、44 个文件），逐文件核对读写点/struct/收敛入口。
 > **前提确认**: Python 伴生脚本与 PowerShell 桥**已全部 Rust 化并移除**（`src-python/`、`src-ps/`、`prepare_python_runtime.py` 均不存在，无任何 python 子进程调用）→ **v1 计划的 Phase 3（Python/PS 跨进程改造）整体取消**，跨进程并发仅剩 Rust 进程内多线程 + `--task-run` CLI 子进程（同一 exe，共享同一 store 模块）。
@@ -46,48 +47,44 @@
 
 ### 2.2 表模型（三组）
 
-#### ① KV 文档表（23 键）——content 保持原 serde JSON 结构，key = 文件名去 .json
+#### ① KV 文档表（29 键）——content 保持原 serde JSON 结构，key = 文件名去 .json
 
 ```sql
 CREATE TABLE kv (key TEXT PRIMARY KEY, content TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
 ```
 
-成员：`app_settings`、`api_pool`、`dispatch_policy`、`api_gateway_settings`、`api_models`、`wb_model_catalog`、`trae_model_meta`、`wb_model_route`、`wb_template_map`、`wb_sticky_sessions`、`checkin_summary`、`workbuddy_settings`、`workbuddy_credits_history`、`workbuddy_credits_cache`、`workbuddy_usage_official_cache`、`workbuddy_usage_official_all_cache`、`workbuddy_activity_cache`、`wb_cli_rotate_state`、`token_stats_files`、`doubao_renew_result`、`usage_history`、`oauth_device`、`scheduler_state`。
-（整存整取、无行级访问诉求 → KV 最贴切；`remaining_credits`/`api_keys`/`custom_models` 的顶层 `updated_at` 全局字段随行文档表入 kv 键 `<name>_updated_at`。）
+文件键（24）：`app_settings`、`api_pool`、`dispatch_policy`、`api_gateway_settings`、`api_models`、`wb_model_catalog`、`trae_model_meta`、`wb_model_route`、`wb_template_map`、`wb_sticky_sessions`、`checkin_summary`、`workbuddy_settings`、`workbuddy_credits_history`、`workbuddy_credits_cache`、`workbuddy_usage_official_cache`、`workbuddy_usage_official_all_cache`、`workbuddy_activity_cache`、`wb_cli_rotate_state`、`token_stats_files`、`doubao_renew_result`、`usage_history`、`oauth_device`、`scheduler_state`、`doubao_captured_credentials`（单对象凭据快照，MITM 捕获写 / 命令读，整存整取）。
+标量/元数据键（5）：`api_keys_auth_disabled`、`custom_models_updated_at`、`remaining_credits_updated_at`、`wb_tokens_meta`（version 闸门）、`doubao_pool_meta`（last_keepalive_at）。
 
-#### ② 行文档实体表（12 表）——(pk TEXT PRIMARY KEY, data TEXT NOT NULL JSON, updated_at)
+#### ② 行文档实体表（10 表）——(pk TEXT PRIMARY KEY, data TEXT NOT NULL JSON, updated_at)
 
 | 表 | 源文件 | pk | data 内容（serde JSON，struct 不变） |
 |---|---|---|---|
-| `accounts` | checkin_accounts.json | 行号（INTEGER PK，user_id 可空） | `Account` 全字段 |
+| `accounts` | checkin_accounts.json | seq（INTEGER PK AUTOINCREMENT 保序）+ user_id UNIQUE 可空 | `RawAccount` 全字段 |
 | `device_map` | device_map.json | uid | `DeviceEntry` |
-| `groups` | groups.json | uid | group_id（TEXT） |
-| `remaining_credits` | remaining_credits.json | uid | 每账号积分聚合对象（credits/expire_time/general/work/total_limit/membership_*） |
+| `groups` / `group_members` | groups.json | id / uid | `Group` / group_id TEXT |
+| `remaining_credits` | remaining_credits.json | uid | 原 7 平行 map 按账号合并为单行对象（credits/expire_time/general/work/total_limit/membership_*） |
 | `account_cooldowns` | account_cooldowns.json | uid | `CooldownEntry` |
 | `pay_status` | pay_status.json | uid | `PayStatusEntry` |
-| `api_keys` | api_keys.json | key id | `ApiKeyEntry`（allowed_accounts 为 JSON 数组文本） |
+| `api_keys` | api_keys.json | key id | `ApiKeyEntry` 全字段（含 allowed_accounts / daily_stats，原文件内嵌结构不变） |
 | `custom_models` | custom_models.json | model id | `CustomModel` |
 | `doubao_accounts` | doubao_accounts.json | user_id | `DoubaoAccount` |
-| `wb_accounts` | workbuddy_accounts.json | account id | `WorkBuddyAccount` |
-| `wb_tokens` | workbuddy_token_store.json | account_id | token 记录（accessToken/refreshToken/expires/domain） |
-| `doubao_captured_credentials` | doubao_captured_credentials.json | uid | 凭据对象（MITM 捕获写 / 命令读） |
+| `wb_accounts` | workbuddy_accounts.json | account id | `WorkBuddyAccount`（池 Value 内 account 对象） |
+| `wb_tokens` | workbuddy_token_store.json | account_id | token 记录对象（accessToken/refreshToken/expires/domain/updated_at） |
+| `api_usage` | api_usage.json | (bucket, day) 复合 PK | `DayStats` 全量 JSON（含 latency/model_latency 样本，保真） |
 
-**建模修订理由（相对 v1「全字段列化」）**：实体表消费模式全部是「整文件读入内存 struct ↔ 整文件写回」，无 SQL 级字段过滤/聚合诉求；列化需为 12 个 struct 各写 30~40 列机械映射（≈1500 行纯胶水），回归风险远大于收益。行文档表保留行级 PK（UPSERT/行删/演进能力）与事务原子性，serde 结构零改动、调用面零改动。纯流水/指标表（无固定 struct、需日期聚合与裁剪）保持列化（③）。
+**建模修订理由（相对 v1「全字段列化」）**：实体表消费模式全部是「整文件读入内存 struct ↔ 整文件写回」，无 SQL 级字段过滤/聚合诉求；列化需为 12 个 struct 各写 30~40 列机械映射（≈1500 行纯胶水），回归风险远大于收益。行文档表保留行级 PK（UPSERT/行删/演进能力）与事务原子性，serde 结构零改动、调用面零改动。`api_usage` 实测含按模型延迟样本（`model_latency: HashMap<String, LatencyAgg>`），列化无法保真 → 改 (bucket, day) 行文档；`api_key_daily` 本就内嵌于 `ApiKeyEntry.daily_stats`（cap 90 天）→ 并入 `api_keys` 行内，不单独建表。纯流水表（追加/裁剪/按日聚合）保持列化（③）。
 
-#### ③ 列化流水/指标表（7 表）
+#### ③ 列化流水表（5 表）
 
 | 表 | 源文件 | 列 |
 |---|---|---|
-| `credits_history` | credits_history.json | id INTEGER PK AUTOINCREMENT; date/user_id/credits(+delta，以 struct 为准) |
+| `credits_history` | credits_history.json | id INTEGER PK AUTOINCREMENT; date TEXT; user_id TEXT; credits INTEGER; delta INTEGER |
 | `credits_daily` | credits_daily.json | date TEXT PK; total/earned/consumed REAL |
-| `checkin_results` | checkin_results.json | PK(day, uid); name/status/updated_at |
-| `wb_checkin_results` | workbuddy_checkin_results.json | id INTEGER PK; day/uid/name/status/message/time/reward REAL |
-| `api_usage` | api_usage.json | PK(bucket, day, dim); requests/ok/errors/prompt_tokens/completion_tokens/duration_ms INTEGER |
-| `api_key_daily` | api_keys.json daily_stats | PK(key_id, date); requests/prompt_tokens/completion_tokens 等 |
-| `doubao_health_events` | doubao_health_history.json | id INTEGER PK; day TEXT; payload TEXT(JSON)；裁剪改 DELETE 超限旧行 |
-
-（列名以对应 struct 的 serde 字段 snake_case 为准，实现时核对 models.rs / 模块内定义；serde default → 列 DEFAULT。）
+| `checkin_results` | checkin_results.json | PK(day, uid); name/status/updated_at TEXT；裁剪改 DELETE 超 90 天 |
+| `wb_checkin_results` | workbuddy_checkin_results.json | id INTEGER PK AUTOINCREMENT; date/time/user_id/name/status/message TEXT; reward REAL 可空；裁剪改 DELETE 超 90 天 |
+| `doubao_health_events` | doubao_health_history.json | id INTEGER PK AUTOINCREMENT; payload TEXT(JSON)（原 events 数组元素）；裁剪改 DELETE 超 HISTORY_MAX |
 
 ### 2.3 排除项（不迁移）
 

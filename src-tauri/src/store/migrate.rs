@@ -558,4 +558,40 @@ mod tests {
         assert!(migrate_on_startup(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// P5 安全验收：store 迁移先于 vault 迁移时，JSON 中的明文凭据先入库、
+    /// 再由 vault::migrate_on_startup 收敛进 Stronghold 并从库中占位化抹除。
+    /// （main.rs 实际调用顺序与此测试一致；红线「vault 写失败禁止明文落盘」的库侧等价物）
+    #[test]
+    fn plaintext_converges_into_vault_after_store_migration() {
+        use crate::state::AppState;
+        let dir = tmp_dir("vault_conv");
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        write(
+            &dir.join("data/checkin_accounts.json"),
+            r#"{"accounts":[{"name":"a1","UserID":"u1","jwt":"secret-jwt","refresh_token":"secret-rt"}]}"#,
+        );
+
+        // ① store 迁移（main.rs 顺序：先于 vault）
+        migrate_on_startup(&dir);
+        // 入库后此刻仍为明文（待 vault 收敛）
+        let store = db(&dir);
+        let mid = super::super::docs::accounts_load(&store);
+        assert_eq!(mid.accounts[0].jwt, "secret-jwt", "store 迁移保真导入");
+
+        // ② vault 迁移（ AppState 手工构造，同 doubao_session 测试模式）
+        let state = AppState {
+            data_dir: dir.clone(),
+            jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        };
+        crate::vault::migrate_on_startup(&state);
+
+        // ③ 库中凭据已占位化抹除（明文只存在于 vault）
+        let after = super::super::docs::accounts_load(&store);
+        assert_eq!(after.accounts.len(), 1);
+        assert_eq!(after.accounts[0].jwt, "", "jwt 必须被占位化抹除");
+        assert!(after.accounts[0].refresh_token.is_none(), "refresh_token 必须被抹除");
+        assert_eq!(after.accounts[0].name, "a1", "非敏感字段保留");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
