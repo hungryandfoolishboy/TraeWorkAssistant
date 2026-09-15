@@ -2,7 +2,11 @@
 //! - 生成：直调 [`crate::device_proxy::ca::ensure_ca`]（兼容 Python 版 RSA CA，
 //!   缺失则用 rcgen 生成，布局 data/certs/{ca.crt,ca.key,ca.cer} 不变）；
 //!   原「device_proxy.py --gen-ca + pip 依赖自愈」链路随 Python 移除一并删除。
-//! - 安装：certutil 管理员写入受信任根（PowerShell RunAs 触发 UAC），流程不变。
+//! - 安装：certutil 管理员写入本地计算机受信任根（PowerShell RunAs 触发 UAC）；
+//!   提权被拒（VPN 客户端证书保护/企业组策略/杀软锁 HKLM 根存储，issue #12）时
+//!   降级为当前用户存储直装（certutil -user -addstore，无需管理员，Chrome/Edge
+//!   信任 HKCU Root，Windows 弹系统安全确认框）。
+//! - 探测：HKLM 与 HKCU Root 任一命中即视为已安装。
 
 use std::os::windows::process::CommandExt;
 use std::process::Command;
@@ -30,26 +34,34 @@ fn explain_certutil_exit(code: Option<i32>) -> String {
     match code {
         Some(1223) => "用户取消了 UAC 授权".into(),
         Some(5) | Some(E_ACCESSDENIED) => {
-            "证书文件权限不足（拒绝访问），可尝试删除数据目录下 certs 文件夹后重试".into()
+            "拒绝访问：可能是证书文件权限不足（可删除数据目录下 certs 文件夹后重试），\
+             也可能是杀毒软件/企业策略/VPN 客户端锁定了根证书存储（可暂时退出后重试）"
+                .into()
         }
         Some(_) => "可能需要管理员权限或证书文件不可读".into(),
         None => "进程异常退出".into(),
     }
 }
 
-#[tauri::command(async)]
-pub fn cert_status(_app: AppHandle, _state: State<AppState>) -> CertStatus {
+/// 查询指定根存储是否含 TraeDeviceProxyCA（args 形如 ["-store","Root"] /
+/// ["-user","-store","Root"]；查询失败一律视为未安装）
+fn store_contains_cn(args: &[&str]) -> bool {
     let out = Command::new("certutil")
-        .args(["-store", "Root"])
+        .args(args)
         .creation_flags(CREATE_NO_WINDOW)
         .output();
-    let installed = match out {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.contains("TraeDeviceProxyCA")
-        }
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains("TraeDeviceProxyCA"),
         Err(_) => false,
-    };
+    }
+}
+
+#[tauri::command(async)]
+pub fn cert_status(_app: AppHandle, _state: State<AppState>) -> CertStatus {
+    // Chrome/Edge 走 Windows 证书 API，HKLM 与 HKCU Root 合并参与链验证，
+    // 任一命中即视为已安装（HKCU 降级安装的用户态路径）
+    let installed =
+        store_contains_cn(&["-store", "Root"]) || store_contains_cn(&["-user", "-store", "Root"]);
     CertStatus { installed }
 }
 
@@ -93,7 +105,22 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
         }
     }
 
-    if !status.success() {
+    // 4. 降级兜底：提权安装仍被拒且非用户取消 UAC → 当前用户存储直装（issue #12）。
+    //    VPN 客户端证书保护/企业组策略/杀软锁 HKLM 根存储时，这是唯一可行路径：
+    //    certutil -user -addstore 写 HKCU Root，无需管理员；Windows 会弹系统安全
+    //    确认框，用户点是即可；Chrome/Edge 信任 HKCU Root
+    let mut installed_via_user_store = false;
+    if !status.success() && status.code() != Some(1223) {
+        installed_via_user_store = Command::new("certutil")
+            .args(["-user", "-addstore", "-f", "Root", &cer_arg])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    }
+
+    // 两条路径都失败才报错（降级路径成败由末尾复查统一判定，避免误报）
+    if !status.success() && !installed_via_user_store {
         return Err(format!(
             "证书安装被取消或失败（{}；certutil 退出码 {:?}）",
             explain_certutil_exit(status.code()),
@@ -101,10 +128,29 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
         ));
     }
 
-    // 4. 复查根存储，防止「命令成功但证书未生效」的误报
+    // 5. 复查根存储（HKLM/HKCU 任一命中），防止「命令成功但证书未生效」的误报
     let result = cert_status(app, state);
     if !result.installed {
-        return Err("证书安装命令已执行，但根证书存储中未找到 TraeDeviceProxyCA，请检查系统策略".into());
+        return Err(
+            "证书安装命令已执行，但根证书存储中未找到 TraeDeviceProxyCA；若本机装有 \
+             VPN/安全软件，请暂时退出后重试，或检查企业策略是否限制安装根证书"
+                .into(),
+        );
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn certutil_exit_code_explanation() {
+        // 0x80070005 的有符号表示（issue #12 实测退出码）
+        assert_eq!(Some(-2147024891), Some(E_ACCESSDENIED));
+        assert!(explain_certutil_exit(Some(E_ACCESSDENIED)).contains("拒绝访问"));
+        assert!(explain_certutil_exit(Some(5)).contains("拒绝访问"));
+        assert_eq!(explain_certutil_exit(Some(1223)), "用户取消了 UAC 授权");
+        assert_eq!(explain_certutil_exit(None), "进程异常退出");
+    }
 }
