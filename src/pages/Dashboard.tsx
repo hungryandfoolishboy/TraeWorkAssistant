@@ -244,7 +244,7 @@ export default function Dashboard() {
               try {
                 await api.cert.install();
                 await useAppStore.getState().refreshCert();
-                toast('success', '证书安装成功');
+                toast('success', '证书安装成功（可在 certmgr「受信任的根证书颁发机构」中搜索 TraeDeviceProxyCA 验证）');
               } catch (e) {
                 toast('error', `证书安装失败：${String(e)}`);
               }

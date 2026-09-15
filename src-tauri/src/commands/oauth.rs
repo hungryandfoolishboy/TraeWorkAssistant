@@ -4,7 +4,7 @@ use tauri::State;
 
 use crate::fs_utils;
 use crate::jwt;
-use crate::models::RawAccount;
+use crate::models::{DeviceMap, RawAccount};
 use crate::state::AppState;
 
 /// 最近签发的 OAuth state（CSRF 防护）：oauth_get_login_url 签发时记录，
@@ -15,7 +15,60 @@ static LAST_OAUTH_STATE: Mutex<Option<String>> = Mutex::new(None);
 const OAUTH_CLIENT_ID: &str = "en1oxy7wnw8j9n";
 const OAUTH_CLIENT_SECRET: &str = "-";
 const OAUTH_APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
-const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:17388/authorize";
+/// 本机回环监听端口（F-78 批次 1：commands/oauth_loopback.rs 在此端口收 OAuth 回调）
+pub(crate) const OAUTH_LOOPBACK_PORT: u16 = 17388;
+pub(crate) const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:17388/authorize";
+const OAUTH_EXCHANGE_URL: &str = "https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken";
+
+/// OAuth 客户端凭证外置配置（缺陷10）：conf/oauth_client.json 可覆盖
+/// client_id / client_secret / exchange_url（上游更换凭证或端点时无需发版）。
+/// 文件缺失或字段缺省回退内置默认；进程内 OnceLock 缓存，修改后需重启应用生效。
+#[derive(serde::Deserialize, Clone)]
+pub struct OAuthClientConfig {
+    #[serde(default = "default_client_id")]
+    pub client_id: String,
+    #[serde(default = "default_client_secret")]
+    pub client_secret: String,
+    #[serde(default = "default_exchange_url")]
+    pub exchange_url: String,
+}
+
+impl Default for OAuthClientConfig {
+    fn default() -> Self {
+        Self {
+            client_id: default_client_id(),
+            client_secret: default_client_secret(),
+            exchange_url: default_exchange_url(),
+        }
+    }
+}
+
+fn default_client_id() -> String {
+    OAUTH_CLIENT_ID.to_string()
+}
+fn default_client_secret() -> String {
+    OAUTH_CLIENT_SECRET.to_string()
+}
+fn default_exchange_url() -> String {
+    OAUTH_EXCHANGE_URL.to_string()
+}
+
+/// 读取外置 OAuth 客户端配置（全局一次；缺失/损坏回退默认值）
+pub fn oauth_client() -> &'static OAuthClientConfig {
+    static CFG: std::sync::OnceLock<OAuthClientConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        std::env::var("APPDATA")
+            .ok()
+            .map(|d| {
+                std::path::PathBuf::from(d)
+                    .join(crate::state::DATA_DIR_NAME)
+                    .join("conf")
+                    .join("oauth_client.json")
+            })
+            .map(|p| fs_utils::read_json::<OAuthClientConfig>(&p))
+            .unwrap_or_default()
+    })
+}
 
 /// OAuth 回调解析结果
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -106,15 +159,58 @@ pub(crate) fn random_hex(len: usize) -> String {
     out
 }
 
+/// OAuth 登录设备标识（F-78 批次 3）：持久化于 data/oauth_device.json。
+/// 原实现每次随机生成 machine_id/device_id，与 device_map.json 的账号稳定伪设备漂移，
+/// OAuth 换发的 JWT 绑定设备与签到用设备不一致，存在被服务端判定异动/顶替的风控隐患。
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct OAuthDevice {
+    pub machine_id: String,
+    pub device_id: String,
+}
+
+/// 读取（缺失则生成并写回）本机稳定的 OAuth 设备标识。
+/// device_id 优先对齐 device_map.json 已有条目（登录前无法预知账号，取 user_id 字典序
+/// 最小的条目作为本机基准，保证不再每次随机）；machine_id 无对应字段，首次随机后固定。
+/// 注意：不回写 device_map.json——DeviceEntry 三元组（device_id/market_user_id/session_id）
+/// 与 OAuth 二元组字段语义不同，部分写入会破坏签到脚本的完整三元组假设。
+fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
+    // SQLite 化（P2）：oauth_device.json → kv `oauth_device`
+    let store = crate::store::db(&state.data_dir);
+    let mut dev: OAuthDevice = store.kv_get("oauth_device");
+    if dev.machine_id.is_empty() || dev.device_id.is_empty() {
+        if dev.device_id.is_empty() {
+            let map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
+            if let Some((_, entry)) = map.iter().min_by_key(|(k, _)| k.as_str()) {
+                if !entry.device_id.is_empty() {
+                    dev.device_id = entry.device_id.clone();
+                }
+            }
+        }
+        if dev.machine_id.is_empty() {
+            dev.machine_id = random_hex(32);
+        }
+        if dev.device_id.is_empty() {
+            dev.device_id = (0..15)
+                .map(|_| {
+                    let n = (random_hex(2).chars().next().unwrap() as u8).wrapping_rem(10);
+                    (b'0' + n) as char
+                })
+                .collect();
+        }
+        // 写回失败不阻断登录（下次重新生成，仅损失一次稳定性）
+        let _ = store.kv_set("oauth_device", &dev);
+    }
+    dev
+}
+
 /// 生成 OAuth 登录 URL
 #[tauri::command]
-pub fn oauth_get_login_url() -> OAuthLoginUrl {
-    let state = random_hex(32);
-    let machine_id = random_hex(32);
-    let device_id: String = (0..15).map(|_| {
-        let n = (random_hex(2).chars().next().unwrap() as u8).wrapping_rem(10);
-        (b'0' + n) as char
-    }).collect();
+pub fn oauth_get_login_url(state: State<AppState>) -> OAuthLoginUrl {
+    let state = &*state;
+    let dev = load_or_create_oauth_device(state);
+    let machine_id = dev.machine_id;
+    let device_id = dev.device_id;
+    let state_param = random_hex(32);
 
     let url = format!(
         "https://www.trae.cn/authorization?\
@@ -126,11 +222,11 @@ pub fn oauth_get_login_url() -> OAuthLoginUrl {
         &machine_id={machine_id}\
         &device_id={device_id}\
         &response_type=code",
-        client_id = OAUTH_CLIENT_ID,
-        client_secret = OAUTH_CLIENT_SECRET,
+        client_id = oauth_client().client_id,
+        client_secret = oauth_client().client_secret,
         app_id = OAUTH_APP_ID,
         redirect_uri = urlencoding::encode(OAUTH_REDIRECT_URI),
-        state = state,
+        state = state_param,
         machine_id = machine_id,
         device_id = device_id,
     );
@@ -139,8 +235,8 @@ pub fn oauth_get_login_url() -> OAuthLoginUrl {
         url,
         // 记录最近签发的 state 供回调校验（CSRF）
         state: {
-            *LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(state.clone());
-            state
+            *LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(state_param.clone());
+            state_param
         },
         redirect_uri: OAUTH_REDIRECT_URI.to_string(),
     }
@@ -168,18 +264,6 @@ pub fn oauth_parse_callback(callback_url: String) -> Result<OAuthCallbackInfo, S
         params.insert(key, decoded);
     }
 
-    // 优先从 refreshToken 参数获取
-    let refresh_token = params
-        .get("refreshToken")
-        .or_else(|| params.get("refresh_token"))
-        .cloned()
-        .ok_or_else(|| "回调 URL 中缺少 refreshToken 参数".to_string())?;
-
-    let access_token = params
-        .get("accessToken")
-        .or_else(|| params.get("access_token"))
-        .cloned();
-
     let user_id = params
         .get("userId")
         .or_else(|| params.get("user_id"))
@@ -196,7 +280,8 @@ pub fn oauth_parse_callback(callback_url: String) -> Result<OAuthCallbackInfo, S
 
     // CSRF 校验（审查 P2）：回调携带 state 且本进程签发过 state 时，两者必须一致；
     // 不一致的回调 URL 可能来自伪造/重放，直接拒绝。回调不带 state（旧流程/第三方拼 URL）
-    // 或本进程从未签发过（如重启后直接粘贴回调）时保持宽容，不阻断正常登录
+    // 或本进程从未签发过（如重启后直接粘贴回调）时保持宽容，不阻断正常登录。
+    // 注意：必须在 code 交换（网络请求）之前完成，避免对伪造回调发起无谓交换
     if let Some(cb_state) = params.get("state") {
         let issued = LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(expected) = issued {
@@ -205,6 +290,39 @@ pub fn oauth_parse_callback(callback_url: String) -> Result<OAuthCallbackInfo, S
             }
         }
     }
+
+    let mut access_token = params
+        .get("accessToken")
+        .or_else(|| params.get("access_token"))
+        .cloned();
+
+    // 优先从 refreshToken 参数获取；无 refreshToken 但携带 code（标准授权码回调）时，
+    // 尝试用 code 调 ExchangeToken 交换（F-78 批次 3）。授权码语义未经抓包验证：
+    // 响应含 refresh_token 即走后续流程，失败则明确报「暂不支持」引导手动兜底
+    let refresh_token = match params
+        .get("refreshToken")
+        .or_else(|| params.get("refresh_token"))
+        .cloned()
+    {
+        Some(t) => t,
+        None => {
+            let code = params
+                .get("code")
+                .cloned()
+                .ok_or_else(|| "回调 URL 中缺少 refreshToken 参数".to_string())?;
+            match exchange_code(&code) {
+                Ok((at, rt)) => {
+                    access_token = Some(at);
+                    rt
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "暂不支持 code 授权码回调（{e}），请改用携带 refreshToken 的回调，或复制完整回调 URL 手动重试"
+                    ));
+                }
+            }
+        }
+    };
 
     Ok(OAuthCallbackInfo {
         refresh_token,
@@ -215,16 +333,60 @@ pub fn oauth_parse_callback(callback_url: String) -> Result<OAuthCallbackInfo, S
     })
 }
 
-/// ExchangeToken：用 refresh_token 换取 access_token
-fn exchange_token(refresh_token: &str) -> Result<(String, Option<String>), String> {
+/// 用授权码 code 尝试交换 token（F-78 批次 3：oauth_parse_callback 的 code 回调分支）。
+/// ExchangeToken 端点按授权码语义（Code 字段）尝试；响应必须同时含 access_token 与
+/// refresh_token 才视为交换成功，否则交由调用方报「暂不支持」。
+fn exchange_code(code: &str) -> Result<(String, String), String> {
     let resp = short_agent()
-        .post("https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken")
+        .post(&oauth_client().exchange_url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
         .send_json(ureq::json!({
-            "ClientID": OAUTH_CLIENT_ID,
+            "ClientID": oauth_client().client_id,
+            "Code": code,
+            "ClientSecret": oauth_client().client_secret,
+            "UserID": ""
+        }))
+        .map_err(|e| format!("ExchangeToken 请求失败: {}", e))?;
+
+    let body: serde_json::Value =
+        resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
+
+    let code_val = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if code_val != 0 {
+        let msg = body
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        return Err(format!("ExchangeToken 失败 (code={}): {}", code_val, msg));
+    }
+
+    let data = body.get("data").ok_or("响应中缺少 data 字段")?;
+    let access_token = data
+        .get("access_token")
+        .or_else(|| data.get("token"))
+        .and_then(|v| v.as_str())
+        .ok_or("响应中缺少 access_token")?
+        .to_string();
+    let refresh_token = data
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or("响应中缺少 refresh_token")?
+        .to_string();
+
+    Ok((access_token, refresh_token))
+}
+
+/// ExchangeToken：用 refresh_token 换取 access_token
+fn exchange_token(refresh_token: &str) -> Result<(String, Option<String>), String> {
+    let resp = short_agent()
+        .post(&oauth_client().exchange_url)
+        .set("content-type", "application/json")
+        .set("accept", "*/*")
+        .send_json(ureq::json!({
+            "ClientID": oauth_client().client_id,
             "RefreshToken": refresh_token,
-            "ClientSecret": OAUTH_CLIENT_SECRET,
+            "ClientSecret": oauth_client().client_secret,
             "UserID": ""
         }))
         .map_err(|e| format!("ExchangeToken 请求失败: {}", e))?;
@@ -303,6 +465,7 @@ fn get_user_info(access_token: &str) -> Result<(String, String), String> {
 #[tauri::command(async)]
 pub fn oauth_login(
     state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     callback_url: String,
     account_name: Option<String>,
     group_id: Option<String>,
@@ -367,6 +530,9 @@ pub fn oauth_login(
         acct.jwt = jwt.clone();
         acct.refresh_token = Some(final_refresh_token.clone());
         acct.updated_at = Some(fs_utils::now_iso());
+        // 重新 OAuth 登录拿到新 token：生命周期计数清零、失效标记解除（F-78 批次 3）
+        acct.refresh_token_fails = 0;
+        acct.refresh_token_invalid = false;
         crate::vault::save_accounts(&state, &mut accounts)?;
 
         fs_utils::app_log(
@@ -383,21 +549,33 @@ pub fn oauth_login(
             added_at: Some(fs_utils::now_iso()),
             updated_at: Some(fs_utils::now_iso()),
             dc_id: None,
+            refresh_token_expires_at: None,
+            refresh_token_fails: 0,
+            refresh_token_invalid: false,
         });
         crate::vault::save_accounts(&state, &mut accounts)?;
 
         // 设置分组
         if let Some(g) = group_id {
             let mut groups: crate::models::GroupsFile =
-                fs_utils::read_json(&state.path("groups.json"));
+                crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
             groups.membership.insert(user_id.clone(), g);
-            fs_utils::write_json(&state.path("groups.json"), &groups)?;
+            crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
         }
 
         fs_utils::app_log(
             &state.data_dir,
             &format!("OAuth 登录：新增账号 [{}] user_id={}", name, user_id),
         );
+    }
+
+    // F-78 批次 3：重新登录拿到新凭证 → 运行中 API 池回填 JWT 并解除 refresh_token 失效禁用
+    {
+        let guard = runtime.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rt) = guard.as_ref() {
+            rt.shared.pool.note_refresh_success(&user_id, &jwt);
+            rt.shared.wb_pool.note_refresh_success(&user_id, &jwt);
+        }
     }
 
     Ok(OAuthLoginResult {

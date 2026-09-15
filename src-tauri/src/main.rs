@@ -3,12 +3,15 @@
 
 mod commands;
 mod checkin_results;
+mod device_proxy;
 mod fs_utils;
 mod jwt;
 mod models;
 mod notify;
-mod python;
 mod state;
+mod store;
+mod switcher;
+mod tasks;
 mod vault;
 mod api_server;
 mod workbuddy_cli;
@@ -40,6 +43,13 @@ fn main() {
         }
     };
 
+    // CLI 任务模式（D2）：schtasks 计划任务直调主 exe（`--task-run <name>`），
+    // 执行完任务即退出；分支在 Builder 之前，天然绕开单实例插件，不启动 GUI。
+    // Python 运行时移除后计划任务链依赖此入口（原 python 脚本直调的替代）。
+    if let Some(task) = tasks::parse_task_mode(&std::env::args().collect::<Vec<_>>()) {
+        std::process::exit(tasks::run_cli_task(&task, &state));
+    }
+
     if let Some(note) = &migrate_note {
         fs_utils::app_log(&state.data_dir, note);
         eprintln!("{note}");
@@ -50,6 +60,14 @@ fn main() {
     if let Some(note) = commands::misc::try_migrate_legacy_task(&state) {
         fs_utils::app_log(&state.data_dir, &note);
     }
+    // PS 桥 KeepAlive 启动器一次性迁移：旧 task_doubao_renew.cmd 引用
+    // trae-switch-bridge.ps1 → 原地改写为 --task-run doubao-keepalive（幂等，失败静默）
+    if let Some(note) = commands::doubao::try_migrate_keepalive_launcher(&state) {
+        fs_utils::app_log(&state.data_dir, &note);
+    }
+    // OAuth 代理直连豁免崩溃残留清理（F-78 批次 2/缺陷13）：上次进程异常退出
+    // 未还原 ProxyOverride 时，按标记文件只移除本软件追加的条目（无标记幂等空操作）
+    device_proxy::bypass::cleanup_residual_bypass(&state.data_dir);
 
     // 单实例防护（仅正式版）：第二个进程启动时，本回调在首个实例中执行——把主窗口
     // 还原/显示/聚焦后，第二进程由插件自动退出。必须第一个注册（在创建窗口前持有互斥锁）。
@@ -147,6 +165,7 @@ fn main() {
             commands::api_server::pool_list,
             commands::api_server::pool_set,
             commands::api_server::pool_status,
+            commands::api_server::wb_pool_status,
             commands::api_server::api_logs_list,
             commands::api_server::api_logs_detail,
             commands::api_server::api_logs_search,
@@ -211,6 +230,8 @@ fn main() {
             commands::oauth::oauth_get_login_url,
             commands::oauth::oauth_parse_callback,
             commands::oauth::oauth_login,
+            commands::oauth_loopback::oauth_start_loopback,
+            commands::oauth_loopback::oauth_stop_loopback,
             commands::trae_apps::apps_accounts_discover,
             commands::trae_apps::apps_account_add,
             commands::trae_apps::apps_entitlement_read,
@@ -258,11 +279,24 @@ fn main() {
             commands::workbuddy::workbuddy_env_reset,
             commands::workbuddy::workbuddy_usage_official,
             commands::workbuddy::workbuddy_usage_fallback,
+            commands::workbuddy::workbuddy_usage_official_all,
             commands::workbuddy::workbuddy_activity_info,
             commands::workbuddy_stats::workbuddy_token_stats,
+            tasks::scheduler::scheduler_status,
         ])
         .setup(|app| {
             let state = app.state::<AppState>();
+
+            // 数据存储层 SQLite 化（docs/sqllite-storage-plan.md）：旧 JSON 导入 aiwork.sqlite
+            // 并移入 data/backup/（幂等；失败不阻断启动，下次启动重试）。
+            // 必须先于本回调内一切 kv 消费方执行（settings/trim_logs 等）——否则升级
+            // 首次启动读到全默认设置，trim_logs 会按默认保留期误裁日志。
+            // 注意：必须先于 vault 迁移执行——JSON 中的明文凭据先入库，
+            // 再由随后的 vault::migrate_on_startup 收敛进 Stronghold 并从库中占位化抹除。
+            if let Some(summary) = store::migrate::migrate_on_startup(&state.data_dir) {
+                fs_utils::app_log(&state.data_dir, &summary);
+            }
+
             let settings = state.settings();
 
             // 启动期日志清理：按 log_retention_days 丢弃过期日志行（消费设置项，避免无限增长）
@@ -272,7 +306,7 @@ fn main() {
             // 清理上次运行残留的临时凭据文件（崩溃时未及删除的明文文件，失败不阻断启动）
             vault::cleanup_temp_accounts(&state);
 
-            // 敏感数据迁移：checkin_accounts.json 明文 jwt/refresh_token → Stronghold vault（幂等，失败不阻断启动）
+            // 敏感数据迁移：库中明文 jwt/refresh_token → Stronghold vault（幂等，失败不阻断启动）
             vault::migrate_on_startup(&state);
 
             fs_utils::app_log(
@@ -420,8 +454,12 @@ fn main() {
                                     let st = app.state::<AppState>();
                                     let ps =
                                         app.state::<Mutex<Option<commands::proxy::ProxyHandle>>>();
-                                    commands::proxy::proxy_start(app.clone(), st, ps, port)
-                                        .map(|_| ())
+                                    // P4 Rust 化：proxy_start 已是异步命令（进程内代理启动含异步绑定），
+                                    // 托盘回调运行在主线程，用 block_on 等待（与 API 服务托盘同款模式）
+                                    tauri::async_runtime::block_on(commands::proxy::proxy_start(
+                                        app.clone(), st, ps, port,
+                                    ))
+                                    .map(|_| ())
                                 };
                                 if let Err(e) = result {
                                     let st = app.state::<AppState>();
@@ -499,6 +537,10 @@ fn main() {
             // 开关关闭时空转；decide_target 纯函数判定，切号写 ~/.codebuddy/settings.json
             commands::workbuddy::start_cli_rotate_thread();
 
+            // 应用内定时调度器（Rust 原生方案，补充 Windows schtasks）：
+            // 每日签到/巡检/续期到点补跑 + 积分余额每日快照（新增任务，补齐近 7 日消耗时序）
+            tasks::scheduler::start(app.handle().clone());
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -521,13 +563,16 @@ fn main() {
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            // 应用退出时清理代理子进程，防止端口占用
+            // 应用退出时停止进程内代理（P4 Rust 化），防止端口占用
+            commands::proxy::mark_intentional_stop();
             let proxy_state = app_handle.state::<Mutex<Option<commands::proxy::ProxyHandle>>>();
             let mut g = proxy_state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut proxy_was_running = false;
             if let Some(h) = g.take() {
+                proxy_was_running = true;
                 let state = app_handle.state::<AppState>();
-                fs_utils::app_log(&state.data_dir, "应用退出：正在清理代理子进程");
-                drop(h); // Drop trait 会 kill + wait 子进程
+                fs_utils::app_log(&state.data_dir, "应用退出：正在停止进程内代理");
+                h.server.stop(); // 发送 shutdown 信号；句柄 drop 亦触发退出
             }
             // 应用退出时停止 API 服务
             let api_state = app_handle
@@ -538,8 +583,10 @@ fn main() {
                 fs_utils::app_log(&state.data_dir, "应用退出：正在停止 API 服务");
                 rt.handle.stop();
             }
-            // 还原系统代理，避免退出后本机全局断网
-            if let Err(e) = commands::proxy::clear_win_proxy() {
+            // 还原系统代理（#14）：仅当「我们曾接管系统代理」时才还原——
+            // 有用户 VPN 原值则原样还原（原 clear_win_proxy 会把用户梯子一并清掉）；
+            // 代理从未启动/已正常停止则不触碰，避免误关用户自己的 VPN
+            if let Err(e) = commands::proxy::restore_system_proxy_on_exit(proxy_was_running) {
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     fs_utils::app_log(&state.data_dir, &format!("应用退出：还原系统代理失败(可手动关闭): {e}"));
                 }

@@ -88,71 +88,16 @@ pub fn function_for_model(model_lower: &str) -> &'static str {
     }
 }
 
-/// 模型列表文件路径：base_dir/data/api_models.json（数据文件统一放 data/ 子目录）
-fn models_file(data_dir: &Path) -> std::path::PathBuf {
-    data_dir.join("data").join("api_models.json")
-}
-
-/// 数据文件路径：base_dir/data/name（与 AppState::path() 的路由保持一致）
-fn data_file(data_dir: &Path, name: &str) -> std::path::PathBuf {
-    data_dir.join("data").join(name)
-}
-
-/// 读取模型列表；文件缺失或为空时写入默认列表。
-/// 兼容旧位置（base_dir/api_models.json）：命中则迁移内容到 data/ 子目录（旧文件保留不动）。
-/// 文件损坏（JSON 解析失败）：记录日志、备份为 .bak 后写入默认列表自愈，不静默。
+/// 读取模型列表；kv 缺失或为空时写入默认列表。
+/// SQLite 化（P2）：data/api_models.json → kv `api_models`（热路径单行 SELECT+解析，
+/// 替代原 mtime 解析缓存；旧根路径兼容迁移由启动迁移器完成）。
 pub fn load_models(data_dir: &Path) -> Vec<ModelOption> {
-    let path = models_file(data_dir);
-    // 热路径解析缓存（调度每请求读取）：mtime 未变 → 直接复用已解析列表，
-    // 免 IO 免解析；未命中/缺失/为空/损坏再走下方读取自愈流程
-    if let Some(list) = fs_utils::read_json_cached::<Vec<ModelOption>>(&path) {
-        if !list.is_empty() {
-            return list;
-        }
-    }
-    // Ok(Some(list)) 读取成功；Ok(None) 文件缺失或空列表；Err(原因) 文件存在但损坏
-    let read_list = |p: &Path| -> Result<Option<Vec<ModelOption>>, String> {
-        let text = match std::fs::read_to_string(p) {
-            Ok(t) => t,
-            Err(_) => return Ok(None),
-        };
-        if text.trim().is_empty() {
-            return Ok(None);
-        }
-        match serde_json::from_str::<Vec<ModelOption>>(&text) {
-            Ok(list) if !list.is_empty() => Ok(Some(list)),
-            Ok(_) => Ok(None),
-            Err(e) => Err(format!("{} 解析失败: {e}", p.display())),
-        }
-    };
-    match read_list(&path) {
-        Ok(Some(list)) => return list,
-        Err(e) => {
-            fs_utils::app_log(
-                data_dir,
-                &format!("模型列表文件损坏，备份后回退默认列表: {e}"),
-            );
-            let _ = std::fs::rename(&path, path.with_extension("json.bak"));
-        }
-        Ok(None) => {}
-    }
-    // 旧位置兼容迁移（v3.2.5 曾存放在数据根目录）
-    let legacy = data_dir.join("api_models.json");
-    if path != legacy {
-        match read_list(&legacy) {
-            Ok(Some(list)) => {
-                if fs_utils::write_json(&path, &list).is_ok() {
-                    return list;
-                }
-            }
-            Err(e) => {
-                fs_utils::app_log(data_dir, &format!("旧位置模型列表损坏，忽略: {e}"));
-            }
-            Ok(None) => {}
-        }
+    let list: Vec<ModelOption> = crate::store::db(data_dir).kv_get("api_models");
+    if !list.is_empty() {
+        return list;
     }
     let defaults = default_models();
-    if let Err(e) = fs_utils::write_json(&path, &defaults) {
+    if let Err(e) = crate::store::db(data_dir).kv_set("api_models", &defaults) {
         fs_utils::app_log(data_dir, &format!("模型列表默认配置写入失败: {e}"));
     }
     defaults
@@ -228,7 +173,8 @@ fn normalize_order(mut fetched: Vec<ModelOption>) -> Vec<ModelOption> {
 /// `accounts` 由调用方预先经 vault 解密（含明文 jwt）
 pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<ModelOption>, String> {
     // 取第一个可用账号（最多尝试 3 个）
-    let device_map: DeviceMap = fs_utils::read_json(&data_file(data_dir, "device_map.json"));
+    // SQLite 化（P4）：device_map 表
+    let device_map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(data_dir));
     let candidates: Vec<(&crate::models::RawAccount, String, String)> = accounts
         .accounts
         .iter()
@@ -324,7 +270,7 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
     })?;
 
     let list = normalize_order(fetched);
-    fs_utils::write_json(&models_file(data_dir), &list)?;
+    crate::store::db(data_dir).kv_set("api_models", &list)?;
     fs_utils::app_log(
         data_dir,
         &format!("官网模型列表同步成功: {} 个模型", list.len()),

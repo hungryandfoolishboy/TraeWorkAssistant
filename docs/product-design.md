@@ -1,10 +1,11 @@
 # AI Work 助手 · 产品设计文档
 
-> 版本：v2.0（基线）· 2026-09-10 校订
-> 产品名称：**AI Work 助手**（当前产品版本 v3.2.7）
+> 版本：v2.0（基线）· 2026-09-15 校订
+> 产品名称：**AI Work 助手**（当前产品版本 v3.4.5）
 > 定位：整合「多账号签到」「登录态切换」「设备隔离」「账号分组」的 Windows 桌面端一体化工具。
 > 范围声明：v1.0 聚焦桌面端管理工具；v2.0 已实现本地 API 网关（OpenAI 兼容协议）、账号池智能调度、SSE 协议转换，全部为本项目自主设计与实现。
-> 文档定位：本文是**需求产品设计**主文档（v1.0/v2.0 设计基线）；3.x 增量功能见 `CHANGELOG.md` 与根目录 `AGENT.md`，WorkBuddy 接入设计见 [workbuddy-product-design.md](workbuddy-product-design.md)，未排期优化项见 [product-optimization-backlog.md](product-optimization-backlog.md)。
+> 文档定位：本文是**需求产品设计**主文档（v1.0/v2.0 设计基线）；3.x 增量功能见 `CHANGELOG.md` 与根目录 `AGENT.md`，未排期优化项见 [backlog.md](backlog.md)（WorkBuddy 接入蓝本的协议事实已归并至 [tech-framework.md](tech-framework.md) 附录 B）。
+> **架构演进说明（2026-09-15）**：文中 §1.2/§1.3/§九等处的 Python/PowerShell 表述为**设计当时的历史现状**——现核心逻辑已全量 Rust 化（`src-tauri/src/tasks/`、`switcher/`、`device_proxy/`），Python/PS 运行时与脚本均已移除；状态数据已由 JSON 文件迁入 SQLite（`data/aiwork.sqlite`）。历史表述保留以存档设计决策脉络。
 
 ---
 
@@ -562,8 +563,8 @@ AI Work 助手是一款面向多账号 Trae Work 用户的桌面端管理工具�
 ```
 前端：React 18 + TypeScript + Tailwind CSS + shadcn/ui + Recharts + Zustand
 外壳：Tauri 2.x（Rust）
-核心：Python 3.13（复用 auto_checkin.py / device_proxy.py）
-切换：PowerShell（复用 trae-switch-bridge.ps1）
+核心：Rust（switcher / tasks / device_proxy 全模块，无外部运行时）
+切换：Rust switcher 模块（原 trae-switch-bridge.ps1 已 Rust 化）
 打包：Tauri Bundler → MSI / NSIS 单文件安装包
 ```
 
@@ -583,11 +584,10 @@ AI Work 助手是一款面向多账号 Trae Work 用户的桌面端管理工具�
 │  ├─ sys::       TW 检测 / CA 检测 / UAC 提权 / 计划任务  │
 │  ├─ jwt::       JWT 解析（exp / data.id），不校验签名    │
 │  └─ watch::     文件监听（accounts.json 变更 → 推事件）  │
-├──────────────────────┬──────────────────────────────────┤
-│  Python Core         │  PowerShell Core                 │
-│  auto_checkin.py     │  trae-switch-bridge.ps1     │
-│  device_proxy.py     │  （登录态备份/恢复、机器码重置）  │
-└──────────────────────┴──────────────────────────────────┘
+├─────────────────────────────────────────────────────────┤
+│  Core (Rust)     tasks / switcher / device_proxy         │
+│  （签到、登录态备份/恢复、机器码重置、MITM 代理）        │
+└─────────────────────────────────────────────────────────┘
 ```
 
 > v2.0 API 网关已实现，内嵌于 Tauri 应用中（axum + tokio runtime），无需独立进程。
@@ -666,17 +666,11 @@ Rust 侧实现，避免为读一个 exp 而拉起 Python 进程：
 
 #### 6.3.6 账号切换
 
-本项目自主实现的账号切换桥（`trae-switch-bridge.ps1`），以参数化非交互模式调用：
+本项目自主实现的登录态切换器（Rust `switcher` 模块，原 `trae-switch-bridge.ps1` 已全量 Rust 化）：
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File trae-switch-bridge.ps1 `
-  -Action Switch -UserId 4487568582777872 -Json
-```
-
-- 新增 `-Action`（Switch / Save / New / Reset / List）与 `-Json` 参数。
-- 以 NDJSON 输出每步进度，Rust 侧转发给前端渲染步骤条。
-- 需管理员权限（重置 MachineGuid），Rust 侧统一以 runas 提权启动。
+- Action：`Switch / SaveCurrentLogin / BackupCurrent / RestoreOnly / ResetMachineId / ResetDeviceIds / KeepAlive`，5 应用档案表驱动（TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy）。
+- 以 NDJSON 输出每步进度（`ProgressSink` 回调 → 前端渲染步骤条），`*-done {success, raw}` 事件契约不变。
+- 仅重置 MachineGuid 需管理员（失败跳过不阻断切换）；其余动作普通用户可运行。
 
 #### 6.3.7 文件监听与状态同步
 
@@ -973,14 +967,11 @@ Anthropic Request─┘                    └─→ Anthropic SSE
 
 | 用途 | 路径 |
 |---|---|
-| 批量签到核心 | `src-python/auto_checkin.py` |
-| MITM 代理核心 | `src-python/device_proxy.py` |
-| 账号配置模板 | `src-python/tests/（测试数据）` |
-| 设备限制根因分析 | `docs/技术框架（本项目设计）` |
-| 设备 ID 代理方案 | `docs/技术框架（本项目设计）` |
+| 批量签到核心 | `src-tauri/src/tasks/trae_checkin.rs`（原 `src-python/auto_checkin.py` 已 Rust 化） |
+| MITM 代理核心 | `src-tauri/src/device_proxy/`（原 `src-python/device_proxy.py` 已 Rust 化） |
+| 账号切换器 | `src-tauri/src/switcher/`（原 `src-ps/trae-switch-bridge.ps1` 已 Rust 化删除） |
+| 状态存储层 | `src-tauri/src/store/`（SQLite，v3.4.5 起替代 data 目录 JSON） |
 | JWT 重抓指南 | `docs/tech-framework.md`（开发与运维） |
-| 账号切换器（命令行） | `src-ps/trae-switch-bridge.ps1` |
-| 账号切换器（GUI） | `src-ps/trae-switch-bridge.ps1（集成模式）` |
 | 功能参考界面 | `docs/product-design.md（界面参考）` |
 
 ### 11.2 上游接口清单（v1.0 涉及）

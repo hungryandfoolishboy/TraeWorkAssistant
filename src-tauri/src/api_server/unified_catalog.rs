@@ -166,13 +166,10 @@ pub struct TraeModelMeta {
     pub supports_image: Option<bool>,
 }
 
-fn meta_path(data_dir: &Path) -> std::path::PathBuf {
-    data_dir.join("data").join("trae_model_meta.json")
-}
-
-/// 读取 L1 覆盖层（键 canonical_id；缺失/损坏回退空表）
+/// 读取 L1 覆盖层（键 canonical_id；缺失/损坏回退空表）。
+/// SQLite 化（P2）：data/trae_model_meta.json → kv `trae_model_meta`。
 pub fn load_meta(data_dir: &Path) -> HashMap<String, TraeModelMeta> {
-    crate::fs_utils::read_json(&meta_path(data_dir))
+    crate::store::db(data_dir).kv_get("trae_model_meta")
 }
 
 /// L1 写入（upsert；编辑弹框整条覆盖，官网同步不触碰本文件）
@@ -183,7 +180,7 @@ pub fn meta_set(data_dir: &Path, model: &str, meta: TraeModelMeta) -> Result<(),
     }
     let mut map = load_meta(data_dir);
     map.insert(id, meta);
-    crate::fs_utils::write_json(&meta_path(data_dir), &map)
+    crate::store::db(data_dir).kv_set("trae_model_meta", &map)
 }
 
 /// L1 清除（恢复自动来源链 L2→L3→L4）；返回是否确有删除
@@ -192,7 +189,7 @@ pub fn meta_clear(data_dir: &Path, model: &str) -> Result<bool, String> {
     let mut map = load_meta(data_dir);
     let removed = map.remove(&id).is_some();
     if removed {
-        crate::fs_utils::write_json(&meta_path(data_dir), &map)?;
+        crate::store::db(data_dir).kv_set("trae_model_meta", &map)?;
     }
     Ok(removed)
 }
@@ -596,6 +593,8 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(dir.join("data")).unwrap();
+        // SQLite 化（P2）：测试种子改走 kv（api_models / wb_model_catalog / trae_model_meta）
+        let st = crate::store::db(&dir);
         let list: Vec<serde_json::Value> = trae
             .iter()
             .map(|(id, rate)| {
@@ -606,11 +605,7 @@ mod tests {
                 o
             })
             .collect();
-        std::fs::write(
-            dir.join("data").join("api_models.json"),
-            serde_json::to_string(&list).unwrap(),
-        )
-        .unwrap();
+        st.kv_set("api_models", &list).unwrap();
         if !wb.is_empty() {
             let list: Vec<serde_json::Value> = wb
                 .iter()
@@ -620,20 +615,16 @@ mod tests {
                            "supported_efforts": ["low","medium","high"], "rate": 0.79})
                 })
                 .collect();
-            std::fs::write(
-                dir.join("data").join("wb_model_catalog.json"),
+            st.kv_set(
+                "wb_model_catalog",
                 // 模拟「人工维护」目录：必须携带当前 builtin_rev 才退出内置表重建
                 //（wb_catalog::load 对旧版本自动落盘的目录按新快照重建，见该文件 BUILTIN_REV 注释）
-                json!({"models": list, "builtin_rev": crate::api_server::wb_catalog::BUILTIN_REV}).to_string(),
+                &json!({"models": list, "builtin_rev": crate::api_server::wb_catalog::BUILTIN_REV}),
             )
             .unwrap();
         }
         if let Some(m) = meta {
-            std::fs::write(
-                dir.join("data").join("trae_model_meta.json"),
-                m.to_string(),
-            )
-            .unwrap();
+            st.kv_set_raw("trae_model_meta", &m.to_string()).unwrap();
         }
         Fixture { dir }
     }
@@ -796,23 +787,21 @@ mod tests {
         let list = unified_models(&f.dir, true, true, true);
         assert_eq!(find(&list, "glm-5.3").rate, Some(0.79));
         // per_model 覆盖为 trae 优先 → Trae 源倍率（L3 参考值 0.78）
-        std::fs::write(
-            f.dir.join("data").join("dispatch_policy.json"),
-            json!({"priority": ["buddy", "trae"],
-                   "per_model": {"glm-5.3": ["trae", "buddy"]}, "fallback": true}).to_string(),
-        )
-        .unwrap();
+        crate::store::db(&f.dir)
+            .kv_set("dispatch_policy", &json!({"priority": ["buddy", "trae"],
+                   "per_model": {"glm-5.3": ["trae", "buddy"]}, "fallback": true}))
+            .unwrap();
         let list = unified_models(&f.dir, true, true, true);
         assert_eq!(find(&list, "glm-5.3").rate, Some(0.78));
         // 命中侧未声明倍率（WB rate=0 视为未声明）→ 退另一可用源
-        std::fs::write(
-            f.dir.join("data").join("wb_model_catalog.json"),
-            json!({"models": [{"id": "glm-5.3", "display": "GLM-5.3", "context_length": 0,
+        crate::store::db(&f.dir)
+            .kv_set(
+                "wb_model_catalog",
+                &json!({"models": [{"id": "glm-5.3", "display": "GLM-5.3", "context_length": 0,
                                "max_tokens": 0, "supports_image": true,
-                               "supported_efforts": [], "rate": 0.0}]})
-                .to_string(),
-        )
-        .unwrap();
+                               "supported_efforts": [], "rate": 0.0}]}),
+            )
+            .unwrap();
         let list = unified_models(&f.dir, true, true, true);
         assert_eq!(find(&list, "glm-5.3").rate, Some(0.78), "WB 未声明倍率退 Trae 源");
     }
@@ -861,16 +850,16 @@ mod tests {
             },
         )
         .unwrap();
-        // 模拟官网同步：parse_official 整表重写 api_models.json（新倍率 0.99 + 新增条目）
-        std::fs::write(
-            f.dir.join("data").join("api_models.json"),
-            serde_json::to_string(&json!([
-                {"id": "glm-5.3", "label": "GLM-5.3", "rate": 0.99},
-                {"id": "new-official-model", "label": "New"}
-            ]))
-            .unwrap(),
-        )
-        .unwrap();
+        // 模拟官网同步：parse_official 整表重写 api_models（新倍率 0.99 + 新增条目）
+        crate::store::db(&f.dir)
+            .kv_set(
+                "api_models",
+                &json!([
+                    {"id": "glm-5.3", "label": "GLM-5.3", "rate": 0.99},
+                    {"id": "new-official-model", "label": "New"}
+                ]),
+            )
+            .unwrap();
         let list = unified_models(&f.dir, true, true, true);
         let g = find(&list, "glm-5.3");
         assert_eq!(g.rate, Some(0.42), "L1 人工值保留，不被同步值覆盖");
@@ -894,24 +883,22 @@ mod tests {
         assert_eq!(m.display, "KIMI-K2.7-CODE");
         assert_eq!(m.supports_image, Some(true));
         // per_model 覆盖为 trae 优先 → 展示名 = Trae 侧 L2 label、图片 = Trae 侧 L4 推断
-        std::fs::write(
-            f.dir.join("data").join("dispatch_policy.json"),
-            json!({"priority": ["buddy", "trae"],
-                   "per_model": {"kimi-k2.7-code": ["trae", "buddy"]}, "fallback": true})
-                .to_string(),
-        )
-        .unwrap();
+        crate::store::db(&f.dir)
+            .kv_set(
+                "dispatch_policy",
+                &json!({"priority": ["buddy", "trae"],
+                   "per_model": {"kimi-k2.7-code": ["trae", "buddy"]}, "fallback": true}),
+            )
+            .unwrap();
         let list = unified_models(&f.dir, true, true, true);
         let m = find(&list, "kimi-k2.7-code");
         assert_eq!(m.display, "Kimi-K2.7-Code");
         assert_eq!(m.supports_image, Some(false));
         // 命中 trae 且 Trae 侧未声明图片（glm-5.3 L4 无推断）→ 退 WB 声明兜底
         let f2 = fixture(&[("glm-5.3", None)], &["glm-5.3"], None);
-        std::fs::write(
-            f2.dir.join("data").join("dispatch_policy.json"),
-            json!({"priority": ["trae", "buddy"], "fallback": true}).to_string(),
-        )
-        .unwrap();
+        crate::store::db(&f2.dir)
+            .kv_set("dispatch_policy", &json!({"priority": ["trae", "buddy"], "fallback": true}))
+            .unwrap();
         let list2 = unified_models(&f2.dir, true, true, true);
         let g = find(&list2, "glm-5.3");
         assert_eq!(g.display, "glm-5.3", "命中 trae → Trae 侧展示名");
@@ -925,11 +912,20 @@ mod tests {
         // Trae 侧 L4 对 my-vision-model 无图片推断 → supports_image = None；
         // disabled 自定义条目声明 supports_image=true → 不得覆盖
         let f = fixture(&[("my-vision-model", None)], &[], None);
-        std::fs::write(
-            f.dir.join("data").join("custom_models.json"),
-            json!({"models": [{"id": "cm1", "name": "my-vision-model", "base_url": "https://x",
-                               "enabled": false, "supports_image": true}]})
-                .to_string(),
+        // SQLite 化（P3）：custom_models 表
+        crate::store::docs::custom_models_save(
+            &crate::store::db(&f.dir),
+            &crate::api_server::custom_models::CustomModelsFile {
+                models: vec![crate::api_server::custom_models::CustomModel {
+                    id: "cm1".into(),
+                    name: "my-vision-model".into(),
+                    base_url: "https://x".into(),
+                    enabled: false,
+                    supports_image: true,
+                    ..Default::default()
+                }],
+                updated_at: 0,
+            },
         )
         .unwrap();
         let list = unified_models(&f.dir, true, true, true);
@@ -939,11 +935,19 @@ mod tests {
             "disabled 条目不覆盖顶层 supports_image"
         );
         // enabled 条目参与覆盖 → true
-        std::fs::write(
-            f.dir.join("data").join("custom_models.json"),
-            json!({"models": [{"id": "cm1", "name": "my-vision-model", "base_url": "https://x",
-                               "enabled": true, "supports_image": true}]})
-                .to_string(),
+        crate::store::docs::custom_models_save(
+            &crate::store::db(&f.dir),
+            &crate::api_server::custom_models::CustomModelsFile {
+                models: vec![crate::api_server::custom_models::CustomModel {
+                    id: "cm1".into(),
+                    name: "my-vision-model".into(),
+                    base_url: "https://x".into(),
+                    enabled: true,
+                    supports_image: true,
+                    ..Default::default()
+                }],
+                updated_at: 0,
+            },
         )
         .unwrap();
         let list = unified_models(&f.dir, true, true, true);
@@ -955,11 +959,20 @@ mod tests {
     #[test]
     fn t14_custom_zero_rate_is_free() {
         let f = fixture(&[], &[], None);
-        std::fs::write(
-            f.dir.join("data").join("custom_models.json"),
-            json!({"models": [{"id": "cm1", "name": "my-free-model", "base_url": "https://x",
-                               "enabled": true, "rate": 0.0}]})
-                .to_string(),
+        // SQLite 化（P3）：custom_models 表
+        crate::store::docs::custom_models_save(
+            &crate::store::db(&f.dir),
+            &crate::api_server::custom_models::CustomModelsFile {
+                models: vec![crate::api_server::custom_models::CustomModel {
+                    id: "cm1".into(),
+                    name: "my-free-model".into(),
+                    base_url: "https://x".into(),
+                    enabled: true,
+                    rate: 0.0,
+                    ..Default::default()
+                }],
+                updated_at: 0,
+            },
         )
         .unwrap();
         let list = unified_models(&f.dir, true, true, true);

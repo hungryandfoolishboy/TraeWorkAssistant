@@ -21,7 +21,7 @@ import { StatCard } from '../ui';
 import { api } from '../../lib/tauri';
 import { fmtTokens } from '../../lib/format';
 import { cn } from '../../lib/cn';
-import type { UsageCounterView, UsageDayView, UsageKeyTokenView } from '../../types';
+import type { UsageCounterView, UsageDayView, UsageKeyTokenView, UsageModelLatencyView } from '../../types';
 
 /** 资源池筛选（§5.2：全部/Trae/Buddy/自定义模型） */
 export type PoolFilter = 'all' | 'trae' | 'buddy' | 'custom';
@@ -64,9 +64,18 @@ function mergeKeyTokens(a: UsageKeyTokenView[], b: UsageKeyTokenView[]): UsageKe
   return [...map.values()];
 }
 
-/** 两条日记录合并（avg_duration 按请求数加权） */
+/** 两条日记录合并（avg_duration 按请求数加权；TTFT 按样本数加权） */
 function mergeDay(a: UsageDayView, b: UsageDayView): UsageDayView {
   const total = a.total_requests + b.total_requests;
+  const ttfbSamples = (a.ttfb_samples ?? 0) + (b.ttfb_samples ?? 0);
+  const avgTtfb =
+    ttfbSamples > 0
+      ? Math.round(
+          ((a.avg_ttfb_ms ?? 0) * (a.ttfb_samples ?? 0) +
+            (b.avg_ttfb_ms ?? 0) * (b.ttfb_samples ?? 0)) /
+            ttfbSamples,
+        )
+      : undefined;
   return {
     date: a.date,
     total_requests: total,
@@ -81,11 +90,51 @@ function mergeDay(a: UsageDayView, b: UsageDayView): UsageDayView {
             (a.avg_duration_ms * a.total_requests + b.avg_duration_ms * b.total_requests) / total,
           )
         : 0,
+    p95_duration_ms: maxOpt(a.p95_duration_ms, b.p95_duration_ms),
+    max_duration_ms: maxOpt(a.max_duration_ms, b.max_duration_ms),
+    avg_ttfb_ms: avgTtfb,
+    p95_ttfb_ms: maxOpt(a.p95_ttfb_ms, b.p95_ttfb_ms),
+    ttfb_samples: ttfbSamples,
     models: mergeCounters(a.models, b.models),
     accounts: mergeCounters(a.accounts, b.accounts),
     keys: mergeCounters(a.keys, b.keys),
     key_tokens: mergeKeyTokens(a.key_tokens, b.key_tokens),
+    model_latency: mergeModelLatency(a.model_latency, b.model_latency),
   };
+}
+
+/** 可选数值取较大者（P95/最大值跨桶合并取保守值） */
+function maxOpt(a?: number, b?: number): number | undefined {
+  if (a == null && b == null) return undefined;
+  return Math.max(a ?? 0, b ?? 0);
+}
+
+/** 多日可选 P95 取最大值（跨天聚合取保守值） */
+function maxOptList(values: (number | undefined)[]): number | undefined {
+  const vs = values.filter((v): v is number => v != null);
+  return vs.length > 0 ? Math.max(...vs) : undefined;
+}
+
+/** 按模型的延迟分位合并（F-76①） */
+function mergeModelLatency(
+  a: UsageModelLatencyView[] = [],
+  b: UsageModelLatencyView[] = [],
+): UsageModelLatencyView[] {
+  const map = new Map<string, UsageModelLatencyView>();
+  for (const m of [...a, ...b]) {
+    const e = map.get(m.model);
+    if (e) {
+      e.samples += m.samples;
+      e.p50_duration_ms = maxOpt(e.p50_duration_ms, m.p50_duration_ms);
+      e.p95_duration_ms = maxOpt(e.p95_duration_ms, m.p95_duration_ms);
+      e.max_duration_ms = maxOpt(e.max_duration_ms, m.max_duration_ms);
+      e.avg_ttfb_ms = maxOpt(e.avg_ttfb_ms, m.avg_ttfb_ms);
+      e.p95_ttfb_ms = maxOpt(e.p95_ttfb_ms, m.p95_ttfb_ms);
+    } else {
+      map.set(m.model, { ...m });
+    }
+  }
+  return [...map.values()].sort((x, y) => y.samples - x.samples);
 }
 
 /** 多桶按日合并（同日相加），按日期升序 */
@@ -140,6 +189,7 @@ export default function UsageStatsPanel() {
   // 汇总（跨天聚合）+ 图表数据（与原页面统计逻辑一致，纯搬移）
   const summary = useMemo(() => {
     const models = new Map<string, { requests: number; ok: number; errors: number }>();
+    const modelLatency = new Map<string, UsageModelLatencyView>();
     const t = usage.reduce(
       (acc, d) => {
         acc.requests += d.total_requests;
@@ -148,6 +198,8 @@ export default function UsageStatsPanel() {
         acc.prompt += d.prompt_tokens;
         acc.completion += d.completion_tokens;
         acc.weightedDuration += d.avg_duration_ms * d.total_requests;
+        acc.ttfbSamples += d.ttfb_samples ?? 0;
+        acc.weightedTtfb += (d.avg_ttfb_ms ?? 0) * (d.ttfb_samples ?? 0);
         for (const m of d.models) {
           const e = models.get(m.name) ?? { requests: 0, ok: 0, errors: 0 };
           e.requests += m.requests;
@@ -155,19 +207,47 @@ export default function UsageStatsPanel() {
           e.errors += m.errors;
           models.set(m.name, e);
         }
+        for (const m of d.model_latency ?? []) {
+          const e = modelLatency.get(m.model);
+          if (e) {
+            e.samples += m.samples;
+            e.p95_duration_ms = maxOpt(e.p95_duration_ms, m.p95_duration_ms);
+            e.max_duration_ms = maxOpt(e.max_duration_ms, m.max_duration_ms);
+            e.avg_ttfb_ms = maxOpt(e.avg_ttfb_ms, m.avg_ttfb_ms);
+            e.p95_ttfb_ms = maxOpt(e.p95_ttfb_ms, m.p95_ttfb_ms);
+          } else {
+            modelLatency.set(m.model, { ...m });
+          }
+        }
         return acc;
       },
-      { requests: 0, ok: 0, errors: 0, prompt: 0, completion: 0, weightedDuration: 0 },
+      {
+        requests: 0,
+        ok: 0,
+        errors: 0,
+        prompt: 0,
+        completion: 0,
+        weightedDuration: 0,
+        ttfbSamples: 0,
+        weightedTtfb: 0,
+      },
     );
     const topModels = [...models.entries()]
       .sort((a, b) => b[1].requests - a[1].requests)
       .slice(0, 5)
       .map(([name, v]) => ({ name, ...v }));
+    const latencyModels = [...modelLatency.values()]
+      .sort((a, b) => b.samples - a.samples)
+      .slice(0, 5);
     return {
       ...t,
       topModels,
+      latencyModels,
       successRate: t.requests > 0 ? ((t.ok / t.requests) * 100).toFixed(1) : '—',
       avgDuration: t.requests > 0 ? Math.round(t.weightedDuration / t.requests) : 0,
+      avgTtfb: t.ttfbSamples > 0 ? Math.round(t.weightedTtfb / t.ttfbSamples) : undefined,
+      p95Ttfb: maxOptList(usage.map((d) => d.p95_ttfb_ms)),
+      p95Duration: maxOptList(usage.map((d) => d.p95_duration_ms)),
     };
   }, [usage]);
 
@@ -255,7 +335,17 @@ export default function UsageStatsPanel() {
           label="平均耗时"
           value={summary.requests > 0 ? `${summary.avgDuration}ms` : '—'}
           tone="blue"
-          hint="按请求加权"
+          hint={summary.p95Duration != null ? `按请求加权 · P95 ${summary.p95Duration}ms` : '按请求加权'}
+        />
+        <StatCard
+          label="首字延迟 TTFT"
+          value={summary.avgTtfb != null ? `${summary.avgTtfb}ms` : '—'}
+          tone="violet"
+          hint={
+            summary.avgTtfb != null
+              ? `P95 ${summary.p95Ttfb ?? '—'}ms · ${summary.ttfbSamples} 样本（流式成功）`
+              : '暂无流式样本'
+          }
         />
       </div>
 
@@ -331,6 +421,53 @@ export default function UsageStatsPanel() {
                     </tr>
                   );
                 })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {summary.latencyModels.length > 0 && (
+        <div className="mt-4">
+          <p className="mb-2 text-xs font-medium text-slate-500 dark:text-zinc-400">
+            模型延迟（近 {days} 天 Top 5 · P50/P95 总耗时 + 首字延迟）
+          </p>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
+                  <th className="pb-2 pr-4 font-medium">模型</th>
+                  <th className="pb-2 pr-4 font-medium">样本数</th>
+                  <th className="pb-2 pr-4 font-medium">P50 耗时</th>
+                  <th className="pb-2 pr-4 font-medium">P95 耗时</th>
+                  <th className="pb-2 pr-4 font-medium">平均 TTFT</th>
+                  <th className="pb-2 font-medium">P95 TTFT</th>
+                </tr>
+              </thead>
+              <tbody>
+                {summary.latencyModels.map((m) => (
+                  <tr
+                    key={m.model}
+                    className="border-b border-slate-100 last:border-0 dark:border-zinc-800"
+                  >
+                    <td className="py-2 pr-4 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
+                      {m.model}
+                    </td>
+                    <td className="py-2 pr-4 tabular-nums text-slate-600 dark:text-zinc-300">{m.samples}</td>
+                    <td className="py-2 pr-4 tabular-nums text-slate-600 dark:text-zinc-300">
+                      {m.p50_duration_ms != null ? `${m.p50_duration_ms}ms` : '—'}
+                    </td>
+                    <td className="py-2 pr-4 tabular-nums text-slate-600 dark:text-zinc-300">
+                      {m.p95_duration_ms != null ? `${m.p95_duration_ms}ms` : '—'}
+                    </td>
+                    <td className="py-2 pr-4 tabular-nums text-violet-600 dark:text-violet-400">
+                      {m.avg_ttfb_ms != null ? `${m.avg_ttfb_ms}ms` : '—'}
+                    </td>
+                    <td className="py-2 tabular-nums text-violet-600 dark:text-violet-400">
+                      {m.p95_ttfb_ms != null ? `${m.p95_ttfb_ms}ms` : '—'}
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>

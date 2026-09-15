@@ -9,14 +9,14 @@
 //!   读：JSON 明文优先（更新鲜，如 MITM 新捕获）→ 否则从 vault 回填；
 //!   写：非空凭据先写入 vault 并落盘快照 → JSON 占位化；
 //!   vault 写失败时仅保存占位化 JSON 并返回 Err（禁止明文 jwt/refresh_token 落盘）；
-//! - Python 签到脚本通过 `write_temp_accounts` 获取解密临时文件（用后即删；
-//!   文件落在应用数据目录而非全局 %TEMP%，启动时统一清理残留）。
+//! - Rust 签到直调后凭据全程内存传递（原 Python 脚本方案需写解密临时文件，已移除；
+//!   启动清理逻辑保留，兜底清理旧版本残留的临时凭据文件）。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
 use crate::fs_utils;
-use crate::models::{AccountsFile, RawAccount};
+use crate::models::AccountsFile;
 use crate::state::AppState;
 use tauri_plugin_stronghold::stronghold::Stronghold;
 
@@ -41,7 +41,7 @@ static VAULT: Mutex<Option<Stronghold>> = Mutex::new(None);
 // ---------------- DPAPI（Windows 数据保护 API） ----------------
 
 #[cfg(windows)]
-mod dpapi {
+pub(crate) mod dpapi {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
         CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
@@ -197,7 +197,8 @@ fn open(state: &AppState) -> Result<std::sync::MutexGuard<'static, Option<Strong
 /// 从磁盘加载账号文件，并从 vault 回填占位账号的明文凭据（仅内存，不落明文盘）。
 /// JSON 中已有的明文凭据优先（更新鲜，例如 MITM 新捕获，待下次保存迁移进 vault）。
 pub fn load_accounts(state: &AppState) -> AccountsFile {
-    let mut file: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    // SQLite 化（P3）：checkin_accounts.json → accounts 表（行保序、user_id 可空）
+    let mut file: AccountsFile = crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
     let Ok(guard) = open(state) else {
         return file; // vault 不可用：降级返回 JSON 原样（占位 jwt 视为空，上层自行报错）
     };
@@ -245,7 +246,7 @@ pub fn save_accounts(state: &AppState, accounts: &mut AccountsFile) -> Result<()
             &format!("vault 写入失败，已仅保存账号占位信息（禁止明文落盘）: {reason}"),
         );
     }
-    fs_utils::write_json(&state.path("checkin_accounts.json"), accounts)?;
+    crate::store::docs::accounts_save(&crate::store::db(&state.data_dir), accounts)?;
     vault_result.map_err(|reason| {
         format!(
             "加密存储失败，已仅保存账号占位信息，签到功能不可用直至修复（vault 错误: {reason}）"
@@ -346,10 +347,12 @@ pub fn remove_secret(state: &AppState, uid: &str) {
     }
 }
 
-/// 启动时幂等迁移：JSON 中的明文 jwt / refresh_token → vault，随后 JSON 占位化。
+/// 启动时幂等迁移：库中明文 jwt / refresh_token → vault，随后占位化。
+/// （SQLite 化 P4：原读 checkin_accounts.json，现读 accounts 表——main.rs 已调整为
+/// store 迁移先于本函数，JSON 导入的明文凭据在此收敛进 vault 并从库中抹除。）
 /// 失败不阻断启动（下次启动重试；vault 异常时 save_accounts 仅落盘占位信息，禁止明文）。
 pub fn migrate_on_startup(state: &AppState) {
-    let raw: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let raw: AccountsFile = crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
     let plaintext = raw
         .accounts
         .iter()
@@ -373,29 +376,7 @@ pub fn migrate_on_startup(state: &AppState) {
     }
 }
 
-/// 为 Python 签到脚本生成解密临时账号文件（仅含候选账号），返回路径；调用方用后必须删除。
-/// 文件写入应用数据目录（而非全局 %TEMP%），避免明文凭据散落系统临时区；残留由启动清理兜底。
-pub fn write_temp_accounts(state: &AppState, uids: &[String]) -> Result<PathBuf, String> {
-    let accounts = load_accounts(state);
-    let set: std::collections::HashSet<&str> = uids.iter().map(|s| s.as_str()).collect();
-    let filtered: Vec<RawAccount> = accounts
-        .accounts
-        .into_iter()
-        .filter(|a| a.user_id.as_deref().map_or(false, |u| set.contains(u)))
-        .collect();
-    if filtered.is_empty() {
-        return Err("候选账号均无可用凭据".into());
-    }
-    let path = state.data_dir.join(format!(
-        "{}{}.json",
-        TEMP_ACCOUNTS_PREFIX,
-        chrono::Local::now().timestamp_millis()
-    ));
-    fs_utils::write_json(&path, &AccountsFile { accounts: filtered })?;
-    Ok(path)
-}
-
-/// 清理目录下残留的临时凭据文件（按前缀匹配，覆盖 write_json 的 .tmp 半成品），返回删除数量
+/// 清理目录下残留的临时凭据文件（按前缀匹配，覆盖 write_json 的 .tmp 半成品），返回数量
 fn cleanup_temp_in(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -430,6 +411,7 @@ pub fn cleanup_temp_accounts(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::RawAccount;
 
     #[test]
     fn merge_entry_覆盖非空字段并保留旧值() {
@@ -468,6 +450,9 @@ mod tests {
                     added_at: Some("t".into()),
                     updated_at: Some("t".into()),
                     dc_id: None,
+                    refresh_token_expires_at: None,
+                    refresh_token_fails: 0,
+                    refresh_token_invalid: false,
                 },
                 // 无 uid 的账号不占位（vault 无法按 uid 键存储）
                 RawAccount {
@@ -478,6 +463,9 @@ mod tests {
                     added_at: None,
                     updated_at: None,
                     dc_id: None,
+                    refresh_token_expires_at: None,
+                    refresh_token_fails: 0,
+                    refresh_token_invalid: false,
                 },
             ],
         };

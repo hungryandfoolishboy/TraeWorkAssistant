@@ -64,16 +64,6 @@ impl TemplateMapFile {
     }
 }
 
-/// 模板映射文件路径（迁移至 data/ 子目录，与全仓数据文件约定一致）
-pub fn template_map_path(data_dir: &std::path::Path) -> std::path::PathBuf {
-    data_dir.join("data").join("wb_template_map.json")
-}
-
-/// 旧根路径（历史落盘位置，仅作读取兼容）
-pub fn template_map_path_legacy(data_dir: &std::path::Path) -> std::path::PathBuf {
-    data_dir.join("wb_template_map.json")
-}
-
 /// 审核模板黑名单最小改写：映射表为空才跳过（不做硬编码关键词预检——
 /// 外置映射表新增规则的命中词可能不含内置三短语，预检会永久漏改）；
 /// 条目少（个位数），逐条 contains 代价可接受

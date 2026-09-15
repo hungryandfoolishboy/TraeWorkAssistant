@@ -35,6 +35,7 @@ import type {
   ModelOption,
   OAuthLoginUrl,
   OAuthLoginResult,
+  OAuthLoginDoneEvent,
   PoolStatus,
   ProfileInfo,
   ProxyLogListResult,
@@ -63,7 +64,9 @@ import type {
   WbResetItem,
   WbResetResult,
   WbTokenStats,
+  BuddyChatApp,
   WbUsageOfficial,
+  WbUsageOfficialAll,
   WbUsageFallback,
   WbActivityInfo,
   WbPoolImportResult,
@@ -327,19 +330,23 @@ export const api = {
     cliRotateLogs: (limit?: number) =>
       invoke<WbCliRotateLog[]>('workbuddy_cli_rotate_logs', { limit: limit ?? null }),
     // 会话三件套备份/恢复 + 复制迁移（F-44/F-45，批次3）
-    chatdataBackup: (userId: string) =>
-      invoke<{ ok: boolean; files: number; path: string }>('workbuddy_chatdata_backup', { userId }),
-    chatdataRestore: (userId: string) =>
-      invoke<{ ok: boolean; files: number }>('workbuddy_chatdata_restore', { userId }),
-    chatdataInfo: (userId: string) =>
+    // F-74：app 决定会话域（~/.workbuddy / ~/.codebuddy）与备份根；省略 = WorkBuddy（旧行为）
+    chatdataBackup: (userId: string, app?: BuddyChatApp) =>
+      invoke<{ ok: boolean; files: number; path: string }>('workbuddy_chatdata_backup', {
+        userId,
+        app: app ?? 'WorkBuddy',
+      }),
+    chatdataRestore: (userId: string, app?: BuddyChatApp) =>
+      invoke<{ ok: boolean; files: number }>('workbuddy_chatdata_restore', { userId, app: app ?? 'WorkBuddy' }),
+    chatdataInfo: (userId: string, app?: BuddyChatApp) =>
       invoke<{ backed: boolean; size_bytes?: number; files?: number; backed_at?: string; has_edge_mapping?: boolean }>(
         'workbuddy_chatdata_info',
-        { userId },
+        { userId, app: app ?? 'WorkBuddy' },
       ),
-    chatdataCopy: (sourceUserId: string, targetUserId: string) =>
+    chatdataCopy: (sourceUserId: string, targetUserId: string, app?: BuddyChatApp) =>
       invoke<{ ok: boolean; copied: number; total_lines: number; sessions_cloned: number; mappings_registered: number }>(
         'workbuddy_chatdata_copy',
-        { sourceUserId, targetUserId },
+        { sourceUserId, targetUserId, app: app ?? 'WorkBuddy' },
       ),
     // 账号库导入导出扩展（F-46，批次3）
     accountsExport: (includeCredentials?: boolean) =>
@@ -355,6 +362,8 @@ export const api = {
     // 注意：Rust 端参数名为 refresh（Option<bool>），key 必须写 refresh；此前误写 fresh 被静默忽略导致「刷新」永远走缓存
     usageOfficial: (userId?: string, fresh?: boolean) =>
       invoke<WbUsageOfficial>('workbuddy_usage_official', { userId: userId ?? null, refresh: fresh ?? null }),
+    /** 全账号官方用量聚合（近 7 日积分消耗主数据源；31 天零填充） */
+    usageOfficialAll: () => invoke<WbUsageOfficialAll>('workbuddy_usage_official_all'),
     usageFallback: () => invoke<WbUsageFallback>('workbuddy_usage_fallback'),
     // fresh=true 强制重扫（跳过 10 分钟结果缓存；按文件增量缓存仍生效）
     tokenStats: (fresh?: boolean) =>
@@ -368,6 +377,17 @@ export const api = {
       invoke('oauth_parse_callback', { callbackUrl }),
     login: (callbackUrl: string, accountName?: string, groupId?: string) =>
       invoke<OAuthLoginResult>('oauth_login', { callbackUrl, accountName, groupId }),
+    // F-78 批次 1：本机回环监听（127.0.0.1:17388），浏览器回调自动落库收尾；
+    // startLoopback 端口被占用时后端返回明确错误，前端降级为手动粘贴兜底
+    startLoopback: (accountName?: string, groupId?: string) =>
+      invoke<void>('oauth_start_loopback', {
+        accountName: accountName ?? null,
+        groupId: groupId ?? null,
+      }),
+    stopLoopback: () => invoke<void>('oauth_stop_loopback'),
+    // 登录完成事件：回环监听器自动落库后发出；ok=false 时提示改用手动粘贴兜底
+    onLoginDone: (cb: (e: OAuthLoginDoneEvent) => void): Promise<UnlistenFn> =>
+      listen<OAuthLoginDoneEvent>('oauth-login-done', (ev) => cb(ev.payload)),
   },
   apiServer: {
     start: () => invoke<ApiServiceStatus>('api_server_start'),
@@ -385,6 +405,16 @@ export const api = {
         wbDefaultThinking?: boolean;
         wbToolExec?: boolean;
         wbBgDowngrade?: boolean;
+        /** F-76④ 长上下文降档开关 */
+        wbLongctxDowngrade?: boolean;
+        /** F-76③ 竞速对冲阈值毫秒（0 = 关闭） */
+        wbHedgeThresholdMs?: number;
+        /** F-77 账号并发上限（0 = 不限） */
+        accountConcurrencyLimit?: number;
+        /** F-76② 池粘性 TTL 秒 */
+        poolStickyTtlSecs?: number;
+        /** F-76② WB 会话粘性 TTL 秒 */
+        wbStickyTtlSecs?: number;
       },
       wbStrategy?: string,
     ) =>
@@ -396,9 +426,16 @@ export const api = {
         wbDefaultThinking: wbFlags?.wbDefaultThinking ?? null,
         wbToolExec: wbFlags?.wbToolExec ?? null,
         wbBgDowngrade: wbFlags?.wbBgDowngrade ?? null,
+        wbLongctxDowngrade: wbFlags?.wbLongctxDowngrade ?? null,
+        wbHedgeThresholdMs: wbFlags?.wbHedgeThresholdMs ?? null,
+        accountConcurrencyLimit: wbFlags?.accountConcurrencyLimit ?? null,
+        poolStickyTtlSecs: wbFlags?.poolStickyTtlSecs ?? null,
+        wbStickyTtlSecs: wbFlags?.wbStickyTtlSecs ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
+    /** WB 池实时状态（F-77⑤：含 per-account inflight 在途计数） */
+    wbPoolStatus: () => invoke<PoolStatus[]>('wb_pool_status'),
     logsList: () => invoke<string[]>('api_logs_list'),
     logsDetail: (date: string) => invoke<string | null>('api_logs_detail', { date }),
     logsSearch: (opts: {

@@ -25,6 +25,9 @@ pub struct AccountView {
     /// Work 积分（product_id == 209）剩余
     #[serde(default)]
     pub work_credits: Option<f64>,
+    /// 本周期积分包总额度（有效积分包 credits_limit 合计，到期日历「剩余 X / 总 Y」口径）
+    #[serde(default)]
+    pub total_credits: Option<f64>,
     /// 套餐身份（Free / Lite / Pro ...，来自 ide_user_pay_status 缓存）
     #[serde(default)]
     pub pay_identity: Option<String>,
@@ -34,9 +37,18 @@ pub struct AccountView {
     /// 会员套餐下次自动续费时间（Unix 秒，无自动续费为 None）
     #[serde(default)]
     pub membership_next_billing: Option<i64>,
+    /// refresh_token 过期时间（Unix 秒；上游未下发则为 None）——F-78 批次 3 生命周期管理
+    #[serde(default)]
+    pub refresh_token_expires_at: Option<i64>,
+    /// refresh_token 连续刷新失败次数（刷新成功清零）
+    #[serde(default)]
+    pub refresh_token_fails: i32,
+    /// refresh_token 是否已判定失效（连续 3 次失败或服务端明确拒绝；重新 OAuth 登录重置）
+    #[serde(default)]
+    pub refresh_token_invalid: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct RawAccount {
     pub name: String,
     #[serde(rename = "UserID", default)]
@@ -52,6 +64,16 @@ pub struct RawAccount {
     /// 仅记录预留供未来与外部数据源对账合并，不参与去重/合并/展示（用户确认 2026-09-07）
     #[serde(rename = "DcID", default)]
     pub dc_id: Option<String>,
+    /// refresh_token 过期时间（Unix 秒；上游未下发则为 None）——F-78 批次 3 生命周期管理，
+    /// 对齐 Buddy 侧 refresh_token_expires_at 先例；serde default 保证旧数据文件不破坏
+    #[serde(default)]
+    pub refresh_token_expires_at: Option<i64>,
+    /// refresh_token 连续刷新失败次数（刷新成功清零）
+    #[serde(default)]
+    pub refresh_token_fails: i32,
+    /// refresh_token 是否已判定失效（连续 3 次失败或服务端明确拒绝；重新 OAuth 登录重置）
+    #[serde(default)]
+    pub refresh_token_invalid: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -149,6 +171,10 @@ pub struct Settings {
     pub api_port: u16,
     #[serde(default = "default_api_model")]
     pub api_default_model: String,
+    /// F-74：Buddy（WorkBuddy/CodeBuddy）切换账号时自动把当前账号会话迁移到目标账号
+    ///（默认关；开启后切换前自动备份当前账号三件套并复制到目标账号名下）
+    #[serde(default)]
+    pub buddy_switch_migrate_chats: bool,
 }
 
 fn default_api_port() -> u16 {
@@ -262,6 +288,9 @@ pub struct RemainingCreditsFile {
     /// Work 积分（product_id == 209）剩余缓存
     #[serde(default)]
     pub work: HashMap<String, f64>,
+    /// 本周期积分包总额度缓存（credits_limit 合计；到期日历「剩余 X / 总 Y」数据源）
+    #[serde(default)]
+    pub total_limit: HashMap<String, f64>,
     /// 会员套餐到期时间缓存（Unix 秒，来自 ent_usage 会员包 end_time）
     #[serde(default)]
     pub membership_expire: HashMap<String, i64>,
@@ -318,7 +347,7 @@ pub struct AccountCooldownsFile {
 }
 
 /// API 池配置文件：api_pool.json
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 pub struct ApiPoolFile {
     #[serde(default)]
     pub enabled_uids: Vec<String>,
@@ -343,6 +372,64 @@ pub struct ApiPoolFile {
     /// 后台任务降级（T5.6③/F-65）：标题/摘要类短请求路由到目录最低倍率模型
     #[serde(default)]
     pub wb_bg_downgrade: bool,
+    /// 长上下文降档（F-76④）：输入粗估 ≥100k token 的请求自动换 flash 档模型
+    #[serde(default)]
+    pub wb_longctx_downgrade: bool,
+    /// 慢请求竞速对冲阈值毫秒（F-76③）：流式首字节超阈值且有其他健康账号时
+    /// 向第二账号发对冲请求；0 = 关闭
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub wb_hedge_threshold_ms: u64,
+    /// 账号并发上限（F-77）：inflight ≥ 上限的账号视为 busy 不参与候选，
+    /// 全部 busy 时降级取 inflight 最小者；0 = 不限（保持现状）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub account_concurrency_limit: u32,
+    /// 池粘性 TTL 秒（F-76②）：TTL 内同会话必落同一池同账号（上游 KV cache 复用）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub pool_sticky_ttl_secs: u64,
+    /// WB 显式绑定 TTL 秒（F-76②；wb_sticky 会话粘性）：覆盖原 1800s 常量
+    #[serde(default = "default_wb_sticky_ttl_secs")]
+    pub wb_sticky_ttl_secs: u64,
+}
+
+fn default_hedge_threshold_ms() -> u64 {
+    // 与运行时 clamp(1000, 8000) 上限对齐（P1 缺陷5）：原 15s 默认超出上限，
+    // 实际等效 8s，配置展示失真
+    8_000
+}
+
+fn default_account_concurrency_limit() -> u32 {
+    1
+}
+
+fn default_pool_sticky_ttl_secs() -> u64 {
+    300
+}
+
+fn default_wb_sticky_ttl_secs() -> u64 {
+    1800
+}
+
+/// Default 与 serde default 对齐（derive Default 的数值字段会落 0，与旧版
+/// api_pool.json 缺字段的语义不一致：F-76③ 对冲默认 15s、F-77 并发默认 1、
+/// F-76② 池粘性 300s / 会话粘性 1800s）
+impl Default for ApiPoolFile {
+    fn default() -> Self {
+        Self {
+            enabled_uids: Vec::new(),
+            strategy: String::new(),
+            wb_strategy: String::new(),
+            group_ids: Vec::new(),
+            wb_enabled: false,
+            wb_default_thinking: false,
+            wb_tool_exec: false,
+            wb_bg_downgrade: false,
+            wb_longctx_downgrade: false,
+            wb_hedge_threshold_ms: default_hedge_threshold_ms(),
+            account_concurrency_limit: default_account_concurrency_limit(),
+            pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            wb_sticky_ttl_secs: default_wb_sticky_ttl_secs(),
+        }
+    }
 }
 
 /// 池中单个账号的运行时状态（给 /status 和前端使用）
@@ -360,6 +447,12 @@ pub struct PoolStatus {
     /// 账号五态机（T2.2/F-29 v1.2）：Available/QuotaProtection/RateLimited/Forbidden/ProxyDisabled
     #[serde(default)]
     pub state: String,
+    /// 账号实时在途并发数（F-77：per-account inflight，前端池状态页展示）
+    #[serde(default)]
+    pub inflight: u32,
+    /// refresh_token 是否已判定失效（F-78 批次 3：前端展示「Token 失效」徽标）
+    #[serde(default)]
+    pub refresh_invalid: bool,
 }
 
 /// API 服务整体状态（给前端用）

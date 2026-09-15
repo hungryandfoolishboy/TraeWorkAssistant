@@ -12,15 +12,12 @@
 //!   `dedicated_account` 或 allowed_accounts 首个）
 //! - `daily_stats`：按日请求统计（保留最近 90 天）
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::fs_utils;
 
 /// 数据文件名（位于 data/ 目录）
-pub const KEYS_FILE: &str = "api_keys.json";
-
 /// 按日统计保留天数
 const DAILY_STATS_CAP: usize = 90;
 
@@ -208,21 +205,14 @@ pub fn constraints_for(data_dir: &Path, key_id: &str) -> Option<ResolvedKey> {
     })
 }
 
-/// 数据文件路径：data_dir/data/api_keys.json
-pub fn keys_path(data_dir: &Path) -> PathBuf {
-    let dir = data_dir.join("data");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join(KEYS_FILE)
-}
-
-/// 读盘
+/// 读盘（SQLite 化 P3：api_keys 表 + kv `api_keys_auth_disabled`）
 pub fn load(data_dir: &Path) -> ApiKeysFile {
-    fs_utils::read_json(&keys_path(data_dir))
+    crate::store::docs::api_keys_load(&crate::store::db(data_dir))
 }
 
-/// 原子写盘
+/// 原子写盘（事务内整表替换）
 pub fn save(data_dir: &Path, f: &ApiKeysFile) {
-    let _ = fs_utils::write_json(&keys_path(data_dir), f);
+    let _ = crate::store::docs::api_keys_save(&crate::store::db(data_dir), f);
 }
 
 /// 进程级写锁（审查 P1-2）：api_keys.json 的「读-改-写」（verify 记账 + save）必须
@@ -370,20 +360,20 @@ mod tests {
 
     #[test]
     fn locked_verify_skips_write_when_unchanged() {
-        // Invalid 路径不改写文件；命中记账路径正常落盘
+        // Invalid 路径不改写存储；命中记账路径正常落库（SQLite 化 P3：对比 kv 内容）
         let dir = std::env::temp_dir().join(format!("twa_keys_locked_{}", std::process::id()));
         let f = ApiKeysFile {
             keys: vec![entry("k1", "ck-a", true, 0)],
             auth_disabled: false,
         };
         save(&dir, &f);
-        let before = std::fs::read(keys_path(&dir)).unwrap();
+        let before = crate::store::db(&dir).kv_get_raw("api_keys");
         assert!(matches!(
             verify_and_consume_locked(&dir, "ck-wrong", "d1"),
             KeyCheck::Invalid
         ));
-        let after = std::fs::read(keys_path(&dir)).unwrap();
-        assert_eq!(before, after, "Invalid 路径不应改写文件");
+        let after = crate::store::db(&dir).kv_get_raw("api_keys");
+        assert_eq!(before, after, "Invalid 路径不应改写存储");
         // 命中记账：文件应更新
         assert!(matches!(
             verify_and_consume_locked(&dir, "ck-a", "d1"),

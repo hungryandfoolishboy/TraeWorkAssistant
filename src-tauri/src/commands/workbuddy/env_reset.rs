@@ -12,7 +12,7 @@ use tauri::{AppHandle, State};
 use crate::fs_utils;
 use crate::state::AppState;
 
-use super::common::{as_str, auth_file_path, auth_file_path_of, push_notify, token_store_path, wb_data_dir};
+use super::common::{as_str, auth_file_path, auth_file_path_of, push_notify, wb_data_dir};
 use super::oauth::{jwt_claims, open_in_browser};
 
 const WB_ACCESS_TOKEN_SECRET_KEY: &str =
@@ -351,7 +351,7 @@ fn current_access_token(state: &AppState) -> Option<String> {
             return Some(t);
         }
     }
-    let store: serde_json::Value = fs_utils::read_json(&token_store_path(state));
+    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(state);
     let mut best: Option<(i64, String)> = None;
     if let Some(tokens) = store.get("tokens").and_then(|t| t.as_object()) {
         for rec in tokens.values() {

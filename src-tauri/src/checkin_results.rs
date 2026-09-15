@@ -4,14 +4,11 @@
 //! 保留 90 天自动裁剪；供 Dashboard「签到成功率趋势」堆叠图查询。
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::fs_utils;
 
-/// 结果数据文件名（位于 data/ 目录）
-pub const RESULTS_FILE: &str = "checkin_results.json";
 /// 历史数据保留天数（超出部分读写时裁剪）
 pub const RETENTION_DAYS: i64 = 90;
 
@@ -71,23 +68,17 @@ pub fn today_key() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// 结果文件路径：data_dir/data/checkin_results.json
-pub fn results_path(data_dir: &Path) -> PathBuf {
-    let dir = data_dir.join("data");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join(RESULTS_FILE)
-}
-
-/// 从磁盘加载结果数据（缺失/损坏回退空结构），并裁剪过期日期
+/// 从存储加载结果数据（缺失/损坏回退空结构），并裁剪过期日期。
+/// SQLite 化（P3）：checkin_results.json → checkin_results 表。
 pub fn load(data_dir: &Path) -> ResultsFile {
-    let mut f: ResultsFile = fs_utils::read_json(&results_path(data_dir));
+    let mut f = crate::store::docs::checkin_results_load(&crate::store::db(data_dir));
     f.trim(RETENTION_DAYS);
     f
 }
 
-/// 原子写盘
+/// 原子写库（事务内整表替换）
 pub fn save(data_dir: &Path, results: &ResultsFile) {
-    let _ = fs_utils::write_json(&results_path(data_dir), results);
+    let _ = crate::store::docs::checkin_results_save(&crate::store::db(data_dir), results);
 }
 
 /// 记录当日签到最终状态（签到完成后的 done 落库入口），随后写盘

@@ -8,10 +8,10 @@ use tauri::State;
 use crate::fs_utils;
 use crate::state::AppState;
 
-use super::cli::{cli_rotate_state_path, load_cli_rotate_state};
+use super::cli::{load_cli_rotate_state, save_cli_rotate_state};
 use super::common::{
     account_id_of, as_str, as_ts_seconds, auth_file_path_of, is_running, load_pool, save_pool,
-    snapshot_json_path, token_store_path, upsert_token_store, wb_data_dir, wb_renew_locks,
+    snapshot_json_path, upsert_token_store, wb_data_dir, wb_renew_locks,
     WorkBuddyAccount, WbPool,
 };
 
@@ -140,7 +140,7 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
     let snap_cb_path = state.data_dir.join("data").join("profiles_codebuddy");
     let cur_wb = read_current_account_marker(&snap_path);
     let cur_cb = read_current_account_marker(&snap_cb_path);
-    let store: serde_json::Value = fs_utils::read_json(&token_store_path(state));
+    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(state);
     let store_tokens = store.get("tokens").cloned().unwrap_or(serde_json::Value::Null);
 
     let views = pool
@@ -223,7 +223,7 @@ pub fn workbuddy_account_remove(state: State<AppState>, user_id: String, delete_
     let mut st = load_cli_rotate_state(&state);
     if st.active_account_id.as_deref() == Some(user_id.as_str()) {
         st.active_account_id = None;
-        let _ = fs_utils::write_json(&cli_rotate_state_path(&state), &st);
+        let _ = save_cli_rotate_state(&state, &st);
     }
     Ok(())
 }
@@ -279,6 +279,16 @@ fn read_current_account_marker(dir: &std::path::Path) -> Option<String> {
     let s = std::fs::read_to_string(dir.join("current_account.txt")).ok()?;
     let t = s.trim().trim_start_matches('\u{feff}').trim().to_string();
     if t.is_empty() { None } else { Some(t) }
+}
+
+/// F-74：读指定端的当前账号标记（桥按端写入的 `profiles_<app>/current_account.txt`）。
+/// 与 `is_current_workbuddy` / `is_current_codebuddy` 徽标同源；文件不存在 → None。
+pub fn current_account_marker(state: &AppState, app: &str) -> Option<String> {
+    let dir = match app {
+        "CodeBuddy" => "profiles_codebuddy",
+        _ => "profiles_workbuddy",
+    };
+    read_current_account_marker(&state.data_dir.join("data").join(dir))
 }
 
 /// F1-3（switch.rs 防误覆盖守卫用）：读共享 auth 文件当前 uid → 账号池中反查账号 id。
@@ -434,7 +444,7 @@ pub fn workbuddy_refresh_token(state: State<AppState>, user_id: String) -> Resul
     // 取到期更晚的一源作为生效 refresh_token；无到期信息的源视为 0（最旧），
     // 同新/均无到期时优先工具侧 store 副本（保持原有语义）。
     // auth 文件仅在 uid 与本账号匹配时采信，防止把客户端当前登录的其他账号 token 串号。
-    let store: serde_json::Value = fs_utils::read_json(&token_store_path(&state));
+    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(&state);
     let rec = store.get("tokens").and_then(|t| t.get(&acct.id)).cloned().unwrap_or_default();
     let store_cand = (
         as_str(fs_utils::dig(&rec, &["refresh_token"])),
@@ -530,7 +540,7 @@ pub fn workbuddy_refresh_token(state: State<AppState>, user_id: String) -> Resul
 /// 仅纳入有工具侧凭证副本的账号（auth 文件为只读态，不在此兜底）。
 pub(crate) fn wb_upstream_accounts(state: &AppState) -> Vec<crate::api_server::pool::WbSyncAccount> {
     let pool = load_pool(state);
-    let store: serde_json::Value = fs_utils::read_json(&token_store_path(state));
+    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(state);
     let tokens = store
         .get("tokens")
         .and_then(|t| t.as_object())
@@ -568,7 +578,7 @@ pub fn workbuddy_accounts_export(state: State<AppState>, include_credentials: Op
     let pool = load_pool(&state);
     let include_cred = include_credentials.unwrap_or(false);
     let store: serde_json::Value = if include_cred {
-        fs_utils::read_json(&token_store_path(&state))
+        crate::tasks::wb_common::load_token_store(&state)
     } else {
         serde_json::json!({})
     };

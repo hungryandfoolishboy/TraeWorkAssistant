@@ -1,7 +1,7 @@
-# 技术架构设计 — AI Work 助手 v3.2.7
+# 技术架构设计 — AI Work 助手 v3.4.5
 
 > 本文是技术侧唯一总纲：技术选型、架构分层、数据模型、进程契约、API 协议参考、开发运维与排错。
-> 产品侧（需求/交互/界面）见 [product-design.md](product-design.md)；WorkBuddy 接入设计见 [workbuddy-product-design.md](workbuddy-product-design.md)。
+> 产品侧（需求/交互/界面）见 [product-design.md](product-design.md)；未排期优化项见 [backlog.md](backlog.md)（WorkBuddy 接入蓝本协议事实已归并至本文附录 B）。
 > **完整 Tauri 命令契约表以根目录 `AGENT.md` §5 为权威**，本文只保留契约概览与协议细节，避免双维护漂移。
 
 ## 1. 技术选型
@@ -10,13 +10,13 @@
 |---|---|---|
 | UI | React 18 + TypeScript 5 + Vite 5 + Tailwind 3 + Zustand 4 + Recharts 2 + lucide-react | Web 技术栈还原设计稿；Zustand 单一状态源；Recharts 图表 |
 | 外壳 | Tauri 2.x（Rust 1.75+ MSVC） | 包体 8~15MB（远小于 Electron），可调用系统 API（注册表/证书/计划任务/DPAPI） |
-| 核心逻辑 | Python 3.9+（仅标准库 + cryptography） | 复用已验证的签到/代理/豆包脚本逻辑，可热更 |
-| 登录态切换 | PowerShell 5.1+（`trae-switch-bridge.ps1`，四应用档案表驱动） | 复用备份/恢复/设备标识重置逻辑，系统自带 |
+| 核心逻辑 | Rust（`src-tauri/src/tasks/` 直调模块） | 原 Python 脚本已全部重写为 Rust 后台任务（trae_checkin / wb_* / doubao_* / device_proxy），无子进程、无解释器依赖 |
+| 登录态切换 | Rust `switcher/` 模块（5 应用 × 3 快照布局档案表驱动，进程内直调） | 原 `trae-switch-bridge.ps1` 已全量 Rust 化：sysinfo 进程管理 + windows-registry + lnk 解析，无外部运行时 |
 | API 网关 | Rust axum（内嵌，复用 Tauri tokio runtime） | OpenAI / Anthropic 双协议端点 + SSE 转换 + 账号池调度，无独立进程 |
 | HTTP 客户端 | ureq（同步）+ `spawn_blocking` 包装 | 双 Client 设计：短请求 120s 超时 / 流式仅 ResponseHeaderTimeout 120s，共享连接池 |
 | 加密 | tauri-plugin-stronghold + windows-sys(DPAPI) | jwt/refresh_token 入 vault，主密码经 DPAPI 仅本机当前用户可解 |
-| 测试 | cargo test + Python unittest + vitest | Rust 30 用例 / Python 纯函数 / 前端 `src/lib/format.test.ts` |
-| 打包 | Tauri Bundler → MSI / NSIS（自定义模板） | 含 Python 运行时与 PS 脚本；产物经 `scripts/rename_release.py` 输出中文命名到 release/ |
+| 测试 | cargo test + vitest | Rust 310 用例（tasks/device_proxy 纯函数） / 前端 `src/lib/format.test.ts` |
+| 打包 | Tauri Bundler → MSI / NSIS（自定义模板） | 全 Rust 零外部运行时（Python 与 PowerShell 均已移除）；产物经 `scripts/rename_release.mjs` 输出中文命名到 release/ |
 
 **不采用**：Electron（体积过大）、WPF/WinUI（样式成本高）、PyQt（视觉不达要求）、React Router/Redux（依赖最小原则）。
 
@@ -38,8 +38,12 @@ Bridge        Tauri Commands（src-tauri/src/commands/）
  └─ api_server                axum 网关：Trae 池（routes/pool/payload/sse/auth/models_sync/usage/api_logger）
                               + WB 池（wb_route/wb_payload/wb_sse/wb_upstream/wb_responses/wb_images/wb_sticky/wb_toolexec/wb_catalog/wb_model_route）
                               + 三池调度（dispatch/unified_catalog/custom_models/custom_route/retry/api_keys/gateway_settings）
-Python Core   auto_checkin.py / device_proxy.py / doubao_*.py（renew/quota/chats）/ workbuddy_*.py（checkin/credits/common/ui_click）
-PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy + SnapshotLayout）
+Rust Tasks    tasks/（trae_checkin / wb_checkin / wb_common / wb_credits / ui_click / doubao_session / doubao_quota / doubao_chats
+              / scheduler——应用内定时调度器，schtasks 的跨平台补充）+ device_proxy/（MITM 代理模块，hyper+rustls 自建）
+Switcher      tasks 外的独立域：switcher/（原 PS 切换桥——profile 档案表 / locate 六级 exe 发现 /
+              proc 三级关闭 / machine 6 层重置 / copy+icube+chromium+authfile 三布局快照管线）
+Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 键值文档表 / 行文档实体表 / 列化流水表；
+              WAL + busy_timeout，首启迁移器把旧 JSON 导 backup/，v3.4.5 起替代 data 目录 JSON 读写）
 ```
 
 关键机制：
@@ -63,21 +67,22 @@ PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy
 
 统一存于 `%APPDATA%\AIWorkAssistant\`（旧 TraeWorkAssistant 目录由 `state.rs::migrate_legacy_dirs` 启动自动复制迁移）：
 
-| 文件 | 说明 |
+> **v3.4.5 起 data 目录 JSON 全量迁入 `data/aiwork.sqlite`**（WAL；kv 键值文档表 29 键 + 行文档实体表 12 + 列化流水表 8；首启迁移器导旧 JSON 入 `backup/`，`user_version` 幂等闸门）。下表 JSON 文件名为**逻辑名**（kv 键 = 文件名去 .json），运行期不产生 JSON 读写。
+
+| 逻辑名（库中位置） | 说明 |
 |---|---|
-| `conf/app_settings.json` | Settings 全字段（snake_case） |
-| `conf/vault.stronghold` + `conf/vault_key.bin` | jwt/refresh_token 权威存储（按 uid 键）+ DPAPI 加密的 vault 主密码；JSON 落盘占位化，Python 签到走临时解密文件（用后即删） |
-| `data/checkin_accounts.json` | 账号 + JWT（敏感字段 vault 化后为占位） |
-| `data/device_map.json` | user_id → 虚拟设备身份（`rand_digits(n, seed=user_id)` 稳定派生） |
-| `data/groups.json` | 分组 + membership |
-| `data/credits_history.json` / `credits_daily.json` / `remaining_credits.json` | 积分明细 / 每日三线快照 / 剩余积分缓存（均裁剪 90 天） |
-| `data/checkin_results.json` | 签到最终态按日落库（T8，保留 90 天） |
-| `data/account_cooldowns.json` | 签到错误冷却状态 |
-| `data/api_pool.json` | 账号池：enabled_uids + `strategy`(expire_first/credit_first/random) + `group_ids`（T10） |
-| `data/api_keys.json` / `api_usage.json` / `api_models.json` | 多 API Key+每日配额 / 用量按日统计 / 模型目录 |
-| `data/profiles/`、`profiles_trae/`、`profiles_doubao/` | 三应用登录态快照（current_account.txt + <uid> 槽位 + .bak 单代回滚） |
-| `data/doubao_accounts.json` / `doubao_captured_credentials.json` / `doubao_health_history.json` / `doubao_chats/` | 豆包账号池 / 抓包凭证回写 / 运维健康史 / 对话备份 |
-| `data/certs/` | 自签 CA |
+| `conf/app_settings.json` | Settings 全字段（snake_case，UI 配置保留文件形态） |
+| `conf/vault.stronghold` + `conf/vault_key.bin` | jwt/refresh_token 权威存储（按 uid 键）+ DPAPI 加密的 vault 主密码；JSON 落盘占位化，签到/网关在 Rust 内存中临时解密（无落盘子进程） |
+| `checkin_accounts`（accounts 表） | 账号 + JWT（敏感字段 vault 化后为占位） |
+| `device_map`（表） | user_id → 虚拟设备身份（`rand_digits(n, seed=user_id)` 稳定派生） |
+| `groups`（表） | 分组 + membership |
+| `credits_history` / `credits_daily` / `remaining_credits`（表） | 积分明细 / 每日三线快照 / 剩余积分缓存（裁剪 90~365 天） |
+| `checkin_results`（表） | 签到最终态按日落库（T8，保留 90 天） |
+| `account_cooldowns`（表） | 签到错误冷却状态 |
+| `api_pool`（kv） | 账号池：enabled_uids + `strategy`(expire_first/credit_first/random/weighted/p2c) + `group_ids` + 调度开关 |
+| `api_keys`（表）/ `api_usage`（表）/ `api_models`（kv） | 多 API Key+每日配额 / 用量按日统计 / 模型目录 |
+| `data/profiles*/`、`doubao_chats/`、`exports/`、`certs/` | 快照槽（current_account.txt + <uid> 槽位 + .bak 单代回滚）/ 对话备份 / 导出产物 / 自签 CA——保留文件形态不入库 |
+| `doubao_accounts`（表）/ `doubao_captured_credentials`（kv）/ `doubao_health_events`（表） | 豆包账号池 / 抓包凭证回写 / 运维健康史 |
 | `logs/` | proxy / checkin / switcher / api / proxy-requests / app.log |
 
 账号唯一主键 `UserID`（JWT payload `data.id`）。**红线**：账户中心 dc id与 Cloud-IDE id 两套 id 空间不通用，混用会产生重复账号。
@@ -104,10 +109,12 @@ PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy
 
 ## 5. 进程与子进程契约
 
-### 5.1 `auto_checkin.py`
+### 5.1 `tasks/trae_checkin.rs`（批量签到，Rust 直调）
 
-- 参数（向后兼容）：`--json-stream`（NDJSON）、`--accounts UID1,UID2`、`--scope all|group:<id>`、`--accounts-file`（vault 临时解密文件）。
-- NDJSON 示例：
+- 入口 `checkin_start(opts)`：`opts: { scope: all|group:<id>, user_ids?, skip_checked_in, skip_expired }`；vault 解密在内存中完成（无子进程、无临时文件）。
+- 进度经 `checkin-progress` 事件下发，事件载荷（原 NDJSON 行结构）保持向后兼容：
+
+```json
 
 ```json
 {"type":"start","total":6}
@@ -118,28 +125,30 @@ PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy
 
 - `status` ∈ `already|success|fail`；每次签到追加 `{date, user_id, credits, delta}` 入 `credits_history.json`。
 
-### 5.2 `device_proxy.py`
+### 5.2 `device_proxy/`（MITM 代理模块）
 
-- env：`AIWORKDATA_DIR`、`PROXY_PORT`（默认 8899）、`AUTO_CAPTURE_JWT=1`、可选 `UPSTREAM_PROXY[_USER/_PASS]`（http/socks5）。
+- 配置：`AIWORKDATA_DIR` 决定数据根目录；端口经 `proxy_start(port)` 直传（默认 8899）；上游代理经 `ProxyConfig.upstream` 直传（http/socks5，含认证字段）；`AUTO_CAPTURE_JWT=1` 语义由模块内常量承接。
 - MITM 捕获 `trae.cn`/`trae.com.cn` 带 `Cloud-IDE-JWT` 的请求写回账号库（exp 防降级）；`mchost.guru` 解密记录对话摘要；WebSocket 隧道转发不记录内容。
 - 结构化日志 `logs/proxy_req_YYYY-MM-DD.log` 供 `proxy_logs_list/detail` 查询。
 - 同时承担豆包凭证抓包（doubao.com Cookie sessionid/sid_guard/ttwid 落盘供回写）。
 
-### 5.3 `trae-switch-bridge.ps1`（四应用切换桥）
+### 5.3 `switcher/`（登录态切换器，原 PS 切换桥 Rust 化）
 
-- Action：`Switch / SaveCurrentLogin / ResetMachineId / ResetDeviceIds / BackupCurrent / RestoreOnly / KeepAlive`；通用参数 `-TargetApp TraeWork|Trae|Doubao|WorkBuddy`、`-Json`、`-ProxyPort`、`-IncludeIndexedDB`、`-ExpectedCurrentUid`。
-- icube 布局（Trae 双应用）：精准备份 9 类核心文件；chromium 布局（豆包）：白名单目录快照 + `snapshot_meta.json`（schemaVersion=1）+ `Test-SnapshotIntegrity` 三层校验 + `.bak` 单代回滚 + ExpectedCurrentUid 防误覆盖守卫；authfile 布局（WorkBuddy）随其批次接入。
-- 保存前预检登录会话（Cookie 存在性检测），未登录态拒绝入槽。
-- PowerShell 5 需 UTF-8 with BOM + CRLF 行尾（LF 无 BOM 中文解析错误）。
+- Action：`Switch / SaveCurrentLogin / ResetMachineId / ResetDeviceIds / BackupCurrent / RestoreOnly / KeepAlive`；入参 `target_app: TraeWork|Trae|Doubao|WorkBuddy|CodeBuddy`、`proxy_port`（>0 注入 `--proxy-server`）、`include_indexeddb`、`expected_current_uid`（防误覆盖守卫）。
+- icube 布局（Trae 双应用）：精准备份 9 类核心文件；chromium 布局（豆包）：白名单目录快照 + `snapshot_meta.json`（schemaVersion=1）+ 完整性三层校验 + `.bak` 单代回滚 + ExpectedCurrentUid 防误覆盖守卫；authfile 布局（WorkBuddy/CodeBuddy）：L1 auth 文件 + L2 storage/user-* + L3（仅 CodeBuddy）vscdb 登录真源（含 -wal/-shm 边车）。
+- 保存前预检登录会话（Cookie 存在性检测），未登录态拒绝入槽；全局互斥拒绝并发切换。
+- 进度通道：`ProgressSink` 回调（TauriSink emit 事件 / CliSink 打印 stdout），NDJSON 行结构与 `*-done` 事件契约与 PS 桥逐字段兼容。
 
 ### 5.4 API 网关（api_server 模块）
 
 | 端点 | 说明 |
 |---|---|
 | `GET /health`（免鉴权）/ `GET /status` | 健康检查 / 账号池状态 |
-| `GET /v1/models` | 与 `data/api_models.json` 同源，官网同步后无需重启 |
+| `GET /v1/models` | 统一模型目录（Trae 官网同步 + WB 目录 + 自定义三源合并），官网同步后无需重启 |
 | `POST /v1/chat/completions` | OpenAI 协议（流式 + 非流式） |
 | `POST /v1/messages` | Anthropic Messages 协议（message_start → content_block_* → message_delta → message_stop） |
+| `POST /v1/responses` | Codex Responses API 投影（WB 上游模型） |
+| `POST /v1/images/generations` / `/v1/images/edits` | 生图双端点（WB 上游，模型需 `supports_image=true`） |
 | `POST /v1/completions` | legacy text completion（prompt 转 user message 复用链路） |
 | `/v1/embeddings` | 明确 501（上游无对应能力，不做假实现） |
 
@@ -178,7 +187,7 @@ PowerShell    trae-switch-bridge.ps1（-TargetApp TraeWork|Trae|Doubao|WorkBuddy
 ### 6.3 请求体加密结论（重要）
 
 - TTNet/aha 传输层存在 `@aha-kit` 加密（`x-bridge-transport: aha` 下 body 加密，走 TTNet 隧道）；真实客户端对话为**直连 HTTPS POST + aha 加密体**。
-- `llm_utils_chat` 端点**明文 JSON 可行**（已验证），`create_agent_task`（Work 积分 209）为 ~123KB 富上下文加密体，**外部无法复刻**（真实身份复刻仍 4001）——Work 积分接入只能走多活会话编排，见 [product-optimization-backlog.md](product-optimization-backlog.md) W-01。
+- `llm_utils_chat` 端点**明文 JSON 可行**（已验证），`create_agent_task`（Work 积分 209）为 ~123KB 富上下文加密体，**外部无法复刻**（真实身份复刻仍 4001）——Work 积分接入只能走多活会话编排，见 [backlog.md](backlog.md) W-01（**2026-09-15 已排除**：Trae 积分签到调整，前提与收益不成立，专题转技术留档）。
 
 ### 6.4 SOLO SSE 自定义事件
 
@@ -204,23 +213,20 @@ event:error         流内错误（code:1005 → PlanLimit 等）
 | Node.js | ≥ 18（建议 22） | `node -v` |
 | Rust | ≥ 1.77 stable（MSVC，edition 2021） | `rustc --version` |
 | VS Build Tools | 「使用 C++ 的桌面开发」+ Windows SDK | 链接错误多因缺失此项 |
-| Python | ≥ 3.9（打包时内嵌，运行期自动探测；内嵌不可用回退系统解释器） | `python --version` |
 | WebView2 | Win11 自带 / Win10 装 Evergreen Bootstrapper | — |
 
 ```powershell
 npm install
 npm run tauri dev      # 开发模式（Vite 5173 + Rust 热重载；勿裸 npm run dev，白屏）
 npm run tauri build    # 打包 MSI + NSIS → src-tauri/target/release/bundle/
-python scripts/rename_release.py    # 产物输出 release/，中文命名
-python scripts/package_portable.py  # 便携版 zip
+node scripts/rename_release.mjs    # 产物输出 release/，中文命名
+node scripts/package_portable.mjs  # 便携版 zip
 ```
 
-测试：`cargo test`（Rust）、`python src-python/tests/test_auto_checkin.py`（Python）、`npm run test`（vitest 前端）。
+测试：`cargo test`（Rust）、`npm run test`（vitest 前端）。
 
 ### 7.2 打包注意
 
-- `src-python/` 打进 `resources/python/`：**Python 侧改动在正式版必须重新 `tauri build`**（dev 模式直读源码即生效）。
-- `src-python/` 严禁混入 Python 运行时文件（python.exe/Lib 等）；解释器统一 `import encodings` 自举验证。
 - NSIS 用自定义模板 `build-assets/installer.nsi`（升级安装默认直接覆盖）；`installer-hooks.nsh` 处理旧品牌静默卸载（需 UTF-8 BOM）。
 - 升级 Tauri CLI 后如 NSIS 构建报错，需从对应版本 tag 重新同步模板。
 
@@ -231,22 +237,20 @@ python scripts/package_portable.py  # 便携版 zip
 | `cargo build` 链接失败 / 找不到 link.exe | 未装 VS Build Tools C++ 工作负载 | 装「使用 C++ 的桌面开发」+ SDK，确认 MSVC 目标 |
 | 启动白屏 / `invoke` 不存在 | 浏览器直开 5173，未走 Tauri 外壳 | 用 `npm run tauri dev` |
 | 代理捕获不到 JWT | 未装 CA 或 Trae 未走代理 | 一键安装证书（UAC）→ 启动代理 → 看日志 listening |
-| 开代理后部分网站打不开 | 系统代理被改写 | v2.4.3 起自动串联已有代理为上游；Python 改动需重新打包 |
+| 开代理后部分网站打不开 | 系统代理被改写 | v2.4.3 起自动串联已有代理为上游 |
 | 停代理后 VPN 失效 | 旧版只置 0 未还原 | 已改为原样还原 ProxyEnable/ProxyServer/ProxyOverride |
 | 计划任务输出乱码 / Access Denied | schtasks GBK / `/RL HIGHEST` | 统一走 `misc.rs::run_schtasks()`（chcp 65001）；不加 /RL HIGHEST |
-| 打包后报缺脚本/Python | resources 未包含或混入运行时 | 检查 `bundle.resources`；解释器自举回退兜底 |
 
 ## 8. 风险与应对
 
 | 风险 | 等级 | 应对 |
 |---|---|---|
-| 上游升级导致接口/路径变化 | 高 | 核心逻辑留在可热更的 Python/PS；`dig()` 宽容解析；接口层独立模块 |
+| 上游升级导致接口/路径变化 | 高 | `dig()` 宽容解析；接口层独立模块（Rust 单测锁定解析行为，随发版整体交付） |
 | 上游启用证书固定 | 高 | 降级：OAuth 登录获取可续期凭据（refresh_token 13 天自动续期） |
 | 安全软件拦截 CA/代理 | 中 | 白名单指引 + 代码签名 |
 | 多账号触发风控 | 中 | 免责声明 + 签到间隔随机抖动 + 冷却状态机 |
 | 凭证明文泄露 | 中 | vault + DPAPI；UI 掩码；账号池文件 .gitignore；导出提醒备份 vault |
 | UAC 拒绝 | 低 | 明确提示 + 手动步骤 |
-| Python 运行时残缺 | 低 | 自举验证 + 系统解释器回退 |
 
 ## 9. 附录 B：WorkBuddy / CodeBuddy 协议参考（原 workbuddy-product-design.md 精华归并）
 
@@ -300,7 +304,7 @@ python scripts/package_portable.py  # 便携版 zip
 
 ## 10. 附录 C：豆包对话协议情报（原 doubao-api-feasibility.md 精华归并）
 
-> E-01/E-02/E-03 的需求与实现路径见 [product-optimization-backlog.md](product-optimization-backlog.md)；本节保留协议层事实。
+> E-01/E-02/E-03 的需求与实现路径见 [backlog.md](backlog.md)；本节保留协议层事实。
 
 - **对话端点**：`POST www.doubao.com/samantha/chat/completion`（SSE）；三模式 `doubao` / `doubao-think` / `doubao-expert` → `completion_option` 参数组。
 - **风控形态**：验证码墙而非拒绝服务——错误码 `710012001`（sessionid 吊销）/ `710022004`（需验证码，人工过后恢复）/ `712010702`（Cookie/设备指纹缺失或编码错误）；HTTP 200 无数据流 = 连续失败退避信号。
@@ -328,7 +332,7 @@ python scripts/package_portable.py  # 便携版 zip
 | Jackchaos2025/Doubao-Image-Proxy | 生图 SSE 解析 + message_node_info 兜底 + image_ori 优先级 |
 | laojichao/trae-local-api · laojichao/trae-api | tc 加密格式确认 + 四版本（cn/solo/sg/solo-sg）端点路由表；3 级回退 + 5 档竞速调度（F-72） |
 | BlueChonk/trae-credential-reverse-engineering | tc 解密（AES-128-CBC+SHA-512）+ ECDSA P-256 刷新签名 + 98 API 清单（F-70） |
-| xhrxgr/trae-work-cn-account-manager（Tauri 2 同栈） | `--user-data-dir` 多实例并行 + 插件共享实例隔离（F-67/W-01 底座） |
-| Ttungx/trae-solo-local-api · Sliverkiss/traework2api | `llm_utils_chat + function=solo_work_lite` 通道双实现交叉验证（W-01 可抄实现） |
+| xhrxgr/trae-work-cn-account-manager（Tauri 2 同栈） | `--user-data-dir` 多实例并行 + 插件共享实例隔离（F-67 底座；原 W-01 多活会话编排底座，W-01 已排除） |
+| Ttungx/trae-solo-local-api · Sliverkiss/traework2api | `llm_utils_chat + function=solo_work_lite` 通道双实现交叉验证（原 W-01 可抄实现；W-01 已排除，通道情报仍有留档价值） |
 | wicm84266964/Buddy2api · mtfly/trae-switch | 多通道网关统一接入方向验证；hosts 劫持 + 本地 443 反代（F-73） |
 | jlcodes99/cockpit-tools · dingminhua/dsh-connect-trae | TRAE 多实例思路（F-67）；DSH 桥装即用（F-38 主参照） |

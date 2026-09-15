@@ -12,7 +12,7 @@
 //! base 以 `/v1` 结尾时直接拼 `/chat/completions`），Bearer 鉴权。
 //! 请求体强制 `stream:true`（与 WB 上游同策略：统一 SSE 处理，非流式本地聚合）。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -85,15 +85,9 @@ pub struct CustomModelsFile {
     pub updated_at: i64,
 }
 
-fn file_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("data").join("custom_models.json")
-}
-
-/// 读取列表（热路径缓存：调度每请求命中判定走 read_json_cached）
+/// 读取列表（SQLite 化 P3：custom_models 表；热路径单行组读取替代解析缓存）
 pub fn load(data_dir: &Path) -> Vec<CustomModel> {
-    crate::fs_utils::read_json_cached::<CustomModelsFile>(&file_path(data_dir))
-        .map(|f| f.models)
-        .unwrap_or_default()
+    crate::store::docs::custom_models_load(&crate::store::db(data_dir)).models
 }
 
 /// 整表保存（调用方负责校验后的最终形态落盘）
@@ -105,8 +99,8 @@ pub fn save_list(data_dir: &Path, models: Vec<CustomModel>) -> Result<(), String
             m.updated_at = now;
         }
     }
-    crate::fs_utils::write_json(
-        &file_path(data_dir),
+    crate::store::docs::custom_models_save(
+        &crate::store::db(data_dir),
         &CustomModelsFile { models: list, updated_at: now },
     )
 }

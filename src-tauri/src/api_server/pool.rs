@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Sha256, Digest};
@@ -87,6 +87,9 @@ pub struct PoolEntry {
     pub domain: String,
     pub enterprise_id: String,
     pub global_region: bool,
+    /// refresh_token 已判定失效（F-78 批次 3）：同步自 RawAccount.refresh_token_invalid，
+    /// 与 disabled 联动（重新 OAuth 登录后 sync 自动恢复）
+    pub refresh_invalid: bool,
 }
 
 impl PoolEntry {
@@ -145,6 +148,14 @@ pub struct ApiPool {
     strategy: Mutex<PoolStrategy>,
     /// 防惊群（T2.2）：100ms 内重复选中同一 uid 且存在其他候选时让位
     recent_pick: Mutex<(String, i64)>, // (uid, 毫秒时间戳)
+    /// 账号级在途并发计数（F-77）：uid → 计数器共享句柄；
+    /// InflightGuard 取号后 bind，Drop（流结束/断连/panic 展开）时 -1。
+    /// 计数器经 Arc 与 guard 共享，池重建（sync_*）不中断在途请求的配对释放
+    inflight: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicU32>>>,
+    /// 账号并发上限（F-77，api_pool.json 热应用）：0 = 不限；默认 1。
+    /// inflight ≥ 上限的账号视为 busy 不参与候选；全部 busy 时降级取
+    /// inflight 最小者（不过载拒绝，保证请求不失败）
+    concurrency_limit: std::sync::atomic::AtomicU32,
 }
 
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
@@ -158,7 +169,37 @@ impl ApiPool {
             entries: Mutex::new(HashMap::new()),
             strategy: Mutex::new(PoolStrategy::ExpireFirst),
             recent_pick: Mutex::new((String::new(), 0)),
+            inflight: Mutex::new(HashMap::new()),
+            concurrency_limit: std::sync::atomic::AtomicU32::new(1),
         }
+    }
+
+    /// 设置账号并发上限（F-77，pool_set 热应用；0 = 不限）
+    pub fn set_concurrency_limit(&self, limit: u32) {
+        self.concurrency_limit
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 账号并发上限当前值
+    pub fn concurrency_limit(&self) -> u32 {
+        self.concurrency_limit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 账号在途计数共享句柄（F-77）：InflightGuard 取号后 bind_account 使用；
+    /// 不存在则创建（计数从 0 开始，bind 时 +1）
+    pub fn inflight_handle(&self, uid: &str) -> Arc<std::sync::atomic::AtomicU32> {
+        let mut m = safe_lock(&self.inflight);
+        m.entry(uid.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// 在途计数快照（调度 busy 过滤与 P2C/Weighted 负载因子数据源）
+    fn inflight_snapshot(&self) -> HashMap<String, u32> {
+        let m = safe_lock(&self.inflight);
+        m.iter()
+            .map(|(uid, c)| (uid.clone(), c.load(std::sync::atomic::Ordering::Relaxed)))
+            .collect()
     }
 
     /// 设置调度策略（启动时由 api_pool.json 决定）
@@ -227,7 +268,9 @@ impl ApiPool {
                     }
                 }
                 let cd = cooldowns.get(uid).cloned().unwrap_or_default();
-                let disabled = cd.error_type == "SessionDead";
+                // F-78 批次 3：refresh_token 判定失效的账号同步禁用（需重新 OAuth 登录后恢复）
+                let refresh_invalid = a.refresh_token_invalid;
+                let disabled = cd.error_type == "SessionDead" || refresh_invalid;
                 let (device_id, machine_id) = device_map
                     .get(uid)
                     .map(|d| (d.device_id.clone(), seeded_hex(64, uid, "mach")))
@@ -260,9 +303,15 @@ impl ApiPool {
                         domain: String::new(),
                         enterprise_id: String::new(),
                         global_region: false,
+                        refresh_invalid,
                     },
                 );
             }
+        }
+        // F-77：清理已不在池内的在途计数条目（在途请求经 Arc 独立释放，不受影响）
+        {
+            let mut inflight = safe_lock(&self.inflight);
+            inflight.retain(|uid, _| entries.contains_key(uid));
         }
     }
 
@@ -301,8 +350,14 @@ impl ApiPool {
                     domain: a.domain.clone(),
                     enterprise_id: a.enterprise_id.clone(),
                     global_region: a.global_region,
+                    refresh_invalid: false,
                 },
             );
+        }
+        // F-77：清理已不在池内的在途计数条目（在途请求经 Arc 独立释放，不受影响）
+        {
+            let mut inflight = safe_lock(&self.inflight);
+            inflight.retain(|uid, _| entries.contains_key(uid));
         }
     }
 
@@ -313,16 +368,29 @@ impl ApiPool {
         let mut entries = safe_lock(&self.entries);
         let strategy = *safe_lock(&self.strategy);
         let now = now_ts();
-        let cands: Vec<&PoolEntry> = entries
+        let all_cands: Vec<&PoolEntry> = entries
             .values()
             .filter(|e| selectable(e, tried, now))
             .collect();
+        // F-77 取号过滤 busy：inflight ≥ 上限的账号不参与候选；
+        // 全部 busy 时降级为选 inflight 最小者（不过载拒绝，请求不失败）
+        let inflight = self.inflight_snapshot();
+        let limit = self.concurrency_limit();
+        let (cands, busy_fallback) = busy_filter(&all_cands, &inflight, limit);
         // Random 用纳秒级时间做种子（无需密码学随机，仅打散取号顺序）
         let rand_seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
             .unwrap_or(0);
-        let mut picked = pick_by_strategy(&cands, strategy, rand_seed, now).map(|e| PickedAccount {
+        let picked_entry = if busy_fallback {
+            all_cands
+                .iter()
+                .copied()
+                .min_by_key(|e| inflight_of(e, &inflight))
+        } else {
+            pick_by_strategy(&cands, strategy, rand_seed, now, &inflight)
+        };
+        let mut picked = picked_entry.map(|e| PickedAccount {
             uid: e.uid.clone(),
             jwt: e.jwt.clone(),
             device_id: e.device_id.clone(),
@@ -332,8 +400,10 @@ impl ApiPool {
             global_region: e.global_region,
         })?;
 
-        // 防惊群：100ms 内重复选中同一 uid 且还有其他候选 → 让位（T2.2）
-        if cands.len() > 1 {
+        // 防惊群：100ms 内重复选中同一 uid 且还有其他候选 → 让位（T2.2）；
+        // 全 busy 降级路径不参与——min(inflight) 本身即负载分散，策略让位反而
+        // 会破坏「取在途最小者」语义（F-77）
+        if !busy_fallback && cands.len() > 1 {
             let mut recent = safe_lock(&self.recent_pick);
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -349,6 +419,7 @@ impl ApiPool {
                     strategy,
                     rand_seed.wrapping_add(1),
                     now,
+                    &inflight,
                 ) {
                     picked = PickedAccount {
                         uid: alt.uid.clone(),
@@ -398,7 +469,20 @@ impl ApiPool {
         allowed: Option<&HashSet<String>>,
         dedicated: Option<&str>,
     ) -> Option<PickedAccount> {
-        // 专一模式：绑定账号 healthy 且未试错过 → 直接锁定
+        self.pick_excluding_constrained_ev(tried, allowed, dedicated)
+            .map(|(p, _)| p)
+    }
+
+    /// 同 [pick_excluding_constrained]，附带 F-77 调度事件（[SCHED] 日志用）：
+    /// - `busy_yield`：候选中存在被并发上限过滤的 busy 账号（让位给空闲账号）
+    /// - `busy_fallback`：全部候选 busy，降级取 inflight 最小者（不过载拒绝）
+    pub fn pick_excluding_constrained_ev(
+        &self,
+        tried: &HashSet<String>,
+        allowed: Option<&HashSet<String>>,
+        dedicated: Option<&str>,
+    ) -> Option<(PickedAccount, Option<String>)> {
+        // 专一模式：绑定账号 healthy 且未试错过 → 直接锁定（专一绑定不让位）
         if let Some(uid) = dedicated {
             if !tried.contains(uid) {
                 if let Some(p) = self.pick_by_uid(uid) {
@@ -406,23 +490,34 @@ impl ApiPool {
                     if let Some(e) = entries.get_mut(uid) {
                         e.last_used = now_ts();
                     }
-                    return Some(p);
+                    return Some((p, None));
                 }
             }
         }
         let mut entries = safe_lock(&self.entries);
         let strategy = *safe_lock(&self.strategy);
         let now = now_ts();
-        let cands: Vec<&PoolEntry> = entries
+        let all_cands: Vec<&PoolEntry> = entries
             .values()
             .filter(|e| selectable(e, tried, now))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
             .collect();
+        // F-77 busy 过滤 + 全 busy 降级（语义同 pick_excluding）
+        let inflight = self.inflight_snapshot();
+        let limit = self.concurrency_limit();
+        let (cands, busy_fallback) = busy_filter(&all_cands, &inflight, limit);
         let rand_seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
             .unwrap_or(0);
-        let picked = pick_by_strategy(&cands, strategy, rand_seed, now)?;
+        let picked = if busy_fallback {
+            all_cands
+                .iter()
+                .copied()
+                .min_by_key(|e| inflight_of(e, &inflight))
+        } else {
+            pick_by_strategy(&cands, strategy, rand_seed, now, &inflight)
+        }?;
         let account = PickedAccount {
             uid: picked.uid.clone(),
             jwt: picked.jwt.clone(),
@@ -432,11 +527,108 @@ impl ApiPool {
             enterprise_id: picked.enterprise_id.clone(),
             global_region: picked.global_region,
         };
+        // F-77⑤ 可观测：busy 让位/降级事件（无 busy 过滤发生则 None）
+        let event = if limit > 0 && busy_fallback {
+            Some(format!(
+                "busy_fallback picked={} inflight={} limit={}",
+                picked.uid,
+                inflight_of(picked, &inflight),
+                limit
+            ))
+        } else if limit > 0 && cands.len() < all_cands.len() {
+            Some(format!(
+                "busy_yield filtered={} picked={}",
+                all_cands.len() - cands.len(),
+                picked.uid
+            ))
+        } else {
+            None
+        };
         drop(cands); // 释放 entries 不可变借用后再更新 last_used
         if let Some(e) = entries.get_mut(&account.uid) {
             e.last_used = now;
         }
-        Some(account)
+        Some((account, event))
+    }
+
+    /// F-77④ 粘性让位取号：粘性账号 busy（inflight ≥ 并发上限）且池内存在其他
+    /// 空闲健康候选时让位改走调度策略（并发健康优先于上游 KV cache 复用）；
+    /// 全候选 busy / 未启用并发上限（limit=0）/ 无其他候选时保持粘性锁定。
+    /// 返回 (账号, 调度事件)：事件非 None 时由调用方记 [SCHED] 日志
+    /// （sticky_yield=让位改选 / sticky_fallback=全 busy 保持粘性）。
+    pub fn pick_sticky_yield(
+        &self,
+        sticky_uid: &str,
+        allowed: Option<&HashSet<String>>,
+    ) -> Option<(PickedAccount, Option<String>)> {
+        let sticky = self.pick_by_uid(sticky_uid)?;
+        let limit = self.concurrency_limit();
+        let inflight = self.inflight_snapshot();
+        let sticky_inflight = inflight.get(sticky_uid).copied().unwrap_or(0);
+        if limit == 0 || sticky_inflight < limit {
+            return Some((sticky, None));
+        }
+        // 粘性账号 busy：判定其他健康候选（同 allowed 约束；首轮无 tried）是否存在空闲
+        let (has_other, has_idle) = {
+            let entries = safe_lock(&self.entries);
+            let now = now_ts();
+            let tried = HashSet::new();
+            entries
+                .values()
+                .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now))
+                .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+                .fold((false, false), |(any, idle), e| {
+                    (any || true, idle || inflight_of(e, &inflight) < limit)
+                })
+        };
+        if !has_other {
+            return Some((sticky, None));
+        }
+        if !has_idle {
+            // 全 busy：保持粘性（粘性缓存收益 > 换一个同样 busy 的账号）
+            return Some((
+                sticky,
+                Some(format!(
+                    "sticky_fallback uid={sticky_uid} inflight={} limit={limit} all_busy=1",
+                    sticky_inflight
+                )),
+            ));
+        }
+        // 让位：空闲候选中走调度策略（重取锁；候选在间隙被移除则回退保持粘性）
+        let mut entries = safe_lock(&self.entries);
+        let now = now_ts();
+        let tried = HashSet::new();
+        let idle: Vec<&PoolEntry> = entries
+            .values()
+            .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now))
+            .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+            .filter(|e| inflight_of(e, &inflight) < limit)
+            .collect();
+        let strategy = *safe_lock(&self.strategy);
+        let rand_seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
+            .unwrap_or(0);
+        let Some(picked) = pick_by_strategy(&idle, strategy, rand_seed, now, &inflight) else {
+            return Some((sticky, None));
+        };
+        let account = PickedAccount {
+            uid: picked.uid.clone(),
+            jwt: picked.jwt.clone(),
+            device_id: picked.device_id.clone(),
+            machine_id: picked.machine_id.clone(),
+            domain: picked.domain.clone(),
+            enterprise_id: picked.enterprise_id.clone(),
+            global_region: picked.global_region,
+        };
+        let event = Some(format!(
+            "sticky_yield from={sticky_uid} to={} inflight={} limit={}",
+            picked.uid, sticky_inflight, limit
+        ));
+        if let Some(e) = entries.get_mut(&account.uid) {
+            e.last_used = now;
+        }
+        Some((account, event))
     }
 
     /// 更新账号凭证（T2.6：网关 401 刷新后回填，后续取号即用新 token）
@@ -444,6 +636,31 @@ impl ApiPool {
         let mut entries = safe_lock(&self.entries);
         if let Some(e) = entries.get_mut(uid) {
             e.jwt = jwt.to_string();
+        }
+    }
+
+    /// F-78 批次 3：refresh_token 判定失效 → 运行时禁用（前端 refresh_jwt 失败联动；
+    /// 持久化标记由 record_refresh_failure 写 accounts 文件，重启后经 sync_from_accounts 同步）
+    pub fn note_refresh_invalid(&self, uid: &str) {
+        let mut entries = safe_lock(&self.entries);
+        if let Some(e) = entries.get_mut(uid) {
+            e.refresh_invalid = true;
+            e.disabled = true;
+            e.reason = "refresh_token_invalid".to_string();
+        }
+    }
+
+    /// F-78 批次 3：refresh_token 刷新成功 → 回填新凭证并解除失效禁用
+    /// （仅当 disabled 因 refresh_invalid 置位时恢复；SessionDead 等其他禁用原因不动）
+    pub fn note_refresh_success(&self, uid: &str, jwt: &str) {
+        let mut entries = safe_lock(&self.entries);
+        if let Some(e) = entries.get_mut(uid) {
+            e.jwt = jwt.to_string();
+            if e.refresh_invalid {
+                e.refresh_invalid = false;
+                e.disabled = false;
+                e.reason.clear();
+            }
         }
     }
 
@@ -516,6 +733,7 @@ impl ApiPool {
     pub fn status_list(&self) -> Vec<PoolStatus> {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
+        let inflight = self.inflight_snapshot();
         let mut out: Vec<PoolStatus> = entries
             .values()
             .map(|e| PoolStatus {
@@ -529,6 +747,8 @@ impl ApiPool {
                 disabled: e.disabled,
                 err_count: e.err_count,
                 state: e.state_str(now).to_string(),
+                inflight: inflight.get(&e.uid).copied().unwrap_or(0),
+                refresh_invalid: e.refresh_invalid,
             })
             .collect();
         out.sort_by(|a, b| a.uid.cmp(&b.uid));
@@ -556,7 +776,9 @@ impl ApiPool {
         entries
             .values()
             .map(|e| {
-                let reason = if e.disabled {
+                let reason = if e.refresh_invalid {
+                    "disabled(refresh_token_invalid)".to_string()
+                } else if e.disabled {
                     "disabled(SessionDead)".to_string()
                 } else if e.hard_until > 0 && now < e.hard_until {
                     format!("hard_credit(until_0400={}s)", e.hard_until - now)
@@ -649,20 +871,50 @@ fn selectable(e: &PoolEntry, tried: &HashSet<String>, now: i64) -> bool {
     true
 }
 
-/// 按策略从候选集中挑选（纯函数，便于单测）
+/// 账号在途数（F-77，快照查表；无记录 = 0）
+fn inflight_of(e: &PoolEntry, inflight: &HashMap<String, u32>) -> u32 {
+    inflight.get(&e.uid).copied().unwrap_or(0)
+}
+
+/// F-77 busy 过滤（纯函数）：inflight < limit 的账号才参与候选；
+/// limit = 0 不限（返回原候选集，未降级）。过滤后为空（全部 busy）时
+/// 返回 (原候选集, true)，调用方降级取 inflight 最小者（不过载拒绝）
+fn busy_filter<'a>(
+    cands: &[&'a PoolEntry],
+    inflight: &HashMap<String, u32>,
+    limit: u32,
+) -> (Vec<&'a PoolEntry>, bool) {
+    if limit == 0 {
+        return (cands.to_vec(), false);
+    }
+    let idle: Vec<&PoolEntry> = cands
+        .iter()
+        .copied()
+        .filter(|e| inflight_of(e, inflight) < limit)
+        .collect();
+    if idle.is_empty() {
+        (cands.to_vec(), true)
+    } else {
+        (idle, false)
+    }
+}
+
+/// 按策略从候选集中挑选（纯函数，便于单测）；
+/// `inflight` 为在途计数快照（F-77 负载因子：Weighted/P2C 偏向空闲账号）
 fn pick_by_strategy<'a>(
     cands: &[&'a PoolEntry],
     strategy: PoolStrategy,
     rand_seed: u64,
     now: i64,
+    inflight: &HashMap<String, u32>,
 ) -> Option<&'a PoolEntry> {
     if cands.is_empty() {
         return None;
     }
     match strategy {
         PoolStrategy::Random => Some(cands[(rand_seed as usize) % cands.len()]),
-        PoolStrategy::Weighted => pick_weighted(cands, rand_seed, now),
-        PoolStrategy::P2C => pick_p2c(cands, rand_seed, now),
+        PoolStrategy::Weighted => pick_weighted(cands, rand_seed, now, inflight),
+        PoolStrategy::P2C => pick_p2c(cands, rand_seed, now, inflight),
         PoolStrategy::CreditFirst => cands.iter().copied().max_by(|a, b| {
             a.credits
                 .unwrap_or(0.0)
@@ -690,12 +942,21 @@ fn pick_by_strategy<'a>(
 }
 
 /// 三因子加权随机（T2.2）：积分占比×10 + 闲置补偿（每小时+0.5 封顶 5.0，
-/// 从未使用按满额）+ 成功率×3 → Top5 短名单内按得分二次加权随机
-fn pick_weighted<'a>(cands: &[&'a PoolEntry], rand_seed: u64, now: i64) -> Option<&'a PoolEntry> {
+/// 从未使用按满额）+ 成功率×3 → Top5 短名单内按得分二次加权随机；
+/// F-77 负载因子：每个在途请求扣 4 分（空闲账号天然优先）
+fn pick_weighted<'a>(
+    cands: &[&'a PoolEntry],
+    rand_seed: u64,
+    now: i64,
+    inflight: &HashMap<String, u32>,
+) -> Option<&'a PoolEntry> {
     let total_credits: f64 = cands.iter().filter_map(|e| e.credits).sum();
     let mut scored: Vec<(&'a PoolEntry, f64)> = cands
         .iter()
-        .map(|e| (*e, e.weighted_score(total_credits, now)))
+        .map(|e| {
+            let load_penalty = inflight_of(e, inflight) as f64 * 4.0;
+            (*e, (e.weighted_score(total_credits, now) - load_penalty).max(0.1))
+        })
         .collect();
     // 得分降序，取 Top5 短名单
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -714,8 +975,13 @@ fn pick_weighted<'a>(cands: &[&'a PoolEntry], rand_seed: u64, now: i64) -> Optio
 }
 
 /// P2C：随机选二取优（T2.2 v1.2，antigravity-tools 实证延迟优于轮询/加权随机）
-/// 「优」= 三因子得分高者；仅一名候选时直接返回
-fn pick_p2c<'a>(cands: &[&'a PoolEntry], rand_seed: u64, now: i64) -> Option<&'a PoolEntry> {
+/// 「优」= 先比在途数（F-77 负载第一比较键，空闲者胜）再比三因子得分；仅一名候选时直接返回
+fn pick_p2c<'a>(
+    cands: &[&'a PoolEntry],
+    rand_seed: u64,
+    now: i64,
+    inflight: &HashMap<String, u32>,
+) -> Option<&'a PoolEntry> {
     if cands.len() == 1 {
         return Some(cands[0]);
     }
@@ -725,6 +991,11 @@ fn pick_p2c<'a>(cands: &[&'a PoolEntry], rand_seed: u64, now: i64) -> Option<&'a
     if a.uid == b.uid {
         // 撞号：退化为随机一个
         return Some(cands[(rand_seed as usize) % cands.len()]);
+    }
+    let ia = inflight_of(a, inflight);
+    let ib = inflight_of(b, inflight);
+    if ia != ib {
+        return Some(if ia < ib { a } else { b });
     }
     let sa = a.weighted_score(total_credits, now);
     let sb = b.weighted_score(total_credits, now);
@@ -747,7 +1018,7 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
-/// 确定性派生 hex 字符串（与 device_proxy.py 的 _seeded_stream 算法一致）
+/// 确定性派生 hex 字符串（与原 device_proxy.py 的 _seeded_stream 算法一致，accounts::derive_device 同源）
 /// 用于从 uid 生成 machine_id，保证同一账号始终得到同一设备标识
 pub(crate) fn seeded_hex(n: usize, seed: &str, salt: &str) -> String {
     let data = format!("{}:{}", salt, seed);
@@ -778,6 +1049,9 @@ mod tests {
             dc_id: None,
             added_at: None,
             updated_at: None,
+            refresh_token_expires_at: None,
+            refresh_token_fails: 0,
+            refresh_token_invalid: false,
         }
     }
 
@@ -950,6 +1224,62 @@ mod tests {
         assert_eq!(pool.count(), 2);
     }
 
+    // ==================== F-78 批次 3 refresh_token 失效联动 ====================
+
+    #[test]
+    fn refresh_invalid_disables_on_sync() {
+        // refresh_token_invalid=true 的账号同步即禁用，不参与取号
+        let pool = ApiPool::new();
+        let mut a_invalid = acct("A", "uid_a");
+        a_invalid.refresh_token_invalid = true;
+        let accounts = vec![a_invalid, acct("B", "uid_b")];
+        let enabled: Vec<String> = vec!["uid_a".into(), "uid_b".into()];
+        let mut credits = HashMap::new();
+        credits.insert("uid_a".to_string(), 100.0);
+        credits.insert("uid_b".to_string(), 10.0);
+        pool.sync_from_accounts(
+            &accounts,
+            &enabled,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &credits,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(pool.count(), 2);
+        let st: Vec<_> = pool.status_list();
+        let sa = st.iter().find(|s| s.uid == "uid_a").unwrap();
+        assert!(sa.disabled && sa.refresh_invalid);
+        assert_eq!(sa.state, "Forbidden");
+        // 取号只落到 uid_b
+        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_b");
+        // diagnose 给出 refresh_token_invalid 原因
+        let d = pool.diagnose().into_iter().find(|x| x.uid == "uid_a").unwrap();
+        assert_eq!(d.reason, "disabled(refresh_token_invalid)");
+    }
+
+    #[test]
+    fn refresh_invalid_runtime_note_and_recover() {
+        // 运行时联动：note_refresh_invalid 禁用 → note_refresh_success 解除并回填新 JWT
+        let pool = build_pool(&[("uid_a", 100.0, 0)]);
+        pool.note_refresh_invalid("uid_a");
+        let st = &pool.status_list()[0];
+        assert!(st.disabled && st.refresh_invalid);
+        assert!(pool.pick_excluding(&HashSet::new()).is_none());
+
+        pool.note_refresh_success("uid_a", "Cloud-IDE-JWT new");
+        let st = &pool.status_list()[0];
+        assert!(!st.disabled && !st.refresh_invalid);
+        let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+        assert_eq!(picked.jwt, "Cloud-IDE-JWT new");
+
+        // 非 refresh_invalid 原因的禁用（SessionDead）不被 note_refresh_success 恢复
+        pool.note_error("uid_a", ErrKind::SessionDead);
+        pool.note_refresh_success("uid_a", "Cloud-IDE-JWT again");
+        assert!(pool.status_list()[0].disabled);
+    }
+
     // ==================== T2.2 新增 ====================
 
     #[test]
@@ -979,6 +1309,7 @@ mod tests {
             device_id: String::new(), machine_id: String::new(),
             hard_until: 0, last_used: 1000, successes: 0, failures: 0, cb_trips: 0,
             domain: String::new(), enterprise_id: String::new(), global_region: false,
+            refresh_invalid: false,
         };
         let e_b = crate::api_server::pool::PoolEntry {
             last_used: 1000 - 3 * 3600, // 闲置 3 小时
@@ -989,6 +1320,7 @@ mod tests {
                 device_id: String::new(), machine_id: String::new(),
                 hard_until: 0, last_used: 0, successes: 0, failures: 0, cb_trips: 0,
                 domain: String::new(), enterprise_id: String::new(), global_region: false,
+                refresh_invalid: false,
             }
         };
         let now = 1000 + 60;
@@ -1006,16 +1338,16 @@ mod tests {
         let now = 2000;
         // 两候选不同时（奇数种子 → 索引 (1,0)），恒选得分更高的 b
         for seed in (1..200u64).step_by(2) {
-            assert_eq!(pick_p2c(&cands, seed, now).unwrap().uid, "b");
+            assert_eq!(pick_p2c(&cands, seed, now, &HashMap::new()).unwrap().uid, "b");
         }
         // 撞号（两索引相同）→ 不 panic，返回任一候选
         for seed in (0..200u64).step_by(2) {
-            let picked = pick_p2c(&cands, seed, now).unwrap();
+            let picked = pick_p2c(&cands, seed, now, &HashMap::new()).unwrap();
             assert!(picked.uid == "a" || picked.uid == "b");
         }
         // 单候选：直接返回
         let single = vec![&e_b];
-        assert_eq!(pick_p2c(&single, 7, now).unwrap().uid, "b");
+        assert_eq!(pick_p2c(&single, 7, now, &HashMap::new()).unwrap().uid, "b");
     }
 
     /// 测试用 PoolEntry 快速构造
@@ -1040,6 +1372,7 @@ mod tests {
             domain: String::new(),
             enterprise_id: String::new(),
             global_region: false,
+            refresh_invalid: false,
         }
     }
 
@@ -1188,5 +1521,204 @@ mod tests {
             &["wb-x".to_string()],
         );
         assert!(pool2.pick_excluding(&HashSet::new()).is_none());
+    }
+
+    // ==================== F-77 账号级并发感知调度 ====================
+
+    #[test]
+    fn busy_account_yields_to_idle() {
+        // 双账号池 + limit=1：uid_a 在途 1 → 取号必落 uid_b（busy 让位 idle）
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
+        pool.set_concurrency_limit(1);
+        let h = pool.inflight_handle("uid_a");
+        h.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..8 {
+            let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+            assert_eq!(picked.uid, "uid_b", "busy 账号应让位空闲账号");
+        }
+        // 释放后恢复可选
+        h.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let mut seen_a = false;
+        for _ in 0..16 {
+            if pool.pick_excluding(&HashSet::new()).unwrap().uid == "uid_a" {
+                seen_a = true;
+                break;
+            }
+        }
+        assert!(seen_a, "计数归零后账号应恢复参与调度");
+    }
+
+    #[test]
+    fn all_busy_falls_back_to_least_inflight() {
+        // 全部 busy：不拒绝，取 inflight 最小者（uid_b=1 < uid_a=2）
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
+        pool.set_concurrency_limit(1);
+        pool.inflight_handle("uid_a").fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        pool.inflight_handle("uid_b").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..8 {
+            let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+            assert_eq!(picked.uid, "uid_b", "全部 busy 时应取 inflight 最小者");
+        }
+    }
+
+    #[test]
+    fn zero_limit_keeps_original_behavior() {
+        // limit=0 = 不限：busy 过滤关闭，在途账号照常参与
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        pool.set_concurrency_limit(0);
+        pool.inflight_handle("uid_a").fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_a");
+    }
+
+    #[test]
+    fn single_busy_account_still_serves() {
+        // 单账号池：无让位对象，busy 也照常取号（粘性/单账号行为兜底）
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        pool.set_concurrency_limit(1);
+        pool.inflight_handle("uid_a").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_a");
+    }
+
+    #[test]
+    fn pick_by_uid_ignores_busy_filter() {
+        // 粘性取号不受 busy 过滤（粘住 = 上游缓存命中，优先级高于让位）
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
+        pool.set_concurrency_limit(1);
+        pool.inflight_handle("uid_a").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(pool.pick_by_uid("uid_a").is_some());
+    }
+
+    #[test]
+    fn p2c_prefers_lower_inflight_first() {
+        // P2C 负载第一比较键：在途数不同时空闲者直接胜出（无视三因子得分）
+        let e_a = test_entry("a", 900.0, 1000); // 高分但 busy
+        let e_b = test_entry("b", 10.0, 1000); // 低分但空闲
+        let cands = vec![&e_a, &e_b];
+        let mut inflight = HashMap::new();
+        inflight.insert("a".to_string(), 2u32);
+        inflight.insert("b".to_string(), 0u32);
+        for seed in (1..50u64).step_by(2) {
+            assert_eq!(pick_p2c(&cands, seed, 2000, &inflight).unwrap().uid, "b");
+        }
+    }
+
+    #[test]
+    fn status_list_reports_inflight() {
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        assert_eq!(pool.status_list()[0].inflight, 0);
+        let h = pool.inflight_handle("uid_a");
+        h.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(pool.status_list()[0].inflight, 1);
+        h.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(pool.status_list()[0].inflight, 0);
+    }
+
+    #[test]
+    fn guard_style_inflight_via_handle() {
+        // 模拟 InflightGuard 配对：取号句柄 +1/-1，中途丢弃（Drop 兜底语义）计数归零
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        {
+            let _h = pool.inflight_handle("uid_a");
+            _h.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(pool.status_list()[0].inflight, 1);
+        }
+        // Arc 丢弃后（guard Drop fetch_sub 语义由调用方保证）：
+        // 这里直接验证句柄释放 + 计数递减路径可用
+        let h = pool.inflight_handle("uid_a");
+        h.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(pool.status_list()[0].inflight, 0);
+    }
+
+    // ==================== F-77④ 粘性让位 + busy 调度事件 ====================
+
+    #[test]
+    fn sticky_yield_when_busy_and_idle_exists() {
+        // 粘性账号 busy（inflight≥limit=1）且存在空闲候选 → 让位改选空闲账号
+        let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_idle", 10.0, 0)]);
+        pool.inflight_handle("uid_sticky").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None).unwrap();
+        assert_eq!(p.uid, "uid_idle", "busy 粘性账号应让位给空闲账号");
+        let ev = ev.unwrap();
+        assert!(
+            ev.starts_with("sticky_yield from=uid_sticky to=uid_idle"),
+            "让位事件应包含 from/to：{ev}"
+        );
+    }
+
+    #[test]
+    fn sticky_kept_when_all_busy() {
+        // 全候选 busy → 保持粘性（sticky_fallback：缓存收益 > 换一个同样 busy 的账号）
+        let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_b", 10.0, 0)]);
+        pool.inflight_handle("uid_sticky").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pool.inflight_handle("uid_b").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None).unwrap();
+        assert_eq!(p.uid, "uid_sticky", "全 busy 时应保持粘性");
+        assert!(ev.unwrap().starts_with("sticky_fallback"));
+    }
+
+    #[test]
+    fn sticky_kept_when_idle() {
+        // 粘性账号空闲 → 正常锁定，无调度事件
+        let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_b", 10.0, 0)]);
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None).unwrap();
+        assert_eq!(p.uid, "uid_sticky");
+        assert!(ev.is_none());
+    }
+
+    #[test]
+    fn sticky_yield_respects_allowed() {
+        // 让位候选受 allowed 白名单约束：唯一其他候选不在白名单 → 保持粘性
+        let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_b", 10.0, 0)]);
+        pool.inflight_handle("uid_sticky").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut allowed = HashSet::new();
+        allowed.insert("uid_sticky".to_string());
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", Some(&allowed)).unwrap();
+        assert_eq!(p.uid, "uid_sticky", "无白名单内其他候选时保持粘性");
+        assert!(ev.is_none());
+    }
+
+    #[test]
+    fn sticky_yield_no_limit_always_keeps() {
+        // limit=0（不限并发）→ 无 busy 概念，始终粘性锁定
+        let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_b", 10.0, 0)]);
+        pool.set_concurrency_limit(0);
+        pool.inflight_handle("uid_sticky").fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None).unwrap();
+        assert_eq!(p.uid, "uid_sticky");
+        assert!(ev.is_none());
+    }
+
+    #[test]
+    fn busy_yield_event_on_constrained_pick() {
+        // 调度路径：busy 账号被 idle 过滤淘汰 → busy_yield 事件 + 选空闲账号
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
+        pool.inflight_handle("uid_a").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (p, ev) =
+            pool.pick_excluding_constrained_ev(&HashSet::new(), None, None).unwrap();
+        assert_eq!(p.uid, "uid_b");
+        assert!(ev.unwrap().starts_with("busy_yield"));
+    }
+
+    #[test]
+    fn busy_fallback_event_when_all_busy() {
+        // 全候选 busy → busy_fallback 降级取 inflight 最小者
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
+        pool.inflight_handle("uid_a").fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        pool.inflight_handle("uid_b").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (p, ev) =
+            pool.pick_excluding_constrained_ev(&HashSet::new(), None, None).unwrap();
+        assert_eq!(p.uid, "uid_b", "全 busy 时应取 inflight 最小者");
+        assert!(ev.unwrap().starts_with("busy_fallback"));
+    }
+
+    #[test]
+    fn no_busy_event_when_limit_zero() {
+        // limit=0 → 无 busy 过滤，无事件（兼容原语义）
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
+        pool.set_concurrency_limit(0);
+        pool.inflight_handle("uid_a").fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        let (_, ev) =
+            pool.pick_excluding_constrained_ev(&HashSet::new(), None, None).unwrap();
+        assert!(ev.is_none());
     }
 }

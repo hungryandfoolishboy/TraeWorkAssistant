@@ -185,6 +185,8 @@ function defaultSettings(): Settings {
     proxy_log_path: null,
     api_port: 7864,
     api_default_model: 'deepseek-v4-flash',
+    // F-74：切换时自动迁移会话——默认关（旧行为保持"只切登录态，不写会话"）
+    buddy_switch_migrate_chats: false,
   };
 }
 

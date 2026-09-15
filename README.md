@@ -43,7 +43,7 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 - **积分看板**：排行、三线趋势图、今日新增统计；WorkBuddy 积分三件套 + 官方用量 + 本地 Token 统计（缓存命中率/热力图）+ 到期日历
 - **本地代理**：MITM 代理自动捕获 JWT / 豆包凭证、注入独立设备 ID；**自动串联已有系统代理（VPN）作为上游**，停止时原样还原系统代理
 - **API 网关**：内嵌 OpenAI / Anthropic / Codex Responses 三协议兼容 API 服务——Trae 账号池 + WorkBuddy 池 + 自定义 OpenAI 兼容模型三池调度（smart 智能策略/优先级/模型级覆盖）、会话粘性、ck_ 子 Key、四段模型路由、审核指纹清洗、生图双端点、web_search 工具代执行
-- **定时任务**：Windows 计划任务，后台自动签到 / 保活 / 续期 / 额度巡检
+- **定时任务**：Windows 计划任务 + 应用内调度器双轨，后台自动签到 / 保活 / 续期 / 额度巡检
 - **6 层设备标识重置**：machineid / storage.json 遥测 / aha.device / 注册表 MachineGuid / webview 追踪数据 / aha TinyStorage
 - **快照管理**：查看/备份/恢复/删除账号登录态快照（各应用独立管理）；豆包/WorkBuddy 对话数据独立备份恢复与导出
 - **暗色模式**：6 套主题，图表动态适配
@@ -55,11 +55,11 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 npm install
 npm run tauri dev      # 开发模式
 npm run tauri build    # 打包（msi + nsis）
-python scripts/rename_release.py   # 安装包统一输出到 release/，命名 AI Work 助手_<版本>_x64*
-python scripts/package_portable.py # 便携版 zip（AI Work 助手_<版本>_x64_portable.zip）
+node scripts/rename_release.mjs     # 安装包统一输出到 release/，命名 AI Work 助手_<版本>_x64*
+node scripts/package_portable.mjs   # 便携版 zip（AI Work 助手_<版本>_x64_portable.zip）
 ```
 
-前置：Node.js 18+、Rust 1.75+、Python 3.9+、WebView2 Runtime、VS Build Tools (C++)
+前置：Node.js 18+、Rust 1.75+、WebView2 Runtime、VS Build Tools (C++)
 
 ## 从老版本升级
 
@@ -80,28 +80,27 @@ python scripts/package_portable.py # 便携版 zip（AI Work 助手_<版本>_x64
 ```
 %APPDATA%\AIWorkAssistant\
 ├── conf/
-│   └── app_settings.json        # 设置
+│   ├── app_settings.json        # 设置
+│   ├── vault.stronghold         # 凭证加密保险库（DPAPI 保护主密码）
+│   └── vault_key.bin
 ├── data/
-│   ├── checkin_accounts.json    # 账号 + JWT
-│   ├── device_map.json          # 设备 ID 映射
-│   ├── groups.json              # 分组
-│   ├── credits_history.json     # 积分历史（签到明细）
-│   ├── credits_daily.json       # 每日积分快照（三线趋势图数据源）
-│   ├── remaining_credits.json   # 各账号剩余积分缓存
-│   ├── account_cooldowns.json   # 签到错误冷却状态
-│   ├── api_pool.json            # API 账号池配置
-│   └── profiles/                # 登录态快照（按账号 ID 分目录）
-│       ├── current_account.txt  # 当前活跃账号 ID
-│       └── <user_id>/           # 各账号登录态备份
-└── logs/                        # proxy / checkin / switcher / api / proxy-requests 日志
+│   ├── aiwork.sqlite            # 全量状态库（账号 / 分组 / 积分 / 设备映射 / 签到结果 /
+│   │                            #   API 池与 Key / 模型目录 / 用量统计 / WorkBuddy / 豆包状态）
+│   ├── backup/                  # 首次升级时旧版 JSON 数据自动迁入 SQLite 后的备份
+│   ├── certs/                   # 自签 CA 证书
+│   ├── profiles*/               # 各应用登录态快照（按账号 ID 分目录 + .bak 单代回滚）
+│   └── exports/                 # 对话记录等导出产物
+└── logs/                        # proxy / checkin / switcher / api 日志
 ```
+
+> 从 3.4.x 之前的版本升级：旧版 `data/` 下的 JSON 状态文件会在首次启动时**自动导入 SQLite** 并移入 `data/backup/`，无需手动迁移。
 
 ## 文档
 
 - [更新日志](CHANGELOG.md) — 各版本变更记录
 - [用户手册](docs/user-manual.md) — 功能说明与使用指南
 - [产品设计](docs/product-design.md) — 需求与产品设计基线（v1.0/v2.0）
-- [产品优化需求清单](docs/product-optimization-backlog.md) — 全项目唯一待办依据（需求概述/实现路径/参考开源项目）
+- [产品优化需求清单](docs/backlog.md) — 全项目唯一待办依据（需求概述/实现路径/参考开源项目）
 - [技术架构设计](docs/tech-framework.md) — 架构/数据模型/协议参考（含 WorkBuddy、豆包协议附录与开源仓库映射）/开发运维
 
 ## 赞赏

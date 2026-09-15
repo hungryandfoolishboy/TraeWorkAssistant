@@ -1,9 +1,6 @@
 use std::path::PathBuf;
-use std::os::windows::process::CommandExt;
-use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use crate::fs_utils;
 use crate::models::Settings;
 
 /// 应用数据目录名（品牌 ai-work-assistant）
@@ -131,13 +128,12 @@ fn dir_is_empty(dir: &PathBuf) -> Option<bool> {
 
 /// 应用全局状态。base_dir 指向 %APPDATA%\AIWorkAssistant；
 /// 子目录: conf/ (配置), data/ (数据), logs/ (日志)
-/// python_dir 指向打包后的 python 脚本目录（Tauri resource `python/`）。
+/// Clone 支持把状态克隆进后台工作线程（签到/任务等直调场景）。
+#[derive(Clone)]
 pub struct AppState {
     pub data_dir: PathBuf,
-    pub python_dir: PathBuf,
-    pub python_exe: String,
-    /// JWT 刷新锁：防止多个并发请求同时 ExchangeToken
-    pub jwt_refresh_lock: Mutex<()>,
+    /// JWT 刷新锁：防止多个并发请求同时 ExchangeToken（Arc 共享跨线程）
+    pub jwt_refresh_lock: Arc<Mutex<()>>,
 }
 
 /// 配置文件名列表（路由到 conf/ 目录）
@@ -161,23 +157,9 @@ impl AppState {
         let _ = std::fs::create_dir_all(&data_subdir);
         let _ = std::fs::create_dir_all(&logs_dir);
 
-        // python 脚本目录：优先取 Tauri 资源目录下的 python/，否则回退到源码目录
-        let python_dir = resolve_python_dir();
-
-        // python 解释器：资源目录内嵌的 python.exe 优先（须能自举导入标准库）；否则探测系统可用解释器。
-        // Windows 官方安装通常提供 python.exe / py.exe，python3 反而常不存在，故依次探测。
-        let embedded = python_dir.join("python.exe");
-        let python_exe = if embedded.exists() && python_can_bootstrap(&embedded.to_string_lossy()) {
-            embedded.to_string_lossy().to_string()
-        } else {
-            probe_python_exe()
-        };
-
         Ok(Self {
             data_dir,
-            python_dir,
-            python_exe,
-            jwt_refresh_lock: Mutex::new(()),
+            jwt_refresh_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -224,8 +206,9 @@ impl AppState {
     }
 
     pub fn settings(&self) -> Settings {
-        // 统一走 fs_utils::read_json：文件缺失/为空/解析失败均回退默认，行为一致
-        let mut s: Settings = fs_utils::read_json(&self.conf_path("app_settings.json"));
+        // SQLite 化（docs/sqllite-storage-plan.md P2）：kv 文档读取，
+        // 缺失/为空/解析失败均回退默认（与原 fs_utils::read_json 语义一致）
+        let mut s: Settings = crate::store::db(&self.data_dir).kv_get("app_settings");
         // proxy_domains 为空时回填默认值，确保设置页始终展示默认监听域名；
         // 仍为旧默认（未含 doubao.com）时也迁移到新默认（用户未自定义过才替换）
         if s.proxy_domains.trim().is_empty()
@@ -246,82 +229,5 @@ impl AppState {
     }
 }
 
-/// 定位 python 脚本目录：覆盖安装版(MSI/NSIS)、便携版(zip 直接运行)、开发期三种布局。
-fn resolve_python_dir() -> PathBuf {
-    // 1) 运行期 Tauri 注入的资源目录：<RESOURCE_DIR>/python
-    if let Ok(res) = std::env::var("TAURI_RESOURCE_DIR") {
-        let p = PathBuf::from(res).join("python");
-        if p.exists() {
-            return p;
-        }
-    }
-    // 2) 可执行文件周边布局（便携版 sidecar / 安装版均可能命中）
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            // dir/resources/python
-            let c1 = dir.join("resources").join("python");
-            if c1.exists() {
-                return c1;
-            }
-            // dir/python（少数打包方式把 python 放 exe 同级）
-            let c2 = dir.join("python");
-            if c2.exists() {
-                return c2;
-            }
-            // 上层再找 resources/python（如 exe 在 "<App>/ai-work-assistant.exe" 嵌套一层）
-            if let Some(parent) = dir.parent() {
-                let c3 = parent.join("resources").join("python");
-                if c3.exists() {
-                    return c3;
-                }
-            }
-        }
-    }
-    // 3) 开发期：仓库 src-python
-    PathBuf::from("src-python")
-}
-
-/// 定位 ps 脚本目录：与 python 目录同级，覆盖安装版/便携版/开发期。
-pub fn resolve_ps_dir() -> PathBuf {
-    let py = resolve_python_dir();
-    // 安装/便携版：python 与 ps 都在 <RESOURCE_DIR> 下，故用 python 的父目录
-    if let Some(parent) = py.parent() {
-        let ps = parent.join("ps");
-        if ps.exists() {
-            return ps;
-        }
-    }
-    // 开发期：python 在 src-python，ps 在 src-ps
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let c = dir.join("resources").join("ps");
-            if c.exists() {
-                return c;
-            }
-        }
-    }
-    PathBuf::from("src-ps")
-}
-
-/// 验证解释器能否自举（成功导入标准库 encodings）。
-/// 注意 `--version` 不触发 stdlib 导入，残缺运行时（如缺 Lib/encodings 的内嵌 Python，
-/// 报 "Fatal Python error: Failed to import encodings module"）也能通过，故必须用 import 探测。
-fn python_can_bootstrap(exe: &str) -> bool {
-    Command::new(exe)
-        .args(["-c", "import encodings"])
-        .creation_flags(0x08000000)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// 探测系统可用的 Python 解释器，依次尝试 python / python3 / py。
-/// 均不可用时兜底返回 "python3"（保持原行为，由上层在启动时报错提示）。
-fn probe_python_exe() -> String {
-    for cand in ["python", "python3", "py"] {
-        if python_can_bootstrap(cand) {
-            return cand.to_string();
-        }
-    }
-    "python3".to_string()
-}
+// （PS 桥 Rust 化后 resolve_ps_dir 与 tauri.conf.json resources 的 ps/ 资源一并移除——
+// 切换/保存/备份/恢复/保活全链路由 switcher 模块进程内直调，无外部运行时依赖）

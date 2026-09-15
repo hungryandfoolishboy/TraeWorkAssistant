@@ -81,7 +81,7 @@ pub fn derive_device(uid: &str) -> DeviceEntry {
 /// 否则按 uid 确定性派生（与签到脚本同算法，无需写盘）。
 /// 参数为 &AppState（tauri State 经 Deref 自动传入，测试也可直接构造）
 pub fn resolve_device(state: &crate::state::AppState, uid: &str) -> DeviceEntry {
-    let map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
+    let map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
     map.get(uid)
         .cloned()
         .unwrap_or_else(|| derive_device(uid))
@@ -159,8 +159,8 @@ pub fn accounts_list(state: State<AppState>) -> Vec<AccountView> {
 #[tauri::command]
 pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, String> {
     let accounts = crate::vault::load_accounts(&state);
-    let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
-    let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
+    let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
+    let device_map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
     let views = build_account_views(&state);
 
     let merged: Vec<serde_json::Value> = views
@@ -296,7 +296,7 @@ pub fn accounts_import(
     let (accounts_arr, groups_arr) = parse_import_file(&content)?;
 
     let mut accounts = crate::vault::load_accounts(&state);
-    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
 
     // 已有 uid 集合（user_id 字段 + JWT 解析），与自动发现共用同一去重口径
     let mut known: std::collections::HashSet<String> = build_known_uids(&accounts);
@@ -388,13 +388,17 @@ pub fn accounts_import(
             added_at: Some(fs_utils::now_iso()),
             updated_at: Some(fs_utils::now_iso()),
             dc_id: pick_str(entry, &["dcId", "DcID", "dc_id"]),
+            // refresh_token 生命周期字段（F-78 批次 3）：导入账号从零计数
+            refresh_token_expires_at: None,
+            refresh_token_fails: 0,
+            refresh_token_invalid: false,
         });
         report.added += 1;
     }
 
     if report.added > 0 || report.groups_added > 0 {
         crate::vault::save_accounts(&state, &mut accounts)?;
-        fs_utils::write_json(&state.path("groups.json"), &groups)?;
+        crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
         fs_utils::app_log(
             &state.data_dir,
             &format!(
@@ -483,7 +487,7 @@ pub fn accounts_import_preview(
     let (accounts_arr, groups_arr) = parse_import_file(&content)?;
     let accounts = crate::vault::load_accounts(&state);
     let known = build_known_uids(&accounts);
-    let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     let existing_group_ids: std::collections::HashSet<String> =
         groups.groups.iter().map(|g| g.id.clone()).collect();
 
@@ -563,12 +567,15 @@ pub fn account_add_manual(
         added_at: Some(fs_utils::now_iso()),
         updated_at: Some(fs_utils::now_iso()),
         dc_id: None,
+        refresh_token_expires_at: None,
+        refresh_token_fails: 0,
+        refresh_token_invalid: false,
     });
     crate::vault::save_accounts(&state, &mut accounts)?;
     if let Some(g) = group_id {
-        let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+        let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
         groups.membership.insert(uid, g);
-        fs_utils::write_json(&state.path("groups.json"), &groups)?;
+        crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     }
     Ok(())
 }
@@ -587,9 +594,9 @@ pub fn account_delete(
     // 同步清理 vault 中的凭据记录（失败仅记录日志，不阻断删除）
     crate::vault::remove_secret(&state, &user_id);
 
-    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     groups.membership.remove(&user_id);
-    fs_utils::write_json(&state.path("groups.json"), &groups)?;
+    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
 
     if delete_profile {
         // P0 防目录逃逸：user_id 直接拼进 profiles/ 路径并整目录删除，先做字符集白名单校验
@@ -669,7 +676,7 @@ pub struct GroupView {
 
 #[tauri::command]
 pub fn groups_list(state: State<AppState>) -> Vec<GroupView> {
-    let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     groups
         .groups
         .iter()
@@ -695,7 +702,7 @@ pub fn groups_list(state: State<AppState>) -> Vec<GroupView> {
 
 #[tauri::command]
 pub fn group_create(state: State<AppState>, name: String, color: String) -> Result<String, String> {
-    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     let id = format!("g_{}", chrono::Local::now().timestamp_millis());
     let order = (groups.groups.len() as i32) + 1;
     groups.groups.push(Group {
@@ -704,7 +711,7 @@ pub fn group_create(state: State<AppState>, name: String, color: String) -> Resu
         color,
         order,
     });
-    fs_utils::write_json(&state.path("groups.json"), &groups)?;
+    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     Ok(id)
 }
 
@@ -716,7 +723,7 @@ pub fn group_update(
     color: Option<String>,
     order: Option<i32>,
 ) -> Result<(), String> {
-    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     let g = groups
         .groups
         .iter_mut()
@@ -731,16 +738,16 @@ pub fn group_update(
     if let Some(o) = order {
         g.order = o;
     }
-    fs_utils::write_json(&state.path("groups.json"), &groups)?;
+    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     Ok(())
 }
 
 #[tauri::command]
 pub fn group_delete(state: State<AppState>, id: String) -> Result<(), String> {
-    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     groups.groups.retain(|g| g.id != id);
     groups.membership.retain(|_, v| *v != id);
-    fs_utils::write_json(&state.path("groups.json"), &groups)?;
+    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     Ok(())
 }
 
@@ -750,7 +757,7 @@ pub fn group_move(
     user_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     match group_id {
         Some(g) => {
             groups.membership.insert(user_id, g);
@@ -759,7 +766,7 @@ pub fn group_move(
             groups.membership.remove(&user_id);
         }
     }
-    fs_utils::write_json(&state.path("groups.json"), &groups)?;
+    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     Ok(())
 }
 
@@ -782,10 +789,15 @@ struct CreditStats {
     general: f64,
     /// Work 积分剩余
     work: f64,
+    /// 本周期积分包总额度（有效积分包 credits_limit 合计；到期日历「剩余 X / 总 Y」）
+    total_limit: f64,
     /// 最近一个仍未用完且未过期的积分包过期时间（Unix 秒）
     earliest_expire: Option<i64>,
-    /// 今日购买获得积分（charge_amount > 0 且 start_time 在今日）
-    today_non_checkin_earned: f64,
+    /// 各日期新开积分包额度聚合（键=北京时间日期）：
+    /// entitlement_base_info.start_time 即积分包 CycleStartTime（如
+    /// "2026-09-14 15:52:38"），某日获得积分 = 该日新开全部积分包 credits_limit
+    /// 合计（签到包与购买包均计）；覆盖范围受 API 返回的包历史限制
+    pack_earned_daily: std::collections::BTreeMap<String, f64>,
     /// 会员套餐到期时间（Unix 秒，如「会员 Lite 连续包月」包的 end_time）
     membership_expire: Option<i64>,
     /// 会员套餐下次自动续费扣款时间（Unix 秒，next_billing_time）
@@ -918,26 +930,15 @@ fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, S
     let mut total: f64 = 0.0;
     let mut general: f64 = 0.0;
     let mut work: f64 = 0.0;
+    let mut total_limit: f64 = 0.0;
     let mut earliest_expire: Option<i64> = None;
-    let mut today_non_checkin_earned: f64 = 0.0;
+    let mut pack_earned_daily: std::collections::BTreeMap<String, f64> = Default::default();
     let mut membership_expire: Option<i64> = None;
     let mut membership_next_billing: Option<i64> = None;
 
     // 使用固定 UTC+8 偏移，不依赖 chrono::Local（某些 Windows 环境下可能误判时区）
     let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
     let now_ts = chrono::Utc::now().timestamp();
-
-    // 今日北京时间范围 [00:00:00 +08:00, 23:59:59 +08:00]
-    // start_time 来自 API 是 UTC Unix 时间戳，比较时需要按北京时间判定日期
-    let today_start = chrono::Utc::now()
-        .with_timezone(&cst)
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_local_timezone(cst)
-        .unwrap()
-        .timestamp();
-    let today_end = today_start + 86400;
 
     for pack in &packs {
         // ---- 会员套餐到期时间（不限积分包，扫描全部权益包）----
@@ -979,6 +980,8 @@ fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, S
                 .unwrap_or(0.0);
             let remaining = (limit - used).max(0.0);
             total += remaining;
+            // 本周期总额度：与剩余同口径（有 credits_limit 的包）求和
+            total_limit += limit;
 
             // product_id == 209 → Work 积分，其余归入通用积分
             let product_id = pack
@@ -1002,23 +1005,23 @@ fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, S
                 }
             }
 
-            // 今日购买获得的积分：
-            // start_time 在今日北京时间范围内，且 charge_amount > 0（实际付费购买）
-            // 签到获得的 pack charge_amount=0，不会误判为购买积分
+            // 获得积分归日（积分包 CycleStartTime 口径）：
+            // entitlement_base_info.start_time 即该包 CycleStartTime，某日获得积分 =
+            // 该日新开全部积分包的 credits_limit 合计。签到包（charge_amount=0）与
+            // 购买包（>0）均计入——不能按「签到 delta 合计」算（漏购买），也不能按
+            // 「total - 昨日total + consumed」恒等式反推（包过期/消耗波动虚增，
+            // 实测昨日 earned 虚增至 1300）。
             let start_time = pack
                 .get("entitlement_base_info")
                 .and_then(|e| e.get("start_time"))
                 .and_then(|v| v.as_i64());
-            let charge_amount = pack
-                .get("entitlement_base_info")
-                .and_then(|e| e.get("charge_amount"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            // charge_amount > 0 表示付费购买（如会员连续包月），签到 pack charge_amount=0
-            let is_purchased = charge_amount > 0;
             if let Some(st) = start_time {
-                if st >= today_start && st < today_end && is_purchased {
-                    today_non_checkin_earned += limit;
+                // start_time 为 UTC 秒，按固定 UTC+8 归日
+                let date = chrono::TimeZone::timestamp_opt(&chrono::Utc, st, 0)
+                    .single()
+                    .map(|dt| dt.with_timezone(&cst).date_naive().to_string());
+                if let Some(date) = date {
+                    *pack_earned_daily.entry(date).or_insert(0.0) += limit;
                 }
             }
         }
@@ -1033,8 +1036,9 @@ fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, S
         total: r2(total),
         general: r2(general),
         work: r2(work),
+        total_limit: r2(total_limit),
         earliest_expire,
-        today_non_checkin_earned: r2(today_non_checkin_earned),
+        pack_earned_daily,
         membership_expire,
         membership_next_billing,
     })
@@ -1138,10 +1142,11 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
     let dev = resolve_device(&state, &user_id);
     let stats = calc_remaining_credits(jwt, &dev)?;
     // 写入缓存
-    let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
+    let mut rc: RemainingCreditsFile = crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
     rc.credits.insert(user_id.clone(), stats.total);
     rc.general.insert(user_id.clone(), stats.general);
     rc.work.insert(user_id.clone(), stats.work);
+    rc.total_limit.insert(user_id.clone(), stats.total_limit);
     if let Some(exp) = stats.earliest_expire {
         rc.expire_times.insert(user_id.clone(), exp);
     }
@@ -1162,20 +1167,28 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
         }
     }
     rc.updated_at = Some(fs_utils::now_iso());
-    fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
+    crate::store::docs::remaining_credits_save(&crate::store::db(&state.data_dir), &rc)?;
     Ok(stats.total)
 }
 
 /// 刷新所有账号的剩余积分（批量请求 API），返回成功数量。
+/// 刷新所有账号剩余积分（管理页/积分页刷新按钮入口）。
 /// 同时执行自动解冻：签到成功且有积分（credits > 0）且冷却类型非 SessionDead → 清除冷却。
 #[tauri::command(async)]
 pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String> {
-    let accounts = crate::vault::load_accounts(&state);
-    let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
-    let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    refresh_remaining_credits_impl(&state)
+}
+
+/// 刷新实现（供 Tauri 命令与 `--task-run refresh-credits` CLI 任务共用）：
+/// 逐账号查询积分包 → 回写 remaining_credits.json → 按 CycleStartTime 归日口径
+/// 重算 credits_daily.json 快照（今日 earned + API 可见历史修正）。
+pub fn refresh_remaining_credits_impl(state: &AppState) -> Result<usize, String> {
+    let accounts = crate::vault::load_accounts(state);
+    let mut rc: RemainingCreditsFile = crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
+    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     let mut ok_count = 0usize;
     let mut thawed_count = 0usize;
-    let mut total_non_checkin_earned: f64 = 0.0;
+    let mut pack_earned_daily: std::collections::BTreeMap<String, f64> = Default::default();
     for a in &accounts.accounts {
         let uid = a
             .user_id
@@ -1191,6 +1204,7 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
                 rc.credits.insert(uid.clone(), stats.total);
                 rc.general.insert(uid.clone(), stats.general);
                 rc.work.insert(uid.clone(), stats.work);
+                rc.total_limit.insert(uid.clone(), stats.total_limit);
                 if let Some(exp) = stats.earliest_expire {
                     rc.expire_times.insert(uid.clone(), exp);
                 }
@@ -1210,7 +1224,10 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
                         rc.membership_next_billing.remove(&uid);
                     }
                 }
-                total_non_checkin_earned += stats.today_non_checkin_earned;
+                // 各账号包起始日聚合合并（跨账号同日累加）
+                for (d, e) in &stats.pack_earned_daily {
+                    *pack_earned_daily.entry(d.clone()).or_insert(0.0) += e;
+                }
                 ok_count += 1;
                 // 自动解冻：有积分 + 冷却类型非 SessionDead → 清除
                 if stats.total > 0.0 {
@@ -1240,32 +1257,38 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
         }
     }
     rc.updated_at = Some(fs_utils::now_iso());
-    fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
+    crate::store::docs::remaining_credits_save(&crate::store::db(&state.data_dir), &rc)?;
 
     // 记录每日积分快照（total / earned / consumed）
-    record_daily_snapshot(&state, &rc, total_non_checkin_earned);
+    record_daily_snapshot(state, &rc, &pack_earned_daily);
 
     if thawed_count > 0 {
         cd.updated_at = Some(fs_utils::now_iso());
-        fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
+        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
     }
     Ok(ok_count)
 }
 
 /// 记录每日积分快照（每次刷新剩余积分时计算）：
 /// - total = 所有账号剩余积分之和
+/// - earned = 积分包 CycleStartTime 归日口径：某日获得积分 = 该日新开积分包
+///   （entitlement_base_info.start_time 落在该日）的 credits_limit 合计，签到包与
+///   购买包均计。不能按签到 delta 合计（获得也可能来自购买），也不能按
+///   「total - 昨日total + consumed」恒等式反推——包过期/消耗波动都会被塞进
+///   earned 造成虚增（实测昨日 earned 虚增至 1300）。API 返回历史包时，
+///   可见范围内的历史快照 earned 一并修正。
 /// - consumed 优先取 Trae Work 用量接口今日合计（usage_history.json 的 credits_float，
-///   实际消耗口径，见 commands/usage_history.rs）；无接口数据时回退旧公式
-/// - earned 由恒等式「total = 昨日total + earned - consumed」反推：
-///   earned = total - 昨日total + consumed。
-///   此前 earned 依赖 credits_history.json 的签到 delta 求和，delta 漏记（如今日已签
-///   但 delta=0）时 earned 恒为 0、消耗反被虚增——恒等式口径下数据自愈。
-fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non_checkin_earned: f64) {
+///   实际消耗口径，见 commands/usage_history.rs）；无接口数据时由余额式推算
+fn record_daily_snapshot(
+    state: &AppState,
+    rc: &RemainingCreditsFile,
+    pack_earned_daily: &std::collections::BTreeMap<String, f64>,
+) {
     let today = fs_utils::today_prefix(); // "YYYY-MM-DD"
     let total: f64 = rc.credits.values().sum();
     let total = (total * 100.0).round() / 100.0;
 
-    let mut file: CreditsDailyFile = fs_utils::read_json(&state.path("credits_daily.json"));
+    let mut file: CreditsDailyFile = crate::store::docs::credits_daily_load(&crate::store::db(&state.data_dir));
 
     // 昨日积分总数：取 today 之前最近一条快照
     let yesterday_total = file
@@ -1278,7 +1301,7 @@ fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non
 
     // 优先口径：consumed = 用量接口今日合计；earned = total - 昨日total + consumed
     let usage_cache: serde_json::Value =
-        fs_utils::read_json(&state.data_dir.join("data").join("usage_history.json"));
+        crate::store::docs::usage_history_load(&crate::store::db(&state.data_dir));
     let mut usage_consumed: Option<f64> = None;
     if let Some(accs) = usage_cache.get("accounts").and_then(|v| v.as_object()) {
         let mut sum = 0.0;
@@ -1299,28 +1322,21 @@ fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non
         }
     }
 
-    let (earned, consumed) = match usage_consumed {
-        Some(consumed) => {
-            let earned = ((total - yesterday_total + consumed) * 100.0).round() / 100.0;
-            // 恒等式在「消耗 > 全部新增」时为负，earned 语义为「获得」，钳制为 0
-            let earned = if earned < 0.0 { 0.0 } else { earned };
-            (earned, consumed)
-        }
+    let r2 = |v: f64| {
+        let r = (v * 100.0).round() / 100.0;
+        if r == 0.0 { 0.0 } else { r }
+    };
+
+    // earned：今日新开积分包额度合计（CycleStartTime 归今日；今日无新包则为 0）
+    let earned = pack_earned_daily.get(&today).copied().unwrap_or(0.0);
+    let earned = r2(earned);
+
+    let consumed = match usage_consumed {
+        Some(consumed) => consumed,
         None => {
-            // 回退口径（用量接口无今日数据时）：
-            // earned = 签到获得积分（credits_history.json delta 之和）+ 非签到获得积分（API 查询）
-            let credits_file: CreditsFile = fs_utils::read_json(&state.path("credits_history.json"));
-            let checkin_earned: f64 = credits_file
-                .records
-                .iter()
-                .filter(|r| r.date == today && r.user_id != "_daily_total")
-                .map(|r| r.delta as f64)
-                .sum();
-            let earned = ((checkin_earned + non_checkin_earned) * 100.0).round() / 100.0;
-            // consumed = |total - earned - yesterday_total|
-            let consumed = (total - earned - yesterday_total).abs();
-            let consumed = (consumed * 100.0).round() / 100.0;
-            (earned, consumed)
+            // 回退口径（用量接口无今日数据时）：余额式推算 |昨日total + earned - total|
+            let consumed = (yesterday_total + earned - total).abs();
+            r2(consumed)
         }
     };
 
@@ -1331,11 +1347,23 @@ fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non
         existing.consumed = consumed;
     } else {
         file.snapshots.push(CreditsDailySnapshot {
-            date: today,
+            date: today.clone(),
             total,
             earned,
             consumed,
         });
+    }
+
+    // 历史修正：API 可见范围内的历史日期（如昨日已入账的签到/购买包），
+    // 用 CycleStartTime 归日口径覆盖旧 earned（旧值多为恒等式反推的失真数据，
+    // 实测昨日 1300）；无快照的日期不补建（total/consumed 无数据源）
+    for (date, e) in pack_earned_daily {
+        if date == &today {
+            continue;
+        }
+        if let Some(snap) = file.snapshots.iter_mut().find(|s| &s.date == date) {
+            snap.earned = r2(*e);
+        }
     }
 
     // 保留 90 天
@@ -1346,23 +1374,23 @@ fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non
     };
     file.snapshots.retain(|s| s.date >= cutoff);
 
-    let _ = fs_utils::write_json(&state.path("credits_daily.json"), &file);
+    let _ = crate::store::docs::credits_daily_save(&crate::store::db(&state.data_dir), &file);
 }
 
 /// 获取每日积分快照列表
 #[tauri::command]
 pub fn credits_daily_list(state: State<AppState>) -> Vec<CreditsDailySnapshot> {
-    let file: CreditsDailyFile = fs_utils::read_json(&state.path("credits_daily.json"));
+    let file: CreditsDailyFile = crate::store::docs::credits_daily_load(&crate::store::db(&state.data_dir));
     file.snapshots
 }
 
 /// 手动清除指定账号的冷却状态
 #[tauri::command]
 pub fn cooldown_clear(state: State<AppState>, user_id: String) -> Result<(), String> {
-    let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     if cd.cooldowns.remove(&user_id).is_some() {
         cd.updated_at = Some(fs_utils::now_iso());
-        fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
+        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
     }
     Ok(())
 }
@@ -1374,12 +1402,12 @@ pub fn cooldown_clear_all(
     state: State<AppState>,
     runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
 ) -> Result<usize, String> {
-    let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     let file_count = cd.cooldowns.len();
     if file_count > 0 {
         cd.cooldowns.clear();
         cd.updated_at = Some(fs_utils::now_iso());
-        fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
+        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
     }
 
     // 同时清除运行中 API 池的内存冷却状态
@@ -1400,8 +1428,35 @@ pub fn cooldown_clear_all(
 /// 成功后原子写回新 accessToken + refresh_token，返回新 JWT
 // async：内含 ExchangeToken 网络请求（最长 120s），同步命令会冻结 UI（审查修复）
 #[tauri::command(async)]
-pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, String> {
-    refresh_jwt_impl(&state, &user_id)
+pub fn refresh_jwt(
+    state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    user_id: String,
+) -> Result<String, String> {
+    let result = refresh_jwt_impl(&state, &user_id);
+    // F-78 批次 3：运行中 API 池联动——成功解除失效禁用；失败且已判定失效则禁用
+    // （entry 按 uid 命中，Trae 账号在 pool、WB 账号在 wb_pool，双查无害）
+    let guard = runtime.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(rt) = guard.as_ref() {
+        match &result {
+            Ok(new_jwt) => {
+                rt.shared.pool.note_refresh_success(&user_id, new_jwt);
+                rt.shared.wb_pool.note_refresh_success(&user_id, new_jwt);
+            }
+            Err(_) => {
+                let accounts = crate::vault::load_accounts(&state);
+                if accounts
+                    .accounts
+                    .iter()
+                    .any(|a| a.user_id.as_deref() == Some(user_id.as_str()) && a.refresh_token_invalid)
+                {
+                    rt.shared.pool.note_refresh_invalid(&user_id);
+                    rt.shared.wb_pool.note_refresh_invalid(&user_id);
+                }
+            }
+        }
+    }
+    result
 }
 
 /// refresh_jwt 核心逻辑（&AppState，供命令与测试探针共用）
@@ -1426,21 +1481,29 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
         .filter(|s| !s.is_empty())
         .ok_or("该账号无 refresh_token，无法自动刷新")?;
 
-    // 调用 ExchangeToken API
+    // 调用 ExchangeToken API（凭证与端点来自外置配置，缺失回退内置默认）
+    let client = crate::commands::oauth::oauth_client();
     let resp = short_agent()
-        .post("https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken")
+        .post(&client.exchange_url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
         .send_json(ureq::json!({
-            "ClientID": "en1oxy7wnw8j9n",
+            "ClientID": client.client_id,
             "RefreshToken": refresh_token,
-            "ClientSecret": "-",
+            "ClientSecret": client.client_secret,
             "UserID": ""
         }))
-        .map_err(|e| format!("ExchangeToken 请求失败: {}", e))?;
+        .map_err(|e| {
+            let msg = format!("ExchangeToken 请求失败: {}", e);
+            record_refresh_failure(state, user_id, false, &msg);
+            msg
+        })?;
 
-    let body: serde_json::Value =
-        resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
+    let body: serde_json::Value = resp.into_json().map_err(|e| {
+        let msg = format!("解析响应失败: {}", e);
+        record_refresh_failure(state, user_id, false, &msg);
+        msg
+    })?;
 
     let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 {
@@ -1448,7 +1511,10 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
             .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("未知错误");
-        return Err(format!("ExchangeToken 失败 (code={}): {}", code, msg));
+        let err = format!("ExchangeToken 失败 (code={}): {}", code, msg);
+        // 服务端明确拒绝（code != 0）：refresh_token 已失效，立即置 invalid（F-78 批次 3）
+        record_refresh_failure(state, user_id, true, &err);
+        return Err(err);
     }
 
     // F-49 宽容解析：data 信封内字段直接 dig 查找，兼容嵌套包裹
@@ -1470,10 +1536,13 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
     let new_info = jwt::parse(&new_jwt_full);
     if let Some(ref new_uid) = new_info.user_id {
         if new_uid.as_str() != user_id {
-            return Err(format!(
+            // 换发 token 归属他人：refresh_token 已不可信，立即置 invalid（F-78 批次 3）
+            let err = format!(
                 "刷新后 user_id 不匹配: 期望={}, 实际={}",
                 user_id, new_uid
-            ));
+            );
+            record_refresh_failure(state, user_id, true, &err);
+            return Err(err);
         }
     }
 
@@ -1489,6 +1558,24 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
             account.refresh_token = Some(rt);
         }
         account.updated_at = Some(fs_utils::now_iso());
+        // 刷新成功：生命周期计数清零、失效标记解除（F-78 批次 3）
+        account.refresh_token_fails = 0;
+        account.refresh_token_invalid = false;
+        // 若响应携带 refresh_token 过期时间则更新（兼容秒/毫秒两种时间戳）
+        if let Some(exp) = crate::fs_utils::dig(
+            &body,
+            &[
+                "refresh_token_expires_at",
+                "refresh_expires_at",
+                "refreshTokenExpiresAt",
+                "refresh_expires_at_ms",
+            ],
+        )
+        .and_then(|v| v.as_i64())
+        {
+            account.refresh_token_expires_at =
+                Some(if exp > 10_000_000_000 { exp / 1000 } else { exp });
+        }
         account.name.clone()
     };
     crate::vault::save_accounts(&state, &mut accounts)?;
@@ -1496,10 +1583,10 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
     // 自动解冻（含 SessionDead）：新 JWT 刚从 ExchangeToken 换发、必然有效，
     // 此前签到 401 打上的 SessionDead 永久冷却若不清除，调度会永远跳过该账号
     //（自动解冻逻辑明确排除 SessionDead，见 refresh_remaining_credits）
-    let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     if let Some(entry) = cd.cooldowns.remove(user_id) {
         cd.updated_at = Some(fs_utils::now_iso());
-        fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
+        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
         fs_utils::app_log(
             &state.data_dir,
             &format!("JWT 刷新成功自动解冻 [{}]（原冷却类型={}）", log_name, entry.error_type),
@@ -1521,19 +1608,59 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
     Ok(new_jwt_full)
 }
 
+/// 记录一次 refresh_token 刷新失败（F-78 批次 3 生命周期管理）：
+/// 递增连续失败计数；服务端明确拒绝（code != 0 / user_id 不匹配）或连续 3 次失败时
+/// 置 refresh_token_invalid=true，供调度与 UI 提前规避（原实现只能等签到 401 才暴露）。
+/// 刷新成功在 refresh_jwt_impl 写回时清零；重新 OAuth 登录亦会重置（commands/oauth.rs）。
+/// 调用方持有 jwt_refresh_lock，无并发写竞争。
+fn record_refresh_failure(state: &AppState, user_id: &str, rejected: bool, err_msg: &str) {
+    let mut accounts = crate::vault::load_accounts(state);
+    let Some(acct) = accounts
+        .accounts
+        .iter_mut()
+        .find(|a| a.user_id.as_deref() == Some(user_id))
+    else {
+        return;
+    };
+    acct.refresh_token_fails = acct.refresh_token_fails.saturating_add(1);
+    if rejected || acct.refresh_token_fails >= 3 {
+        acct.refresh_token_invalid = true;
+    }
+    acct.updated_at = Some(fs_utils::now_iso());
+    let (name, fails, invalid) =
+        (acct.name.clone(), acct.refresh_token_fails, acct.refresh_token_invalid);
+    if let Err(e) = crate::vault::save_accounts(state, &mut accounts) {
+        fs_utils::app_log(&state.data_dir, &format!("refresh_token 失败计数写入失败: {e}"));
+    }
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "refresh_token 刷新失败 [{}] 连续第 {} 次{}: {}",
+            name,
+            fails,
+            if invalid {
+                "（已标记失效，需重新 OAuth 登录）"
+            } else {
+                ""
+            },
+            err_msg
+        ),
+    );
+}
+
 // ---------------- 内部工具 ----------------
 
 /// 构建账号视图（聚合 JWT / 分组 / 设备 / 积分 / 今日签到 / 冷却状态 / 套餐身份）。
 pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
     let accounts = crate::vault::load_accounts(&state);
-    let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
-    let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
-    let credits: CreditsFile = fs_utils::read_json(&state.path("credits_history.json"));
-    let rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
-    let cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
+    let device_map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
+    let credits: CreditsFile = crate::store::docs::credits_history_load(&crate::store::db(&state.data_dir));
+    let rc: RemainingCreditsFile = crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
+    let cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     let pay: crate::commands::trae_apps::PayStatusFile =
-        fs_utils::read_json(&state.path("pay_status.json"));
-    let summary: CheckinSummary = fs_utils::read_json(&state.path("checkin_summary.json"));
+        crate::store::docs::pay_status_load(&crate::store::db(&state.data_dir));
+    let summary: CheckinSummary = crate::store::db(&state.data_dir).kv_get("checkin_summary");
     let summary_today = summary
         .time
         .as_ref()
@@ -1637,12 +1764,17 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
             credits_expire_at: rc.expire_times.get(&uid).copied(),
             general_credits: rc.general.get(&uid).copied(),
             work_credits: rc.work.get(&uid).copied(),
+            total_credits: rc.total_limit.get(&uid).copied(),
             pay_identity: pay
                 .statuses
                 .get(&uid)
                 .map(|p| p.identity_str.clone()),
             membership_expire: rc.membership_expire.get(&uid).copied(),
             membership_next_billing: rc.membership_next_billing.get(&uid).copied(),
+            // refresh_token 生命周期（F-78 批次 3）：过期时间/连续失败次数/失效标记
+            refresh_token_expires_at: a.refresh_token_expires_at,
+            refresh_token_fails: a.refresh_token_fails,
+            refresh_token_invalid: a.refresh_token_invalid,
         });
     }
     out

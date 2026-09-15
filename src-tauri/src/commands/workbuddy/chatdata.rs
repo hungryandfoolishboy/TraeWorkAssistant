@@ -1,59 +1,112 @@
 //! WorkBuddy M8 会话域（原 workbuddy.rs 机械拆分）：会话三件套备份/恢复/状态（F-44，§3.11）、
 //! 会话复制/迁移·新 id 算法（F-45）。
+//! F-74：按应用域参数化（WorkBuddy / CodeBuddy 双会话域），并抽出与 Tauri 无关的纯函数
+//! 供「切换时自动迁移会话」编排复用。
 //! 函数逻辑零改动，仅将跨子模块引用项提升为 `pub(super)`。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::State;
 
 use crate::fs_utils;
 use crate::state::AppState;
 
-use super::common::{load_pool, wb_chat_uid_guard, wb_data_dir};
+use super::common::{load_pool, wb_chat_uid_guard};
+
+/// F-74：会话域——WorkBuddy 与 CodeBuddy 各有独立会话目录
+///（`~/.workbuddy/projects` / `~/.codebuddy/projects`，token 统计已扫描证实其存在）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BuddyApp {
+    WorkBuddy,
+    CodeBuddy,
+}
+
+impl BuddyApp {
+    /// 宽容解析：空/未知一律回落 WorkBuddy（前端恒传合法值，回落比硬失败更稳）
+    pub fn parse(s: Option<&str>) -> BuddyApp {
+        match s.map(|v| v.trim().to_lowercase()).as_deref() {
+            Some("codebuddy") | Some("cb") => BuddyApp::CodeBuddy,
+            _ => BuddyApp::WorkBuddy,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BuddyApp::WorkBuddy => "WorkBuddy",
+            BuddyApp::CodeBuddy => "CodeBuddy",
+        }
+    }
+
+    /// 客户端数据目录（会话三件套所在地）
+    pub fn data_dir(self) -> PathBuf {
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        PathBuf::from(home).join(match self {
+            BuddyApp::WorkBuddy => ".workbuddy",
+            BuddyApp::CodeBuddy => ".codebuddy",
+        })
+    }
+
+    /// 会话正文目录（三件套 ①）
+    pub fn chats_dir(self) -> PathBuf {
+        self.data_dir().join("projects")
+    }
+
+    /// 备份根：助手数据目录下按应用域分离（`data/workbuddy_chats` / `data/codebuddy_chats`），
+    /// 避免两端会话互相覆盖；WorkBuddy 沿用原目录名，存量备份零迁移
+    pub fn chat_backup_root(self, data_root: &Path) -> PathBuf {
+        data_root.join("data").join(match self {
+            BuddyApp::WorkBuddy => "workbuddy_chats",
+            BuddyApp::CodeBuddy => "codebuddy_chats",
+        })
+    }
+
+    /// 优雅关闭客户端用的进程类别（`commands::process::images_for_app` 入参）
+    pub fn proc_kind(self) -> &'static str {
+        self.label()
+    }
+
+    /// 数据目录人类可读路径（错误文案用，如 `~/.workbuddy`）
+    fn home_hint(self) -> &'static str {
+        match self {
+            BuddyApp::WorkBuddy => "~/.workbuddy",
+            BuddyApp::CodeBuddy => "~/.codebuddy",
+        }
+    }
+}
 
 // ── M8 会话三件套备份/恢复（F-44，批次3 T3.1）─────────────────────────────
 // 三件套（缺一不可，§3.11）：
-//   ① 正文 ~/.workbuddy/projects/{workspace}/{cid}.jsonl（每行含 sessionId）
-//   ② 元数据 ~/.workbuddy/workbuddy.db（sessions 表，id = 会话 UUID）
-//   ③ 云端映射 ~/.workbuddy/edge-sync-mapping-v2.db（edge_sync_mapping 表，msg_channel=convmsg:{uid}）
-// 备份 = 整目录 + 双 db 快照至 data/workbuddy_chats/<uid>/；执行前先优雅关闭客户端。
+//   ① 正文 <data_dir>/projects/{workspace}/{cid}.jsonl（每行含 sessionId）
+//   ② 元数据 <data_dir>/workbuddy.db（sessions 表，id = 会话 UUID）
+//   ③ 云端映射 <data_dir>/edge-sync-mapping-v2.db（edge_sync_mapping 表，msg_channel=convmsg:{uid}）
+// 备份 = 整目录 + 双 db 快照至 data/<app>_chats/<uid>/；执行前先优雅关闭客户端。
 
-fn wb_chats_dir() -> PathBuf {
-    wb_data_dir().join("projects")
-}
-
-fn wb_chat_backup_root(state: &AppState) -> PathBuf {
-    state.data_dir.join("data").join("workbuddy_chats")
-}
-
-/// 备份当前 ~/.workbuddy 会话三件套（先优雅关闭 WorkBuddy）。
-/// 覆盖式备份（保留最新一份），返回 {ok, files, path}。
-#[tauri::command(async)]
-pub fn workbuddy_chatdata_backup(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
-    wb_chat_uid_guard(&state, &user_id)?;
-    if !wb_data_dir().is_dir() {
-        return Err("未找到 WorkBuddy 数据目录（~/.workbuddy），请先安装并登录".into());
+/// 备份会话三件套（纯逻辑，F-74 切换编排复用）。返回 (文件数, 备份目录)。
+pub fn backup_chats(data_root: &Path, app: BuddyApp, user_id: &str) -> Result<(usize, PathBuf), String> {
+    if !app.data_dir().is_dir() {
+        return Err(format!(
+            "未找到 {} 数据目录（{}），请先安装并登录",
+            app.label(),
+            app.home_hint()
+        ));
     }
-    if !wb_chats_dir().is_dir() {
-        return Err("未发现会话正文目录（~/.workbuddy/projects 为空）".into());
+    if !app.chats_dir().is_dir() {
+        return Err(format!("未发现会话正文目录（{}/projects 为空）", app.home_hint()));
     }
-    crate::commands::process::graceful_kill_app("WorkBuddy")?;
+    crate::commands::process::graceful_kill_app(app.proc_kind())?;
 
-    let dest_root = wb_chat_backup_root(&state).join(&user_id);
+    let backup_root = app.chat_backup_root(data_root);
+    let dest_root = backup_root.join(user_id);
     // 先写临时目录（.staging）：复制中断不毁旧备份；校验通过后原子替换（审查 P1-3）
-    let staging = wb_chat_backup_root(&state).join(format!("{user_id}.staging"));
+    let staging = backup_root.join(format!("{user_id}.staging"));
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| format!("创建备份目录失败: {e}"))?;
 
     // ① 会话正文整目录
-    let files = crate::state::copy_dir_recursive(
-        &wb_chats_dir(),
-        &staging.join("projects"),
-        &[],
-    )?;
+    let files = crate::state::copy_dir_recursive(&app.chats_dir(), &staging.join("projects"), &[])?;
     // ②③ 双 db 快照（SQLite 文件级拷贝；客户端已关闭保证一致性）
     let mut db_files = 0usize;
     for db in ["workbuddy.db", "edge-sync-mapping-v2.db"] {
-        let src = wb_data_dir().join(db);
+        let src = app.data_dir().join(db);
         if src.is_file() {
             std::fs::copy(&src, staging.join(db)).map_err(|e| format!("复制 {db} 失败: {e}"))?;
             db_files += 1;
@@ -67,6 +120,7 @@ pub fn workbuddy_chatdata_backup(state: State<AppState>, user_id: String) -> Res
     let meta = serde_json::json!({
         "schemaVersion": 1, "user_id": user_id, "files": files + db_files,
         "has_edge_mapping": db_files == 2,
+        "app": app.label(),
         "backedAt": fs_utils::now_ts(),
     });
     let _ = std::fs::write(
@@ -79,15 +133,29 @@ pub fn workbuddy_chatdata_backup(state: State<AppState>, user_id: String) -> Res
         let _ = std::fs::remove_dir_all(&staging);
         format!("备份目录替换失败: {e}")
     })?;
-    fs_utils::app_log(&state.data_dir, &format!("workbuddy: 会话三件套已备份 {user_id}（{files} 正文 + {db_files} db）"));
-    Ok(serde_json::json!({ "ok": true, "files": files + db_files, "path": dest_root.display().to_string() }))
+    fs_utils::app_log(
+        data_root,
+        &format!("{}: 会话三件套已备份 {user_id}（{files} 正文 + {db_files} db）", app.label()),
+    );
+    Ok((files + db_files, dest_root))
 }
 
-/// 恢复会话三件套到 ~/.workbuddy（先优雅关闭 WorkBuddy；恢复前自动快照现有数据到 .bak）。
+/// 备份当前会话三件套（先优雅关闭客户端）。覆盖式备份（保留最新一份）。
 #[tauri::command(async)]
-pub fn workbuddy_chatdata_restore(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
+pub fn workbuddy_chatdata_backup(
+    state: State<AppState>,
+    user_id: String,
+    app: Option<String>,
+) -> Result<serde_json::Value, String> {
     wb_chat_uid_guard(&state, &user_id)?;
-    let backup = wb_chat_backup_root(&state).join(&user_id);
+    let app = BuddyApp::parse(app.as_deref());
+    let (files, path) = backup_chats(&state.data_dir, app, &user_id)?;
+    Ok(serde_json::json!({ "ok": true, "files": files, "path": path.display().to_string() }))
+}
+
+/// 恢复会话三件套（纯逻辑）。返回恢复文件数。
+pub fn restore_chats(data_root: &Path, app: BuddyApp, user_id: &str) -> Result<usize, String> {
+    let backup = app.chat_backup_root(data_root).join(user_id);
     if !backup.is_dir() {
         return Err(format!("该账号没有会话备份：{}", backup.display()));
     }
@@ -95,19 +163,20 @@ pub fn workbuddy_chatdata_restore(state: State<AppState>, user_id: String) -> Re
     if !projects_backup.is_dir() {
         return Err("备份缺少 projects 正文目录（备份不完整）".into());
     }
-    crate::commands::process::graceful_kill_app("WorkBuddy")?;
+    crate::commands::process::graceful_kill_app(app.proc_kind())?;
+    let home = app.data_dir();
 
     // 恢复前保护现场：现有 projects/db → 同名 .bak（单代，成功后保留供手动回退）
-    if wb_chats_dir().is_dir() {
-        let bak = wb_data_dir().join("projects.bak");
+    if app.chats_dir().is_dir() {
+        let bak = home.join("projects.bak");
         let _ = std::fs::remove_dir_all(&bak);
-        std::fs::rename(&wb_chats_dir(), &bak).map_err(|e| format!("快照现有 projects 失败: {e}"))?;
+        std::fs::rename(&app.chats_dir(), &bak).map_err(|e| format!("快照现有 projects 失败: {e}"))?;
     }
-    std::fs::create_dir_all(wb_chats_dir()).map_err(|e| format!("重建 projects 目录失败: {e}"))?;
+    std::fs::create_dir_all(app.chats_dir()).map_err(|e| format!("重建 projects 目录失败: {e}"))?;
     for db in ["workbuddy.db", "edge-sync-mapping-v2.db"] {
-        let src = wb_data_dir().join(db);
+        let src = home.join(db);
         if src.is_file() {
-            let _ = std::fs::rename(&src, wb_data_dir().join(format!("{db}.bak")));
+            let _ = std::fs::rename(&src, home.join(format!("{db}.bak")));
         }
     }
 
@@ -118,15 +187,15 @@ pub fn workbuddy_chatdata_restore(state: State<AppState>, user_id: String) -> Re
                 Ok(v) => v,
                 Err(e) => {
                     // 回滚：projects.bak → projects、*.db.bak → *.db
-                    let bak = wb_data_dir().join("projects.bak");
+                    let bak = home.join("projects.bak");
                     if bak.is_dir() {
-                        let _ = std::fs::remove_dir_all(wb_chats_dir());
-                        let _ = std::fs::rename(&bak, wb_chats_dir());
+                        let _ = std::fs::remove_dir_all(app.chats_dir());
+                        let _ = std::fs::rename(&bak, app.chats_dir());
                     }
                     for db in ["workbuddy.db", "edge-sync-mapping-v2.db"] {
-                        let dbbak = wb_data_dir().join(format!("{db}.bak"));
-                        if dbbak.is_file() && !wb_data_dir().join(db).exists() {
-                            let _ = std::fs::rename(&dbbak, wb_data_dir().join(db));
+                        let dbbak = home.join(format!("{db}.bak"));
+                        if dbbak.is_file() && !home.join(db).exists() {
+                            let _ = std::fs::rename(&dbbak, home.join(db));
                         }
                     }
                     return Err(format!("{}: {e}（已自动回滚到恢复前现场）", $msg));
@@ -136,7 +205,7 @@ pub fn workbuddy_chatdata_restore(state: State<AppState>, user_id: String) -> Re
     }
 
     let files = rollback_on_fail!(
-        crate::state::copy_dir_recursive(&projects_backup, &wb_chats_dir(), &[]),
+        crate::state::copy_dir_recursive(&projects_backup, &app.chats_dir(), &[]),
         "恢复会话正文失败"
     );
     let mut db_files = 0usize;
@@ -144,7 +213,7 @@ pub fn workbuddy_chatdata_restore(state: State<AppState>, user_id: String) -> Re
         let src = backup.join(db);
         if src.is_file() {
             rollback_on_fail!(
-                std::fs::copy(&src, wb_data_dir().join(db)).map(|_| ()),
+                std::fs::copy(&src, home.join(db)).map(|_| ()),
                 format!("恢复 {db} 失败").as_str()
             );
             db_files += 1;
@@ -153,15 +222,37 @@ pub fn workbuddy_chatdata_restore(state: State<AppState>, user_id: String) -> Re
     if files == 0 || db_files == 0 {
         return Err(format!("恢复失败（正文 {files} 文件 + {db_files} db），现场已保留 .bak 可手动回退"));
     }
-    fs_utils::app_log(&state.data_dir, &format!("workbuddy: 会话三件套已恢复 {user_id}（{files} 正文 + {db_files} db）"));
-    Ok(serde_json::json!({ "ok": true, "files": files + db_files }))
+    fs_utils::app_log(
+        data_root,
+        &format!("{}: 会话三件套已恢复 {user_id}（{files} 正文 + {db_files} db）", app.label()),
+    );
+    Ok(files + db_files)
+}
+
+/// 恢复会话三件套到客户端数据目录（先优雅关闭客户端；恢复前自动快照现有数据到 .bak）。
+#[tauri::command(async)]
+pub fn workbuddy_chatdata_restore(
+    state: State<AppState>,
+    user_id: String,
+    app: Option<String>,
+) -> Result<serde_json::Value, String> {
+    wb_chat_uid_guard(&state, &user_id)?;
+    let app = BuddyApp::parse(app.as_deref());
+    let files = restore_chats(&state.data_dir, app, &user_id)?;
+    Ok(serde_json::json!({ "ok": true, "files": files }))
 }
 
 /// 会话备份状态（供账号卡片展示：是否有备份 / 时间 / 体积）。
 #[tauri::command]
-pub fn workbuddy_chatdata_info(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
+pub fn workbuddy_chatdata_info(
+    state: State<AppState>,
+    user_id: String,
+    app: Option<String>,
+) -> Result<serde_json::Value, String> {
     wb_chat_uid_guard(&state, &user_id)?;
-    let dir = wb_chat_backup_root(&state).join(&user_id);
+    let dir = BuddyApp::parse(app.as_deref())
+        .chat_backup_root(&state.data_dir)
+        .join(&user_id);
     if !dir.is_dir() {
         return Ok(serde_json::json!({ "backed": false }));
     }
@@ -228,27 +319,22 @@ struct WbChatCopyItem {
     sessions_row_cloned: bool,
 }
 
-/// 复制/迁移会话：source_user_id 的会话（备份优先，其次现有 projects）以新 id
-/// 写入当前 ~/.workbuddy，并注册到目标账号的云端映射（convmsg:{target}）。
-#[tauri::command(async)]
-pub fn workbuddy_chatdata_copy(
-    state: State<AppState>,
-    source_user_id: String,
-    target_user_id: String,
+/// 复制/迁移会话（纯逻辑，F-74 切换编排复用）：source 的会话（备份优先，其次现有
+/// projects）以新 id 写入当前 projects，并注册到目标账号的云端映射（convmsg:{target}）。
+///
+/// 账号池存在性校验留在命令层（切换编排的源/目标均取自池内已确认的账号 id）。
+pub fn copy_chats(
+    data_root: &Path,
+    app: BuddyApp,
+    source_user_id: &str,
+    target_user_id: &str,
 ) -> Result<serde_json::Value, String> {
     if source_user_id == target_user_id {
         return Err("源与目标账号相同，无需复制".into());
     }
-    let pool = load_pool(&state);
-    if !pool.accounts.iter().any(|a| a.id == source_user_id) {
-        return Err(format!("源账号不在池中: {source_user_id}"));
-    }
-    if !pool.accounts.iter().any(|a| a.id == target_user_id) {
-        return Err(format!("目标账号不在池中: {target_user_id}"));
-    }
     // 会话正文来源：源账号备份优先（只读安全），否则现有 projects
-    let backup_projects = wb_chat_backup_root(&state).join(&source_user_id).join("projects");
-    let live_projects = wb_chats_dir();
+    let backup_projects = app.chat_backup_root(data_root).join(source_user_id).join("projects");
+    let live_projects = app.chats_dir();
     let (src_projects, src_label) = if backup_projects.is_dir() {
         (backup_projects, format!("备份({source_user_id})"))
     } else if live_projects.is_dir() {
@@ -257,14 +343,14 @@ pub fn workbuddy_chatdata_copy(
         return Err("未找到可复制的会话正文（该账号无备份且 ~/.workbuddy/projects 为空）".into());
     };
 
-    crate::commands::process::graceful_kill_app("WorkBuddy")?;
+    crate::commands::process::graceful_kill_app(app.proc_kind())?;
 
     // 复制前快照双 db（design: backup_workbuddy_db；.pre-copy.bak 单代覆盖）
     let mut db_pre = 0usize;
     for db in ["workbuddy.db", "edge-sync-mapping-v2.db"] {
-        let p = wb_data_dir().join(db);
+        let p = app.data_dir().join(db);
         if p.is_file() {
-            std::fs::copy(&p, wb_data_dir().join(format!("{db}.pre-copy.bak")))
+            std::fs::copy(&p, app.data_dir().join(format!("{db}.pre-copy.bak")))
                 .map_err(|e| format!("预备份 {db} 失败: {e}"))?;
             db_pre += 1;
         }
@@ -337,7 +423,7 @@ pub fn workbuddy_chatdata_copy(
     }
 
     // ③ sessions 表整行克隆（workbuddy.db；id = 会话 UUID）
-    let main_db = wb_data_dir().join("workbuddy.db");
+    let main_db = app.data_dir().join("workbuddy.db");
     let mut sessions_cloned = 0usize;
     if main_db.is_file() {
         if let Ok(conn) = rusqlite::Connection::open(&main_db) {
@@ -398,7 +484,7 @@ pub fn workbuddy_chatdata_copy(
     }
 
     // ④ edge_sync_mapping 云端映射：把含 convmsg:{source} 的行克隆并替换为 convmsg:{target}
-    let edge_db = wb_data_dir().join("edge-sync-mapping-v2.db");
+    let edge_db = app.data_dir().join("edge-sync-mapping-v2.db");
     let mut mappings = 0usize;
     if edge_db.is_file() {
         let old_channel = format!("convmsg:{source_user_id}");
@@ -482,9 +568,10 @@ pub fn workbuddy_chatdata_copy(
     let copied = items.len();
     let total_lines: usize = items.iter().map(|i| i.jsonl_lines).sum();
     fs_utils::app_log(
-        &state.data_dir,
+        data_root,
         &format!(
-            "workbuddy: 会话复制 {source_user_id} → {target_user_id}（{copied} 会话 / {total_lines} 行，sessions 克隆 {sessions_cloned}，映射注册 {mappings}，预备份 {db_pre} db）"
+            "{}: 会话复制 {source_user_id} → {target_user_id}（{copied} 会话 / {total_lines} 行，sessions 克隆 {sessions_cloned}，映射注册 {mappings}，预备份 {db_pre} db）",
+            app.label()
         ),
     );
     Ok(serde_json::json!({
@@ -497,6 +584,60 @@ pub fn workbuddy_chatdata_copy(
         "source": src_label,
         "items": items,
     }))
+}
+
+/// 复制会话到目标账号（F-45）：新 id 复制 + 云端映射注册。
+/// app = "WorkBuddy"（默认）/"CodeBuddy"，决定会话域与备份根。
+#[tauri::command(async)]
+pub fn workbuddy_chatdata_copy(
+    state: State<AppState>,
+    source_user_id: String,
+    target_user_id: String,
+    app: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let pool = load_pool(&state);
+    if !pool.accounts.iter().any(|a| a.id == source_user_id) {
+        return Err(format!("源账号不在池中: {source_user_id}"));
+    }
+    if !pool.accounts.iter().any(|a| a.id == target_user_id) {
+        return Err(format!("目标账号不在池中: {target_user_id}"));
+    }
+    drop(pool);
+    copy_chats(
+        &state.data_dir,
+        BuddyApp::parse(app.as_deref()),
+        &source_user_id,
+        &target_user_id,
+    )
+}
+
+#[cfg(test)]
+mod f74_app_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn 应用域解析_未知回落workbuddy() {
+        assert_eq!(BuddyApp::parse(None), BuddyApp::WorkBuddy);
+        assert_eq!(BuddyApp::parse(Some("WorkBuddy")), BuddyApp::WorkBuddy);
+        assert_eq!(BuddyApp::parse(Some("codebuddy")), BuddyApp::CodeBuddy);
+        assert_eq!(BuddyApp::parse(Some(" CodeBuddy ")), BuddyApp::CodeBuddy);
+        // 未知值宽容回落，不硬失败
+        assert_eq!(BuddyApp::parse(Some("qq")), BuddyApp::WorkBuddy);
+    }
+
+    #[test]
+    fn 两域数据目录与备份根互不干扰() {
+        let root = Path::new("D:\\data");
+        let wb = BuddyApp::WorkBuddy;
+        let cb = BuddyApp::CodeBuddy;
+        assert_eq!(wb.chat_backup_root(root), root.join("data").join("workbuddy_chats"));
+        assert_eq!(cb.chat_backup_root(root), root.join("data").join("codebuddy_chats"));
+        assert_ne!(wb.data_dir(), cb.data_dir());
+        assert_ne!(wb.chats_dir(), cb.chats_dir());
+        assert_eq!(wb.proc_kind(), "WorkBuddy");
+        assert_eq!(cb.proc_kind(), "CodeBuddy");
+    }
 }
 
 #[cfg(test)]

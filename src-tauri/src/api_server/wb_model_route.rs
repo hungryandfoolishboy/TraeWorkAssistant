@@ -19,9 +19,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// 路由配置文件名（data/wb_model_route.json）
-pub const ROUTE_FILE: &str = "wb_model_route.json";
-
 /// 内置后缀：剥离后注入 reasoning_effort（§5.6 effort 降级链仍会按目录校验）
 pub const BUILTIN_THINKING_SUFFIX: &str = "-thinking";
 pub const BUILTIN_THINKING_EFFORT: &str = "high";
@@ -71,20 +68,10 @@ impl RouteResult {
 }
 
 /// 读取路由配置；缺失/损坏 → 空配置（四级中 ①②④ 用户部分退化为内置层）。
-/// data/ 新路径优先，不存在时回退旧根路径（存量用户数据兼容）；
-/// 写入方（配置命令）负责落盘到 data/ 新路径
+/// SQLite 化（P2）：data/wb_model_route.json → kv `wb_model_route`（热路径单行读取）；
+/// 旧根路径兼容由启动迁移器完成。
 pub fn load_config(data_dir: &Path) -> WbRouteFile {
-    let new_path = data_dir.join("data").join(ROUTE_FILE);
-    if let Some(cfg) = crate::fs_utils::read_json_cached::<WbRouteFile>(&new_path) {
-        return cfg;
-    }
-    if !new_path.exists() {
-        let legacy = data_dir.join(ROUTE_FILE);
-        if legacy.exists() {
-            return crate::fs_utils::read_json_cached::<WbRouteFile>(&legacy).unwrap_or_default();
-        }
-    }
-    WbRouteFile::default()
+    crate::store::db(data_dir).kv_get("wb_model_route")
 }
 
 /// 内置系列通配（③）：知名闭源模型族 → 目录代表模型。
@@ -259,6 +246,53 @@ pub fn is_background_task(body: &serde_json::Value) -> bool {
     total_chars <= 512
 }
 
+// ==================== F-76④ 长上下文降档 ====================
+
+/// 长上下文阈值（token 粗估）：观测请求均值 ~44.5k，取 2 倍以上并取整为 100k
+pub const LONGCTX_TOKEN_THRESHOLD: u64 = 100_000;
+
+/// 输入 token 粗估（F-76④）：消息文本总字符数 / 4（中英混合经验折算）。
+/// 仅用于超阈值提示与降档路由判定，不做精确计费
+pub fn estimate_input_tokens(body: &serde_json::Value) -> u64 {
+    let total_chars: u64 = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|msg| match msg.get("content") {
+                    Some(serde_json::Value::String(s)) => s.chars().count() as u64,
+                    Some(serde_json::Value::Array(blocks)) => blocks
+                        .iter()
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .map(|t| t.chars().count() as u64)
+                        .sum(),
+                    _ => 0,
+                })
+                .sum()
+        })
+        .unwrap_or(0);
+    total_chars / 4
+}
+
+/// flash 档模型（F-76④长上下文降档目标）：id 含 "flash" 中最低倍率者；
+/// 目录无 flash 档时回退全局最低倍率（与 wb_bg_downgrade 同族降档语义）
+pub fn flash_catalog_model(catalog: &[super::wb_catalog::WbModel]) -> Option<String> {
+    let pick_min = |c: &[&super::wb_catalog::WbModel]| {
+        c.iter()
+            .min_by(|a, b| a.rate.partial_cmp(&b.rate).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|m| m.id.clone())
+    };
+    let flash: Vec<&super::wb_catalog::WbModel> = catalog
+        .iter()
+        .filter(|m| m.id.to_lowercase().contains("flash"))
+        .collect();
+    if flash.is_empty() {
+        cheapest_catalog_model(catalog)
+    } else {
+        pick_min(&flash)
+    }
+}
+
 /// 注入 effort 提示（T5.2 路由结果 → 请求体）：body 已带 reasoning_effort 时不覆盖
 pub fn inject_effort_hint(body: &[u8], hint: &Option<String>) -> Vec<u8> {
     let Some(h) = hint.as_deref().filter(|s| !s.trim().is_empty()) else {
@@ -431,9 +465,9 @@ mod tests {
         assert_eq!(inject_effort_hint(&body, &None), body);
     }
 
-    /// 配置读取迁移：data/ 新路径优先，缺失回退旧根路径，全缺失为空配置
+    /// 配置读取（SQLite 化 P2）：kv 缺失 → 空配置；写入后可读回
     #[test]
-    fn load_config_reads_data_subdir_with_legacy_fallback() {
+    fn load_config_kv_roundtrip() {
         let dir = std::env::temp_dir().join(format!(
             "twa_route_{}_{}",
             std::process::id(),
@@ -443,26 +477,53 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(dir.join("data")).unwrap();
-        // 双路径全缺失 → 空配置
+        // kv 缺失 → 空配置
         let empty = load_config(&dir);
         assert!(empty.aliases.is_empty() && empty.rules.is_empty());
-        // 仅旧根路径存在 → 回退读取（存量用户数据兼容）
-        std::fs::write(
-            dir.join(ROUTE_FILE),
-            json!({"aliases": {"gpt-4o": "glm-5.3"}}).to_string(),
-        )
-        .unwrap();
+        // 写入 kv → 读回
+        crate::store::db(&dir)
+            .kv_set("wb_model_route", &json!({"aliases": {"gpt-4o": "glm-5.3"}}))
+            .unwrap();
         let cfg = load_config(&dir);
         assert_eq!(cfg.aliases.get("gpt-4o").map(String::as_str), Some("glm-5.3"));
-        // data/ 新路径存在 → 优先于旧路径
-        std::fs::write(
-            dir.join("data").join(ROUTE_FILE),
-            json!({"aliases": {"claude-x": "hy4"}}).to_string(),
-        )
-        .unwrap();
+        // 覆盖写入生效
+        crate::store::db(&dir)
+            .kv_set("wb_model_route", &json!({"aliases": {"claude-x": "hy4"}}))
+            .unwrap();
         let cfg = load_config(&dir);
         assert!(cfg.aliases.contains_key("claude-x"));
-        assert!(!cfg.aliases.contains_key("gpt-4o"), "新路径存在时不再回退旧路径");
+        assert!(!cfg.aliases.contains_key("gpt-4o"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ==================== F-76④ 长上下文降档 ====================
+
+    #[test]
+    fn estimate_input_tokens_chars_over_four() {
+        // 4 字符 ≈ 1 token：字符串 content 与 blocks content 均计入
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "x".repeat(400)},
+                {"role": "assistant", "content": [{"type": "text", "text": "y".repeat(200)}]},
+            ]
+        });
+        assert_eq!(estimate_input_tokens(&body), 150);
+        assert_eq!(estimate_input_tokens(&json!({})), 0);
+        assert_eq!(estimate_input_tokens(&json!({"messages": "bad"})), 0);
+    }
+
+    #[test]
+    fn flash_catalog_model_prefers_cheapest_flash() {
+        fn m(id: &str, rate: f64) -> super::super::wb_catalog::WbModel {
+            serde_json::from_value(json!({"id": id, "rate": rate})).unwrap()
+        }
+        // flash 档中最低倍率者胜
+        let cat = vec![m("glm-5.3", 1.0), m("glm-5.3-flash", 0.5), m("glm-4-flash", 0.2)];
+        assert_eq!(flash_catalog_model(&cat).as_deref(), Some("glm-4-flash"));
+        // 无 flash 档 → 回退全局最低倍率
+        let cat2 = vec![m("glm-5.3", 1.0), m("glm-5.2", 0.8)];
+        assert_eq!(flash_catalog_model(&cat2).as_deref(), Some("glm-5.2"));
+        // 空目录 → None
+        assert_eq!(flash_catalog_model(&[]), None);
     }
 }

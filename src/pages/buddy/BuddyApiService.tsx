@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { RefreshCw, Save, Coins, ToggleLeft, Activity } from 'lucide-react';
+import { RefreshCw, Save, Coins, ToggleLeft, Activity, Gauge } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner, StatCard } from '../../components/ui';
 import { api } from '../../lib/tauri';
@@ -8,6 +8,7 @@ import { withMinDelay } from '../../lib/delay';
 import type {
   ApiServiceStatus,
   ApiPoolFile,
+  PoolStatus,
   UsageDayView,
   WbModelInfo,
   WorkBuddyAccountView,
@@ -15,14 +16,15 @@ import type {
 
 /**
  * Buddy · 资源调度（unified-api-gateway-design §6.2，Phase 3）
- * 页内仅保留 Buddy 资源级内容：积分体系说明 / 池指标行 / 左列（资源开关（Buddy 独有）+
- * 账号池选择，窄列上下排布）/ 右列 模型目录（Buddy，wb_model_catalog 同步），同行左右两列。
+ * 页内仅保留 Buddy 资源级内容：积分体系说明 / 池指标行 /
+ * 左列（资源开关 + 调度参数合并面板，共用「保存」）/ 右列（账号池选择 + 模型目录（Buddy）上下排布），
+ * 同行左右两列各占 1/2。
  * 网关级功能（服务启停 / 使用方式 / 生态接入 / WB 用量统计）已全部迁至
  * 全局 API 管理弹窗（左侧栏 KeyRound 图标），页内不再出现网关级内容。
  */
 
-// Buddy 资源开关字段（wb_enabled 上游总开关 / 默认深度思考 / 工具执行 / 后台任务降级）
-const WB_FLAG_FIELDS: { key: 'wbEnabled' | 'wbDefaultThinking' | 'wbToolExec' | 'wbBgDowngrade'; label: string; desc: string }[] = [
+// Buddy 资源开关字段（wb_enabled 上游总开关 / 默认深度思考 / 工具执行 / 后台任务降级 / 长上下文降档）
+const WB_FLAG_FIELDS: { key: 'wbEnabled' | 'wbDefaultThinking' | 'wbToolExec' | 'wbBgDowngrade' | 'wbLongctxDowngrade'; label: string; desc: string }[] = [
   {
     key: 'wbEnabled',
     label: '启用 WB 上游',
@@ -43,7 +45,68 @@ const WB_FLAG_FIELDS: { key: 'wbEnabled' | 'wbDefaultThinking' | 'wbToolExec' | 
     label: '后台任务降级',
     desc: '标题/摘要类短请求（≤128 token 且 ≤512 字符）路由到最低倍率模型',
   },
+  {
+    key: 'wbLongctxDowngrade',
+    label: '长上下文降档',
+    desc: '输入粗估 ≥100k token 的请求自动换 flash 档低倍率模型',
+  },
 ];
+
+/** F-76②/③/F-77 数值参数（保存时写回 api_pool.json，服务运行中热生效） */
+const WB_PARAM_FIELDS: {
+  key: 'wbHedgeThresholdMs' | 'accountConcurrencyLimit' | 'poolStickyTtlSecs' | 'wbStickyTtlSecs';
+  label: string;
+  desc: string;
+  min: number;
+  max: number;
+  step: number;
+  unit: string;
+}[] = [
+  {
+    key: 'wbHedgeThresholdMs',
+    label: '竞速对冲阈值',
+    desc: '流式首字节超过该时长即向第二账号发对冲请求，先出首字者胜；0 = 关闭（有效范围 1s–8s，与后端对齐）',
+    min: 0,
+    max: 8_000,
+    step: 500,
+    unit: 'ms',
+  },
+  {
+    key: 'accountConcurrencyLimit',
+    label: '账号并发上限',
+    desc: '单账号在途请求数达到上限即让位其他账号（全部 busy 时取负载最小者）；0 = 不限',
+    min: 0,
+    max: 32,
+    step: 1,
+    unit: '并发',
+  },
+  {
+    key: 'poolStickyTtlSecs',
+    label: '池粘性 TTL',
+    desc: 'TTL 内同会话落同一账号（上游 KV cache 复用）',
+    min: 0,
+    max: 3600,
+    step: 30,
+    unit: '秒',
+  },
+  {
+    key: 'wbStickyTtlSecs',
+    label: '会话粘性 TTL',
+    desc: '显式 conversationId 绑定账号的有效期',
+    min: 0,
+    max: 86_400,
+    step: 60,
+    unit: '秒',
+  },
+];
+
+/** 数值参数默认值（与后端 serde default 对齐：对冲 8s / 并发 1 / 池粘性 300s / 会话粘性 1800s） */
+const WB_PARAM_DEFAULTS = {
+  wbHedgeThresholdMs: 8_000,
+  accountConcurrencyLimit: 1,
+  poolStickyTtlSecs: 300,
+  wbStickyTtlSecs: 1800,
+};
 
 export default function BuddyApiService() {
   const pushToast = useAppStore((s) => s.pushToast);
@@ -54,7 +117,9 @@ export default function BuddyApiService() {
     wbDefaultThinking: false,
     wbToolExec: false,
     wbBgDowngrade: false,
+    wbLongctxDowngrade: false,
   });
+  const [wbParams, setWbParams] = useState({ ...WB_PARAM_DEFAULTS });
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [catalog, setCatalog] = useState<WbModelInfo[]>([]);
   const [syncing, setSyncing] = useState(false);
@@ -62,26 +127,37 @@ export default function BuddyApiService() {
   const [refreshing, setRefreshing] = useState(false);
   // 当日活跃账号数据源（今日 WB 用量桶的账号维度计数）
   const [usage, setUsage] = useState<UsageDayView[]>([]);
+  // WB 池实时状态（F-77⑤ 可观测：per-account inflight 在途计数）
+  const [wbPool, setWbPool] = useState<PoolStatus[]>([]);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [st, pf, accs, cat] = await Promise.all([
+      const [st, pf, accs, cat, wbp] = await Promise.all([
         api.apiServer.status().catch(() => null),
         api.apiServer.poolList().catch(() => null),
         api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
         api.apiServer.wbCatalogList().catch(() => [] as WbModelInfo[]),
+        api.apiServer.wbPoolStatus().catch(() => [] as PoolStatus[]),
       ]);
       setStatus(st);
       setPool(pf);
       setAccounts(accs);
       setCatalog(cat);
+      setWbPool(wbp);
       if (pf) {
         setWbFlags({
           wbEnabled: pf.wb_enabled ?? false,
           wbDefaultThinking: pf.wb_default_thinking ?? false,
           wbToolExec: pf.wb_tool_exec ?? false,
           wbBgDowngrade: pf.wb_bg_downgrade ?? false,
+          wbLongctxDowngrade: pf.wb_longctx_downgrade ?? false,
+        });
+        setWbParams({
+          wbHedgeThresholdMs: pf.wb_hedge_threshold_ms ?? WB_PARAM_DEFAULTS.wbHedgeThresholdMs,
+          accountConcurrencyLimit: pf.account_concurrency_limit ?? WB_PARAM_DEFAULTS.accountConcurrencyLimit,
+          poolStickyTtlSecs: pf.pool_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.poolStickyTtlSecs,
+          wbStickyTtlSecs: pf.wb_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.wbStickyTtlSecs,
         });
       }
     } catch (err) {
@@ -109,17 +185,24 @@ export default function BuddyApiService() {
     void loadTodayUsage();
   }, [loadTodayUsage]);
 
-  // 保存资源开关：uids/strategy/groups 原样回传（本页不改 Trae 池配置）
+  // 保存资源开关：uids/strategy/groups 原样回传（本页不改 Trae 池配置）；
+  // F-76②/③/F-77 数值参数随开关一起保存（后端热应用，运行中即时生效）
   const saveFlags = async () => {
     setSaving(true);
     try {
       await withMinDelay(
-        api.apiServer.poolSet(pool?.enabled_uids ?? [], pool?.strategy, pool?.group_ids, wbFlags),
+        api.apiServer.poolSet(pool?.enabled_uids ?? [], pool?.strategy, pool?.group_ids, {
+          ...wbFlags,
+          wbHedgeThresholdMs: wbParams.wbHedgeThresholdMs,
+          accountConcurrencyLimit: wbParams.accountConcurrencyLimit,
+          poolStickyTtlSecs: wbParams.poolStickyTtlSecs,
+          wbStickyTtlSecs: wbParams.wbStickyTtlSecs,
+        }),
         600,
       );
-      pushToast('success', '资源开关已保存');
+      pushToast('success', '资源开关与调度参数已保存（调度参数热生效）');
       if (status?.running) {
-        pushToast('info', '需重启 API 服务以应用变更');
+        pushToast('info', '开关类变更需重启 API 服务以应用');
       }
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);
@@ -210,16 +293,15 @@ export default function BuddyApiService() {
         />
       </div>
 
-      {/* 资源开关 + 账号池选择（左列）｜模型目录（Buddy）（右列），同行两列各占 1/2 */}
+      {/* 资源开关 + 调度参数（左列，合并面板）｜账号池选择 + 模型目录（右列），同行两列各占 1/2 */}
       <div className="mt-4 grid grid-cols-12 items-start gap-4">
-        {/* 左列：资源开关 + 账号池选择（上下排布） */}
-        <div className="col-span-6 space-y-4">
-          {/* 资源开关卡（Buddy 独有） */}
+        {/* 左列：资源开关 + 调度参数（合并为一个面板，共用「保存」，两者本就随 poolSet 一并落盘） */}
+        <div className="col-span-6">
           <div className="card p-4">
             <div className="mb-3 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <ToggleLeft size={16} className="text-brand-500" />
-                <span className="text-sm font-medium">资源开关</span>
+                <span className="text-sm font-medium">资源开关与调度参数</span>
               </div>
               <button className="btn-outline" onClick={() => void saveFlags()} disabled={saving}>
                 {saving ? <Spinner /> : <Save size={15} />} 保存
@@ -251,11 +333,56 @@ export default function BuddyApiService() {
                 </label>
               ))}
             </div>
-            <p className="mt-2 text-xs text-slate-400 dark:text-zinc-500">
+
+            {/* 调度参数（F-76②/③/F-77：数值热参数，与资源开关同面板，保存即热生效） */}
+            <div className="mt-4 border-t border-slate-100 pt-3 dark:border-zinc-800">
+              <div className="mb-2 flex items-center gap-2">
+                <Gauge size={15} className="text-brand-500" />
+                <span className="text-sm font-medium">调度参数</span>
+                <span className="text-xs text-slate-400">保存即热生效 · 0 表示关闭/不限</span>
+              </div>
+              <div className="space-y-3">
+                {WB_PARAM_FIELDS.map((item) => (
+                  <div key={item.key} className="rounded-md px-1.5 py-1.5">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-xs text-slate-700 dark:text-zinc-200">{item.label}</span>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          className="w-24 rounded-md border border-slate-200 bg-transparent px-2 py-1 text-right text-xs tabular-nums focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+                          min={item.min}
+                          max={item.max}
+                          step={item.step}
+                          value={wbParams[item.key]}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            setWbParams((prev) => ({
+                              ...prev,
+                              [item.key]: Number.isFinite(v)
+                                ? Math.min(item.max, Math.max(item.min, v))
+                                : prev[item.key],
+                            }));
+                          }}
+                        />
+                        <span className="w-8 shrink-0 text-[11px] text-slate-400">{item.unit}</span>
+                      </div>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                      {item.desc}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <p className="mt-3 text-xs text-slate-400 dark:text-zinc-500">
               保存后需重启 API 服务生效；Trae 池的调度策略与分组筛选在 Trae「资源调度」页配置，本页不改动。
             </p>
           </div>
+        </div>
 
+        {/* 右列：账号池选择（上）+ 模型目录（Buddy）（下），上下排布 */}
+        <div className="col-span-6 space-y-4">
           {/* 账号池选择卡（现有 WB 池状态卡功能保留迁移） */}
           <div className="card p-4">
             <div className="mb-3 flex items-center gap-2">
@@ -271,85 +398,90 @@ export default function BuddyApiService() {
               </p>
             ) : (
               <div className="space-y-1">
-                {credAccounts.map((a) => (
-                  <div
-                    key={a.id}
-                    className="flex items-center gap-3 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800"
-                  >
-                    <div className="min-w-0 flex-1 truncate font-medium">{a.nickname || a.id}</div>
-                    {a.is_current && <Badge tone="green">在线</Badge>}
-                    {a.needs_relogin && <Badge tone="amber">需重新登录</Badge>}
-                    <span className="shrink-0 text-right tabular-nums text-xs text-slate-500">
-                      {a.credits_balance != null ? `${a.credits_balance.toFixed(2)} 积分` : '余额未知'}
-                    </span>
-                  </div>
-                ))}
+                {credAccounts.map((a) => {
+                  // F-77⑤ 可观测：实时在途并发（服务未运行/未匹配时为 0）
+                  const inflight = wbPool.find((p) => p.uid === a.uid)?.inflight ?? 0;
+                  return (
+                    <div
+                      key={a.id}
+                      className="flex items-center gap-3 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800"
+                    >
+                      <div className="min-w-0 flex-1 truncate font-medium">{a.nickname || a.id}</div>
+                      {a.is_current && <Badge tone="green">在线</Badge>}
+                      {a.needs_relogin && <Badge tone="amber">需重新登录</Badge>}
+                      {inflight > 0 && <Badge tone="amber">在途 {inflight}</Badge>}
+                      <span className="shrink-0 text-right tabular-nums text-xs text-slate-500">
+                        {a.credits_balance != null ? `${a.credits_balance.toFixed(2)} 积分` : '余额未知'}
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
-        </div>
 
-        {/* 右列：模型目录（Buddy）卡（现有目录同步能力保留） */}
-        <div className="card col-span-6 p-4">
-          <div className="mb-3 flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Coins size={16} className="text-amber-500" />
-              <span className="text-sm font-medium">模型目录（Buddy）</span>
-              <span className="text-xs text-slate-400">{catalog.length} 个模型</span>
+          {/* 模型目录（Buddy）卡（现有目录同步能力保留） */}
+          <div className="card p-4">
+            <div className="mb-3 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Coins size={16} className="text-amber-500" />
+                <span className="text-sm font-medium">模型目录（Buddy）</span>
+                <span className="text-xs text-slate-400">{catalog.length} 个模型</span>
+              </div>
+              <button className="btn-outline" onClick={() => void syncCatalog()} disabled={syncing}>
+                <RefreshCw size={14} className={syncing ? 'animate-spin' : ''} />
+                {syncing ? '同步中…' : '同步目录'}
+              </button>
             </div>
-            <button className="btn-outline" onClick={() => void syncCatalog()} disabled={syncing}>
-              <RefreshCw size={14} className={syncing ? 'animate-spin' : ''} />
-              {syncing ? '同步中…' : '同步目录'}
-            </button>
-          </div>
-          <p className="mb-3 text-xs text-slate-400">
-            从 Buddy 上游模型目录接口拉取并替换 wb_model_catalog.json（倍率/思考档位/图片模态以服务端为准）；
-            网关启动时也会自动同步一次。
-          </p>
-          {catalog.length === 0 ? (
-            <p className="py-4 text-center text-xs text-slate-400">暂无目录数据：点击「同步目录」拉取（需至少一个含凭证的 WB 账号）。</p>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[560px] text-sm">
-                <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
-                  <tr>
-                    <th className="px-3 py-2 text-left">模型 ID</th>
-                    <th className="px-3 py-2 text-left">展示名</th>
-                    <th className="px-3 py-2 text-right">积分倍率</th>
-                    <th className="px-3 py-2 text-left">思考档位</th>
-                    <th className="px-3 py-2 text-right">上下文</th>
-                    <th className="px-3 py-2 text-center">图片支持</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {catalog.map((m) => (
-                    <tr key={m.id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
-                      <td className="px-3 py-2 font-mono text-xs">{m.id}</td>
-                      <td className="px-3 py-2">{m.display || '—'}</td>
-                      <td className="px-3 py-2 text-right tabular-nums text-amber-600 dark:text-amber-400">{m.rate.toFixed(2)}</td>
-                      <td className="px-3 py-2 text-xs text-slate-500">
-                        {m.effort_override
-                          ? `${m.effort_override}（修正）`
-                          : m.supported_efforts.length > 0
-                            ? m.supported_efforts.join(' / ')
-                            : '—'}
-                      </td>
-                      <td className="px-3 py-2 text-right tabular-nums text-xs text-slate-500">
-                        {(m.context_length / 1000).toFixed(0)}k
-                      </td>
-                      <td className="px-3 py-2 text-center text-xs">
-                        {m.supports_image ? (
-                          <span className="font-semibold text-emerald-600 dark:text-emerald-400">✓</span>
-                        ) : (
-                          <span className="text-slate-400 dark:text-zinc-500">✗</span>
-                        )}
-                      </td>
+            <p className="mb-3 text-xs text-slate-400">
+              从 Buddy 上游模型目录接口拉取并替换 wb_model_catalog.json（倍率/思考档位/图片模态以服务端为准）；
+              网关启动时也会自动同步一次。
+            </p>
+            {catalog.length === 0 ? (
+              <p className="py-4 text-center text-xs text-slate-400">暂无目录数据：点击「同步目录」拉取（需至少一个含凭证的 WB 账号）。</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[560px] text-sm">
+                  <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
+                    <tr>
+                      <th className="px-3 py-2 text-left">模型 ID</th>
+                      <th className="px-3 py-2 text-left">展示名</th>
+                      <th className="px-3 py-2 text-right">积分倍率</th>
+                      <th className="px-3 py-2 text-left">思考档位</th>
+                      <th className="px-3 py-2 text-right">上下文</th>
+                      <th className="px-3 py-2 text-center">图片支持</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+                  </thead>
+                  <tbody>
+                    {catalog.map((m) => (
+                      <tr key={m.id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
+                        <td className="px-3 py-2 font-mono text-xs">{m.id}</td>
+                        <td className="px-3 py-2">{m.display || '—'}</td>
+                        <td className="px-3 py-2 text-right tabular-nums text-amber-600 dark:text-amber-400">{m.rate.toFixed(2)}</td>
+                        <td className="px-3 py-2 text-xs text-slate-500">
+                          {m.effort_override
+                            ? `${m.effort_override}（修正）`
+                            : m.supported_efforts.length > 0
+                              ? m.supported_efforts.join(' / ')
+                              : '—'}
+                        </td>
+                        <td className="px-3 py-2 text-right tabular-nums text-xs text-slate-500">
+                          {(m.context_length / 1000).toFixed(0)}k
+                        </td>
+                        <td className="px-3 py-2 text-center text-xs">
+                          {m.supports_image ? (
+                            <span className="font-semibold text-emerald-600 dark:text-emerald-400">✓</span>
+                          ) : (
+                            <span className="text-slate-400 dark:text-zinc-500">✗</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>

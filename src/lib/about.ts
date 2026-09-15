@@ -1,4 +1,4 @@
-// 软件宣传图 base64 内嵌（由 scripts/gen_asset_base64.py 从 promo_banner.jpg 生成）：
+// 软件宣传图 base64 内嵌（由 scripts/gen_asset_base64.mjs 从 promo_banner.jpg 生成）：
 // dev server 关闭后弹窗图片仍可显示，不依赖运行中的静态服务器
 import { promo_banner_base64 as promoBanner } from '../assets/promo-banner.base64';
 

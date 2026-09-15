@@ -1,18 +1,18 @@
-//! WorkBuddy 签到域（原 workbuddy.rs 机械拆分）：M4 签到/成长（F-15/F-17，python NDJSON 管线）、
+//! WorkBuddy 签到域（原 workbuddy.rs 机械拆分）：M4 签到/成长（F-15/F-17，NDJSON 管线）、
 //! 签到结果（F-15）、每日定时任务（F-16/F-55）、UI 坐标点击兜底（T4.2/F-18）、启动自动补签（F-55）。
-//! 函数逻辑零改动，仅将跨子模块引用项提升为 `pub(super)`。
+//! 签到/成长执行直调 tasks::wb_checkin（Python 移除后无子进程管线），事件契约不变。
 
 use serde::Serialize;
-use std::os::windows::process::CommandExt;
-use std::process::Command;
-use tauri::{AppHandle, State};
+use serde_json::Value;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
+use crate::tasks::wb_checkin::{self, CheckinOpts, GrowthOpts};
 
-use super::common::{checkin_results_path, load_settings, push_notify, spawn_wb_script};
+use super::common::{load_settings, push_notify};
 
-// ── M4 签到（F-15，python NDJSON 管线）─────────────────────────────────────
+// ── M4 签到（F-15，NDJSON 管线）─────────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
 pub struct WbCheckinOpts {
@@ -26,51 +26,79 @@ pub struct WbCheckinOpts {
     pub lazy_hours: Option<i64>,
 }
 
-/// 签到/成长全局轮次锁（审查 P1）：python 签到/成长管线共享 uid 文件锁与结果落盘，
+/// 签到/成长全局轮次锁（审查 P1）：签到/成长管线共享结果落盘，
 /// 并发轮次会互相踩踏——tokio Mutex try_lock 拿不到即拒绝，不排队不阻塞。
 static WB_ROUND_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// 入口尝试获取轮次锁；guard 移交 spawn_wb_script 工作线程并持有至脚本退出
+/// 入口尝试获取轮次锁；guard 移交工作线程并持有至轮次结束
 ///（RAII：正常结束与 panic 展开均可靠释放，防泄漏）。
-fn try_acquire_wb_round() -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
+/// pub(crate)：应用内调度器（tasks/scheduler.rs）到点跑签到轮次时同样抢锁互斥。
+pub(crate) fn try_acquire_wb_round() -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
     WB_ROUND_LOCK
         .try_lock()
         .map_err(|_| "已有签到/成长任务在执行中，请等待当前轮次完成".to_string())
 }
 
-/// 启动 WorkBuddy 签到（python workbuddy_checkin.py --json-stream），
+/// WB 自动签到开关（应用内调度器 wb-checkin 任务的启用判定，与启动补签同源设置）
+pub(crate) fn wb_auto_checkin_enabled(state: &AppState) -> bool {
+    load_settings(state).auto_checkin
+}
+
+/// NDJSON 事件转发（原 python 管线同款：emit 序列化 JSON 字符串，前端逐行 JSON.parse）
+fn emit_wb_event(app: &AppHandle, ev: &Value) {
+    if let Ok(line) = serde_json::to_string(ev) {
+        let _ = app.emit("wb-checkin-progress", &line);
+    }
+}
+
+/// 直调轮次共通封装：轮次锁 guard 移交工作线程，执行完发 exit 事件
+///（原 python 子进程管线退出事件同款，前端据 "type":"exit" 复位运行态）。
+fn spawn_wb_round<F>(
+    app: AppHandle,
+    state: AppState,
+    round: tokio::sync::MutexGuard<'static, ()>,
+    f: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&AppHandle, &AppState) + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let _guard = round;
+        f(&app, &state);
+        let _ = app.emit("wb-checkin-progress", "{\"type\":\"exit\",\"ok\":true}");
+    });
+    Ok(())
+}
+
+/// 启动 WorkBuddy 签到（tasks::wb_checkin 直调），
 /// NDJSON → `wb-checkin-progress` 事件（独立管线，避免与 Trae checkin 状态串扰）。
 #[tauri::command(async)]
 pub fn workbuddy_checkin_start(app: AppHandle, state: State<AppState>, opts: WbCheckinOpts) -> Result<(), String> {
     let round = try_acquire_wb_round()?;
-    let mut args: Vec<String> = vec!["--json-stream".into()];
-    if opts.skip_checked_in {
-        args.push("--skip-checked".into());
-    }
-    if opts.skip_expired {
-        args.push("--skip-expired".into());
-    }
-    if let Some(lh) = opts.lazy_hours {
-        args.push("--lazy-hours".into());
-        args.push(lh.to_string());
-    }
-    for uid in opts.user_ids.unwrap_or_default() {
-        args.push("--uid".into());
-        args.push(uid);
-    }
-    spawn_wb_script(app, &state, "workbuddy_checkin.py", &args, "wb-checkin-progress", round)
+    let o = CheckinOpts {
+        uids: opts.user_ids.unwrap_or_default(),
+        skip_checked: opts.skip_checked_in,
+        skip_expired: opts.skip_expired,
+        lazy_hours: opts.lazy_hours.unwrap_or(24),
+    };
+    spawn_wb_round(app, state.inner().clone(), round, move |app, st| {
+        wb_checkin::run_checkin_round(st, &o, &mut |ev| emit_wb_event(app, ev));
+    })
 }
 
-/// 成长中心执行（F-17，批次2 消费；批次1 端点已就绪时 python 会按开关执行）
+/// 成长中心执行（F-17；旅行/盲盒/任务开关随设置）
 #[tauri::command(async)]
 pub fn workbuddy_growth_run(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     let round = try_acquire_wb_round()?;
     let s = load_settings(&state);
-    let mut args: Vec<String> = vec!["--growth".into()];
-    if s.growth_travel { args.push("--growth-travel".into()); }
-    if s.growth_lottery { args.push("--growth-lottery".into()); }
-    if s.growth_tasks { args.push("--growth-tasks".into()); }
-    spawn_wb_script(app, &state, "workbuddy_checkin.py", &args, "wb-checkin-progress", round)
+    let flags = GrowthOpts {
+        travel: s.growth_travel,
+        lottery: s.growth_lottery,
+        tasks: s.growth_tasks,
+    };
+    spawn_wb_round(app, state.inner().clone(), round, move |app, st| {
+        wb_checkin::run_growth_round(st, &flags, &[], &mut |ev| emit_wb_event(app, ev));
+    })
 }
 
 // ── 签到结果 / 定时任务（F-15/F-16/F-55）───────────────────────────────────
@@ -95,7 +123,8 @@ pub fn workbuddy_checkin_results(state: State<AppState>, days: Option<i64>) -> R
     let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(days))
         .format("%Y-%m-%d")
         .to_string();
-    let raw: serde_json::Value = fs_utils::read_json(&checkin_results_path(&state));
+    let raw: serde_json::Value =
+        crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
     let mut out = Vec::new();
     if let Some(arr) = raw.get("results").and_then(|v| v.as_array()) {
         for r in arr {
@@ -122,12 +151,17 @@ pub fn workbuddy_checkin_results(state: State<AppState>, days: Option<i64>) -> R
 const WB_CHECKIN_TASK_PREFIX: &str = "AIWorkAssistant_WorkBuddyCheckin";
 const WB_RENEW_TASK_NAME: &str = "AIWorkAssistant_WorkBuddyRenew";
 
-fn build_wb_task_tr(state: &AppState, script_args: &[&str]) -> String {
-    let py = state.python_exe.replace('\\', "/");
-    let script = state.python_dir.join("workbuddy_checkin.py").to_string_lossy().replace('\\', "/");
+/// 构造 WorkBuddy 计划任务 /TR：主 exe 直调 CLI 任务模式（--task-run，见 tasks::run_cli_task），
+/// 不再依赖 python 运行时；schtasks 不继承进程环境变量，cmd /c 内显式 set AIWORKDATA_DIR。
+fn build_wb_task_tr(state: &AppState, task: &str) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
     let data_dir = state.data_dir.to_string_lossy().to_string();
-    let args = script_args.join(" ");
-    format!("cmd /c set \"AIWORKDATA_DIR={}\" && \"{}\" \"{}\" {}", data_dir, py, script, args)
+    Ok(format!(
+        "cmd /c set \"AIWORKDATA_DIR={}\" && \"{}\" --task-run {}",
+        data_dir,
+        exe.to_string_lossy(),
+        task
+    ))
 }
 
 fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
@@ -171,7 +205,7 @@ pub fn workbuddy_checkin_task_register(state: State<AppState>, times: Vec<String
     for t in &times {
         crate::commands::misc::validate_hhmm(t)?;
     }
-    let tr = build_wb_task_tr(&state, &["--json-stream", "--skip-checked"]);
+    let tr = build_wb_task_tr(&state, "wb-checkin")?;
     // 先清理旧实例（按任务名前缀枚举，兼容历史任意 HHMM 后缀），保证重注册幂等
     for name in wb_checkin_task_names() {
         let _ = run_schtasks(&["/Delete", "/TN", &name, "/F"]);
@@ -215,7 +249,7 @@ pub fn workbuddy_renew_task_register(state: State<AppState>, day: String) -> Res
     if !["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"].contains(&d.as_str()) {
         return Err(format!("星期无效: {day}（应为 MON..SUN）"));
     }
-    let tr = build_wb_task_tr(&state, &["--renew-only"]);
+    let tr = build_wb_task_tr(&state, "wb-renew")?;
     let (ok, _, stderr) = run_schtasks(&[
         "/Create", "/TN", WB_RENEW_TASK_NAME, "/TR", &tr, "/SC", "WEEKLY", "/D", &d, "/ST", "10:30", "/F",
     ])?;
@@ -240,9 +274,15 @@ pub fn workbuddy_renew_task_unregister() -> Result<(), String> {
 // 无 API 可用时的最后手段：仅手动触发、默认关闭（ui_click_enabled）；
 // 坐标由用户「取点」预配置；单次执行只单击一次，不循环连点；零 token 输出。
 
+/// 取点（F-18）：3 秒倒计时后记录当前鼠标坐标（Rust 直调 tasks::ui_click，输出契约对齐原 python）
 #[tauri::command]
 pub fn workbuddy_ui_click_capture(state: State<AppState>) -> Result<serde_json::Value, String> {
-    run_ui_click_script(&state, vec!["--capture".to_string()])
+    let _ = &state; // 预留：设置回写等扩展
+    let (x, y) = crate::tasks::ui_click::capture_point()?;
+    Ok(serde_json::json!({
+        "ok": true, "x": x, "y": y,
+        "message": format!("已记录坐标 ({x}, {y})"),
+    }))
 }
 
 #[tauri::command]
@@ -254,170 +294,98 @@ pub fn workbuddy_ui_click_checkin(state: State<AppState>) -> Result<serde_json::
     if s.ui_click_x <= 0 || s.ui_click_y <= 0 {
         return Err("签到按钮坐标未配置：请先在客户端打开签到页，再用「取点」记录按钮位置".to_string());
     }
-    run_ui_click_script(
-        &state,
-        vec![
-            "--click".to_string(),
-            "--x".to_string(),
-            s.ui_click_x.to_string(),
-            "--y".to_string(),
-            s.ui_click_y.to_string(),
-        ],
-    )
-}
-
-fn run_ui_click_script(state: &AppState, args: Vec<String>) -> Result<serde_json::Value, String> {
-    let script_path = state.python_dir.join("workbuddy_ui_click.py");
-    if !script_path.exists() {
-        return Err(format!("找不到脚本: {}", script_path.display()));
-    }
-    let out = Command::new(&state.python_exe)
-        .arg(&script_path)
-        .args(&args)
-        .creation_flags(0x08000000)
-        .env("PYTHONIOENCODING", "utf-8")
-        .output()
-        .map_err(|e| format!("UI 点击执行失败: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
-        .lines()
-        .rev()
-        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
-        .ok_or_else(|| format!("UI 点击脚本输出无法解析: {}", stdout.trim().chars().take(120).collect::<String>()))
+    // settings 坐标字段为 i64，屏幕坐标恒在 i32 范围；防御性转换杜绝截断回绕
+    let Ok(x) = i32::try_from(s.ui_click_x) else {
+        return Err("坐标无效（超出屏幕坐标范围）".to_string());
+    };
+    let Ok(y) = i32::try_from(s.ui_click_y) else {
+        return Err("坐标无效（超出屏幕坐标范围）".to_string());
+    };
+    crate::tasks::ui_click::click_at(x, y)?;
+    Ok(serde_json::json!({
+        "ok": true, "x": s.ui_click_x, "y": s.ui_click_y,
+        "message": format!("已点击 ({}, {})，请查看客户端签到结果", s.ui_click_x, s.ui_click_y),
+    }))
 }
 
 // ── 启动自动补签（F-55）────────────────────────────────────────────────────
 
 /// 启动自动补签核心（F-55，main.rs 启动线程调用）：
-/// 复用签到脚本 --json-stream --skip-checked（未签自动补签），静默执行零打扰。
+/// 复用每日签到参数（--json-stream --skip-checked 同款：skip_checked + lazy 24h），
+/// 未签自动补签，静默执行零打扰。
 pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
     let s = load_settings(state);
     if !s.auto_checkin {
         return;
     }
     let app2 = app.clone();
-    let data_dir = state.data_dir.clone();
-    let python_dir = state.python_dir.clone();
-    let python_exe = state.python_exe.clone();
+    let state2 = state.clone();
     std::thread::spawn(move || {
         // 与 Trae 静默签到同款延迟 60s，避开启动高峰
         std::thread::sleep(std::time::Duration::from_secs(60));
-        let script = python_dir.join("workbuddy_checkin.py");
-        if !script.exists() {
-            fs_utils::app_log(&data_dir, "WorkBuddy 启动补签：脚本不存在，跳过");
+        // 抢轮次锁（审查修复 #15）：与 UI 签到/成长轮次互斥，共享结果落盘并发会踩踏；
+        // 抢不到则本轮静默跳过（补签幂等，下轮启动/次日定时任务会再核验）
+        let Ok(_round) = try_acquire_wb_round() else {
+            fs_utils::app_log(&state2.data_dir, "WorkBuddy 启动补签跳过：已有签到/成长任务在执行中");
             return;
-        }
-        fs_utils::app_log(&data_dir, "WorkBuddy 启动补签：开始核验签到状态");
-        match Command::new(&python_exe)
-            .arg(&script)
-            .args(["--json-stream", "--skip-checked"])
-            .creation_flags(0x08000000)
-            .env("AIWORKDATA_DIR", &data_dir)
-            .env("PYTHONIOENCODING", "utf-8")
-            .output()
-        {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let done = stdout
-                    .lines()
-                    .rev()
-                    .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
-                    .filter(|v| v.get("type") == Some(&serde_json::json!("done")));
-                match done {
-                    Some(d) => {
-                        let msg = format!(
-                            "WorkBuddy 启动补签完成: 成功 {}，已签 {}，失败 {}",
-                            d.get("ok").and_then(|v| v.as_i64()).unwrap_or(0),
-                            d.get("already").and_then(|v| v.as_i64()).unwrap_or(0),
-                            d.get("failed").and_then(|v| v.as_i64()).unwrap_or(0),
-                        );
-                        fs_utils::app_log(&data_dir, &msg);
-                        let failed = d.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
-                        if failed > 0 {
-                            push_notify(
-                                Some(&app2),
-                                &data_dir,
-                                "WorkBuddy 签到提醒",
-                                &format!("启动补签有 {failed} 个账号失败，请在签到与成长页查看"),
-                            );
-                        }
-                    }
-                    None => fs_utils::app_log(&data_dir, "WorkBuddy 启动补签：无有效结果输出"),
-                }
-            }
-                    Err(e) => fs_utils::app_log(&data_dir, &format!("WorkBuddy 启动补签失败: {e}")),
+        };
+        fs_utils::app_log(&state2.data_dir, "WorkBuddy 启动补签：开始核验签到状态");
+        let done = wb_checkin::run_checkin_round(&state2, &CheckinOpts::daily(), &mut |_| {});
+        let msg = format!(
+            "WorkBuddy 启动补签完成: 成功 {}，已签 {}，失败 {}",
+            done["ok"].as_i64().unwrap_or(0),
+            done["already"].as_i64().unwrap_or(0),
+            done["failed"].as_i64().unwrap_or(0),
+        );
+        fs_utils::app_log(&state2.data_dir, &msg);
+        let failed = done["failed"].as_i64().unwrap_or(0);
+        if failed > 0 {
+            push_notify(
+                Some(&app2),
+                &state2.data_dir,
+                "WorkBuddy 签到提醒",
+                &format!("启动补签有 {failed} 个账号失败，请在签到与成长页查看"),
+            );
         }
     });
 }
 
 // ── 托盘一键签到（Trae 之外的两个阶段由 main.rs 托盘线程调用）──────────────
 
-/// 托盘一键签到 WorkBuddy 部分：签到 → 成长计划 同步串行执行（同脚本两阶段，
-/// 串行避免 WB_ROUND_LOCK 并发互斥拒绝），各阶段完成发系统通知。
+/// 托盘一键签到 WorkBuddy 部分：签到 → 成长计划 同步串行执行（共享结果文件落盘，
+/// 串行避免并发踩踏），各阶段完成发系统通知。
 /// Trae 签到由 main.rs 复用 start_checkin_core 并行触发，互不阻塞。
 pub fn tray_checkin_all(app: &AppHandle, state: &AppState) {
-    let s = load_settings(state);
-    let script = state.python_dir.join("workbuddy_checkin.py");
-    if !script.exists() {
-        fs_utils::app_log(&state.data_dir, "托盘一键签到：WB 脚本不存在，跳过 WorkBuddy 部分");
+    // 抢轮次锁（审查修复 #15）：与 UI 签到/成长轮次互斥（共享结果落盘并发会踩踏）；
+    // 抢不到则通知并跳过，不排队阻塞托盘线程（签到幂等，稍后可再点）
+    let Ok(_round) = try_acquire_wb_round() else {
+        let msg = "已有签到/成长任务在执行中，一键签到已跳过";
+        fs_utils::app_log(&state.data_dir, msg);
+        push_notify(Some(app), &state.data_dir, "一键签到", msg);
         return;
-    }
-    let growth_args = {
-        let mut a = vec!["--growth".to_string()];
-        if s.growth_travel { a.push("--growth-travel".into()); }
-        if s.growth_lottery { a.push("--growth-lottery".into()); }
-        if s.growth_tasks { a.push("--growth-tasks".into()); }
-        a
     };
-    let stages = [
-        ("签到", vec!["--json-stream".to_string(), "--skip-checked".to_string()]),
-        ("成长计划", growth_args),
-    ];
-    for (name, args) in stages {
-        let result = Command::new(&state.python_exe)
-            .arg(&script)
-            .args(&args)
-            .creation_flags(0x08000000)
-            .env("AIWORKDATA_DIR", &state.data_dir)
-            .env("PYTHONIOENCODING", "utf-8")
-            .output();
-        match result {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                // 取最后一条可解析 NDJSON；仅 type=done 视为有效轮次结果
-                let done = stdout
-                    .lines()
-                    .rev()
-                    .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
-                    .filter(|v| v.get("type") == Some(&serde_json::json!("done")));
-                match done {
-                    Some(d) => {
-                        // 计数器仅签到阶段输出齐全；成长阶段缺字段时降级为「完成」
-                        let summary = match (
-                            d.get("ok").and_then(|v| v.as_i64()),
-                            d.get("already").and_then(|v| v.as_i64()),
-                            d.get("failed").and_then(|v| v.as_i64()),
-                        ) {
-                            (Some(o), Some(a), Some(f)) => format!("成功 {o}，已签 {a}，失败 {f}"),
-                            _ => "完成".to_string(),
-                        };
-                        let msg = format!("WorkBuddy {name}: {summary}");
-                        fs_utils::app_log(&state.data_dir, &msg);
-                        push_notify(Some(app), &state.data_dir, "一键签到", &msg);
-                    }
-                    None => {
-                        fs_utils::app_log(
-                            &state.data_dir,
-                            &format!("托盘一键签到：WorkBuddy {name} 无有效结果输出"),
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                let msg = format!("WorkBuddy {name}失败: {e}");
-                fs_utils::app_log(&state.data_dir, &msg);
-                push_notify(Some(app), &state.data_dir, "一键签到", &msg);
-            }
-        }
-    }
+    let s = load_settings(state);
+    // 阶段 1：签到（每日任务同款参数：skip_checked + lazy 24h）
+    let done = wb_checkin::run_checkin_round(state, &CheckinOpts::daily(), &mut |_| {});
+    let summary = match (
+        done["ok"].as_i64(),
+        done["already"].as_i64(),
+        done["failed"].as_i64(),
+    ) {
+        (Some(o), Some(a), Some(f)) => format!("成功 {o}，已签 {a}，失败 {f}"),
+        _ => "完成".to_string(),
+    };
+    let msg = format!("WorkBuddy 签到: {summary}");
+    fs_utils::app_log(&state.data_dir, &msg);
+    push_notify(Some(app), &state.data_dir, "一键签到", &msg);
+    // 阶段 2：成长计划（旅行/盲盒/任务开关随设置）
+    let flags = GrowthOpts {
+        travel: s.growth_travel,
+        lottery: s.growth_lottery,
+        tasks: s.growth_tasks,
+    };
+    wb_checkin::run_growth_round(state, &flags, &[], &mut |_| {});
+    let msg = "WorkBuddy 成长计划: 完成";
+    fs_utils::app_log(&state.data_dir, msg);
+    push_notify(Some(app), &state.data_dir, "一键签到", msg);
 }

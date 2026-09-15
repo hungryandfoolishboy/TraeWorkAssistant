@@ -4,9 +4,8 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
-use crate::fs_utils;
 use crate::jwt;
-use crate::models::{CreditRecord, CreditsFile, DeviceMap, Settings};
+use crate::models::{CreditRecord, DeviceMap, Settings};
 use crate::state::AppState;
 
 pub const INVITE_LINK: &str =
@@ -16,9 +15,11 @@ pub const INVITE_LINK: &str =
 
 #[tauri::command]
 pub fn device_reset(state: State<AppState>, user_id: String) -> Result<(), String> {
-    let mut map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
+    // SQLite 化（P3）：device_map.json → device_map 表
+    let store = crate::store::db(&state.data_dir);
+    let mut map: DeviceMap = crate::store::docs::device_map_load(&store);
     map.remove(&user_id);
-    fs_utils::write_json(&state.path("device_map.json"), &map)?;
+    crate::store::docs::device_map_save(&store, &map)?;
     Ok(())
 }
 
@@ -447,10 +448,10 @@ pub fn settings_get(state: State<AppState>) -> Settings {
 
 #[tauri::command]
 pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<(), String> {
-    let path = state.path("app_settings.json");
-    // 读取现有设置，合并 patch 中出现的字段（真正的 patch 语义）
-    let mut current: serde_json::Value = fs_utils::read_json(&path);
-    // 文件不存在或内容为 null 时初始化为空对象，避免 patch 被丢弃
+    // SQLite 化（P2）：app_settings 入 kv 文档（patch 合并语义不变）
+    let store = crate::store::db(&state.data_dir);
+    let mut current: serde_json::Value = store.kv_get("app_settings");
+    // 内容为 null 时初始化为空对象，避免 patch 被丢弃
     if !current.is_object() {
         current = serde_json::json!({});
     }
@@ -461,14 +462,14 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
             current_obj.insert(k.clone(), v.clone());
         }
     }
-    fs_utils::write_json(&path, &current)
+    store.kv_set("app_settings", &current)
 }
 
 // ---------------- 积分历史（供看板/趋势图） ----------------
 
 #[tauri::command]
 pub fn credits_history(state: State<AppState>) -> Vec<CreditRecord> {
-    fs_utils::read_json::<CreditsFile>(&state.path("credits_history.json")).records
+    crate::store::docs::credits_history_load(&crate::store::db(&state.data_dir)).records
 }
 
 // ---------------- 邀请 ----------------
@@ -664,23 +665,17 @@ pub(crate) fn write_task_launcher(
     Ok(path.to_string_lossy().to_string())
 }
 
-/// 构造每日签到计划任务的 /TR（复用 .cmd 启动器方案，见 write_task_launcher，
-/// 消除直接拼 python 长命令再次触碰 /TR 261 字符上限的回归）
+/// 构造每日签到计划任务的 /TR：主 exe 直调 CLI 任务模式（--task-run checkin，
+/// 见 tasks::run_cli_task），不再依赖 python 运行时；schtasks 不继承进程环境变量，
+/// cmd /c 内显式 set AIWORKDATA_DIR（与 WorkBuddy 任务注册同款模式）。
 fn build_task_tr(state: &AppState) -> Result<String, String> {
-    let py = state.python_exe.clone();
-    let script = state.python_dir.join("auto_checkin.py");
+    let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
     let data_dir = state.data_dir.to_string_lossy().to_string();
-    // schtasks /TR 不会继承当前进程环境变量，启动器内显式 set AIWORKDATA_DIR。
-    // 必须用 set "VAR=value"（带引号）以兼容含空格的路径；不再使用 /RL HIGHEST：
-    // 签到脚本只读取/写入 %APPDATA% 并运行 python，无需提权（详见问题分析报告）。
-    write_task_launcher(
-        state,
-        "daily_checkin",
-        format!(
-            "set \"AIWORKDATA_DIR={data_dir}\"\r\nset \"PYTHONIOENCODING=utf-8\"\r\n\"{py}\" \"{}\"",
-            script.to_string_lossy()
-        ),
-    )
+    Ok(format!(
+        "cmd /c set \"AIWORKDATA_DIR={}\" && \"{}\" --task-run checkin",
+        data_dir,
+        exe.to_string_lossy()
+    ))
 }
 
 /// 注册每日签到任务（新任务名），供命令与旧任务迁移共用
@@ -706,16 +701,18 @@ fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
             || detail.contains("拒绝访问")
             || detail.contains("权限");
         if is_access_denied {
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| "<主程序路径>".into());
             return Err(format!(
                 "权限不足（Access Denied）。\n\n\
                  解决方法（任选其一）：\n\
                  1. 右键 AI Work 助手 →「以管理员身份运行」后重新点击「注册任务」\n\
                  2. 打开「管理员命令提示符」手动执行：\n\
-                    schtasks /Create /TN {TASK_NAME} /TR \"cmd /c set \\\"AIWORKDATA_DIR={}\\\" && \\\"{}\\\" \\\"{}\\\"\" /SC DAILY /ST {time} /F\n\
+                    schtasks /Create /TN {TASK_NAME} /TR \"cmd /c set \\\"AIWORKDATA_DIR={}\\\" && \\\"{}\\\" --task-run checkin\" /SC DAILY /ST {time} /F\n\
                  3. 如不需最高权限，可去掉 /RL HIGHEST 后重试",
                 state.data_dir.to_string_lossy(),
-                state.python_exe.replace('\\', "/"),
-                state.python_dir.join("auto_checkin.py").to_string_lossy().replace('\\', "/")
+                exe
             ));
         }
         return Err(detail.to_string());

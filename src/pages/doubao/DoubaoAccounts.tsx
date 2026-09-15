@@ -193,7 +193,7 @@ export default function DoubaoAccounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** 代理抓包凭证自动回写：豆包客户端/网页版流量经过代理时，device_proxy.py 会抓到
+  /** 代理抓包凭证自动回写：豆包客户端/网页版流量经过代理时，内置代理会抓到
    *  当前登录账号的 sessionid / sid_guard 并落盘；这里挂载时执行一次 + 每 20s 轮询，
    *  后端幂等（凭证内容未变化直接跳过），有写入才提示并刷新列表。 */
   useEffect(() => {

@@ -4,53 +4,36 @@
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::os::windows::process::CommandExt;
-use std::process::Command;
 use tauri::{AppHandle, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
 
-use super::common::{as_str, auth_file_path_of, load_pool, save_pool, token_store_path};
+use super::common::{as_str, auth_file_path_of, load_pool, save_pool};
 
 // ── M5 积分（F-20/F-22，python 三件套 + 缓存）──────────────────────────────
 
 #[tauri::command(async)]
 pub fn workbuddy_credits_fetch(app: AppHandle, state: State<AppState>, user_id: Option<String>, fresh: Option<bool>) -> Result<serde_json::Value, String> {
     let _ = &app; // 预留：wb-credits-updated 事件随批次2趋势图启用
-    let mut args: Vec<String> = Vec::new();
-    if let Some(uid) = &user_id {
-        args.push("--uid".into());
-        args.push(uid.clone());
-    }
-    if fresh.unwrap_or(false) {
-        args.push("--fresh".into());
-    }
-    let script_path = state.python_dir.join("workbuddy_credits.py");
-    if !script_path.exists() {
-        return Err(format!("找不到脚本: {}", script_path.display()));
-    }
-    let out = Command::new(&state.python_exe)
-        .arg(&script_path)
-        .args(&args)
-        .creation_flags(0x08000000)
-        .env("AIWORKDATA_DIR", &state.data_dir)
-        .env("PYTHONIOENCODING", "utf-8")
-        .output()
-        .map_err(|e| format!("积分查询失败: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // 取末行 JSON（脚本可能输出告警行）
-    let parsed = stdout
-        .lines()
-        .rev()
-        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
-        .ok_or_else(|| format!("积分查询输出无法解析: {}", stdout.trim().chars().take(200).collect::<String>()))?;
-    if parsed.get("ok") != Some(&serde_json::json!(true)) {
-        return Err("积分查询失败（详见脚本输出）".into());
-    }
+    // Rust 直调 tasks::wb_credits（原 python workbuddy_credits.py 移植）；
+    // 失败以 Err 返回，成功恒为 {"ok":true,"cached":bool,"accounts":[...]}（消费契约见 tasks/wb_credits.rs 模块注释）
+    let parsed = crate::tasks::wb_credits::fetch_credits(&state, user_id.as_deref(), fresh.unwrap_or(false))?;
     // 回写账号池余额缓存（列表/概述展示）
+    write_back_pool_balances(&state, &parsed);
+    // 会员套餐回填（仅 edition_type 为空的账号，见 backfill_edition_from_payment_type）
+    backfill_edition_from_payment_type(&state);
+    // 每日余额快照（F-27 数据源）：非缓存命中时追加，按日去重，cap 365 天
+    if parsed.get("cached") != Some(&serde_json::json!(true)) {
+        append_credits_snapshot(&state, &parsed);
+    }
+    Ok(parsed)
+}
+
+/// 将积分查询结果中的余额回写账号池缓存（列表/概述展示；命令与调度器快照任务共用）
+fn write_back_pool_balances(state: &AppState, parsed: &Value) {
     if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
-        let mut pool = load_pool(&state);
+        let mut pool = load_pool(state);
         for acc in accounts {
             let uid = acc.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
             let bal = acc.get("balance").and_then(|v| v.as_f64());
@@ -59,14 +42,22 @@ pub fn workbuddy_credits_fetch(app: AppHandle, state: State<AppState>, user_id: 
                 a.credits_fetched_at = acc.get("fetched_at").and_then(|v| v.as_str()).map(|s| s.to_string());
             }
         }
-        let _ = save_pool(&state, &pool);
+        let _ = save_pool(state, &pool);
     }
-    // 会员套餐回填（仅 edition_type 为空的账号，见 backfill_edition_from_payment_type）
-    backfill_edition_from_payment_type(&state);
-    // 每日余额快照（F-27 数据源）：非缓存命中时追加，按日去重，cap 365 天
-    if parsed.get("cached") != Some(&serde_json::json!(true)) {
-        append_credits_snapshot(&state, &parsed);
-    }
+}
+
+/// 每日积分余额快照任务（调度器 `wb-credits-snapshot`；补齐近 7 日用量时序的关键）：
+/// 强制刷新全部账号积分 → 回写池余额 → 追加当日快照（同日覆盖）。
+/// 此前快照仅在「打开积分页且非缓存命中」时写入，应用内调度器到点自动建快照，
+/// 差分序列不再因未打开页面而断档。
+pub(crate) fn wb_credits_snapshot_task(state: &AppState) -> Result<Value, String> {
+    let parsed = crate::tasks::wb_credits::fetch_credits(state, None, true)?;
+    write_back_pool_balances(state, &parsed);
+    append_credits_snapshot(state, &parsed);
+    fs_utils::app_log(
+        &state.data_dir,
+        "workbuddy: 每日积分余额快照已写入（应用内调度器 wb-credits-snapshot）",
+    );
     Ok(parsed)
 }
 
@@ -98,7 +89,7 @@ fn backfill_edition_from_payment_type(state: &AppState) -> usize {
     if need.is_empty() {
         return 0;
     }
-    let store: Value = fs_utils::read_json(&token_store_path(state));
+    let store: Value = crate::tasks::wb_common::load_token_store(state);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
     let mut filled = 0usize;
@@ -142,13 +133,9 @@ pub fn workbuddy_editions_backfill(state: State<AppState>) -> Result<usize, Stri
     Ok(backfill_edition_from_payment_type(&state))
 }
 
-/// 追加每日积分余额快照（F-27）：workbuddy_credits_history.json，同日覆盖最新
+/// 追加每日积分余额快照（F-27）：SQLite 化 P6 → wb_credits_history 表，同日覆盖最新 + 365 天裁剪
 fn append_credits_snapshot(state: &AppState, parsed: &Value) {
-    let path = state.data_dir.join("data").join("workbuddy_credits_history.json");
-    let mut hist: Value = fs_utils::read_json(&path);
-    if !hist.is_object() {
-        hist = serde_json::json!({});
-    }
+    let store = crate::store::db(&state.data_dir);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let accounts: Vec<Value> = parsed
         .get("accounts")
@@ -171,19 +158,11 @@ fn append_credits_snapshot(state: &AppState, parsed: &Value) {
         "total_balance": total,
         "accounts": accounts,
     });
-    let Some(obj) = hist.as_object_mut() else { return };
-    let arr = obj.entry("snapshots".to_string()).or_insert_with(|| serde_json::json!([]));
-    if let Some(list) = arr.as_array_mut() {
-        match list.iter().position(|s| s.get("date").and_then(Value::as_str) == Some(today.as_str())) {
-            Some(pos) => list[pos] = snap,
-            None => list.push(snap),
-        }
-        let len = list.len();
-        if len > 365 {
-            list.drain(..len - 365);
-        }
+    if let Err(e) = crate::store::docs::wb_credits_history_upsert(&store, &snap) {
+        fs_utils::app_log(&state.data_dir, &format!("workbuddy 积分快照写入失败: {e}"));
+        return;
     }
-    let _ = fs_utils::write_json(&path, &hist);
+    let _ = crate::store::docs::wb_credits_history_prune(&store);
 }
 
 // ── 积分用量快照回退（T4.3/F-27）────────────────────────────────────────────
@@ -193,7 +172,7 @@ fn append_credits_snapshot(state: &AppState, parsed: &Value) {
 /// 负差值（充值包到账/快照波动）记 0。口径明示「快照回退」，非官方逐请求统计。
 #[tauri::command]
 pub fn workbuddy_usage_fallback(state: State<AppState>) -> Result<serde_json::Value, String> {
-    let hist: Value = fs_utils::read_json(&state.data_dir.join("data").join("workbuddy_credits_history.json"));
+    let hist: Value = crate::store::docs::wb_credits_history_load(&crate::store::db(&state.data_dir));
     let snapshots = hist.get("snapshots").and_then(Value::as_array).cloned().unwrap_or_default();
     if snapshots.len() < 2 {
         return Err(
@@ -201,8 +180,8 @@ pub fn workbuddy_usage_fallback(state: State<AppState>) -> Result<serde_json::Va
         );
     }
 
-    // 签到日志 → 每日奖励充值（90 天滚动，仅 success 事件）
-    let results: Value = fs_utils::read_json(&state.data_dir.join("data").join("workbuddy_checkin_results.json"));
+    // 签到日志 → 每日奖励充值（90 天滚动，仅 success 事件；SQLite 化 P3 走 store）
+    let results: Value = crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
     let mut recharge: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     for r in results.get("results").and_then(Value::as_array).into_iter().flatten() {
         if r.get("status").and_then(Value::as_str) != Some("success") {
@@ -330,11 +309,11 @@ pub fn workbuddy_usage_official(
     user_id: Option<String>,
     refresh: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    let cache_path = state.data_dir.join("data").join("workbuddy_usage_official_cache.json");
+    let cache_path = "workbuddy_usage_official_cache"; // kv 键（SQLite 化 P2）
 
     // 选号：user_id → auth 文件当前账号 → 首个有 token store 凭证的账号
     //（审查 P1：选号解析提到缓存命中判断之前——缓存按账号区分，命中须同账号）
-    let store: serde_json::Value = fs_utils::read_json(&token_store_path(&state));
+    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(&state);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let pick = |id: &str| -> Option<(String, String, String)> {
         let rec = tokens.get(id)?;
@@ -363,7 +342,7 @@ pub fn workbuddy_usage_official(
     // 不一致或旧缓存缺 account_id 一律视为未命中，重新按当前账号拉取。
     // F-59 stale-on-error：过期缓存保留一份，拉取失败时降级回退（见下方 fail 闭包）。
     let cached_val: Option<serde_json::Value> = {
-        let c: serde_json::Value = fs_utils::read_json(&cache_path);
+        let c: serde_json::Value = crate::store::db(&state.data_dir).kv_get(cache_path);
         (c.get("status").is_some()).then_some(c)
     };
     if !refresh.unwrap_or(false) {
@@ -391,6 +370,26 @@ pub fn workbuddy_usage_official(
         Err(msg.to_string())
     };
 
+    // 核心：拉取 + 聚合（拆出供全账号聚合命令 workbuddy_usage_official_all 复用）
+    let payload = match usage_official_fetch(&acct_id, &token, &domain) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "workbuddy: 官方用量刷新（{acct_id}，{} 行）",
+            payload.get("request_count_total").and_then(Value::as_u64).unwrap_or(0)
+        ),
+    );
+    Ok(payload)
+}
+
+/// 官方用量核心（拉取近 31 天分页明细 + 聚合，缓存逻辑留在命令层）。
+/// 拆出供单账号命令 `workbuddy_usage_official` 与全账号聚合命令
+/// `workbuddy_usage_official_all`（Buddy 积分看板近 7 日趋势数据源）复用。
+fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serde_json::Value, String> {
     // 区域路由（T4.5/F-36，§5.2）：Global 账号（domain 含 workbuddy.ai）billing
     // 全走 www.workbuddy.ai；CN 账号维持既有 workbuddy.cn 网关。
     let base = if domain.contains("workbuddy.ai") {
@@ -430,21 +429,21 @@ pub fn workbuddy_usage_official(
         let v: serde_json::Value = match resp {
             Ok(r) => r.into_json().unwrap_or_default(),
             Err(ureq::Error::Status(code, _)) => {
-                return fail(&format!("官方用量请求失败（HTTP {code}）：请检查凭证有效期"));
+                return Err(format!("官方用量请求失败（HTTP {code}）：请检查凭证有效期"));
             }
-            Err(e) => return fail(&format!("官方用量请求失败: {e}")),
+            Err(e) => return Err(format!("官方用量请求失败: {e}")),
         };
         let code = v.get("code").and_then(Value::as_i64).unwrap_or(0);
         if code != 0 && code != 200 {
-            return fail(&format!("官方用量请求失败（code={code}）"));
+            return Err(format!("官方用量请求失败（code={code}）"));
         }
         let data = match v.get("data") {
             Some(d) => d,
-            None => return fail("官方响应格式无效"),
+            None => return Err("官方响应格式无效".into()),
         };
         let items = match data.get("data").and_then(Value::as_array) {
             Some(a) => a,
-            None => return fail("官方响应格式无效"),
+            None => return Err("官方响应格式无效".into()),
         };
         reported_total = reported_total.max(
             data.get("total")
@@ -538,7 +537,7 @@ pub fn workbuddy_usage_official(
         }));
     }
 
-    let payload = serde_json::json!({
+    Ok(serde_json::json!({
         "status": "complete",
         "account_id": acct_id,
         "domain": base,
@@ -553,11 +552,134 @@ pub fn workbuddy_usage_official(
         },
         "daily": daily_out,
         "models": models_out,
+    }))
+}
+
+/// 全账号官方用量聚合（Buddy 积分看板「近 7 日积分消耗」主数据源）：
+/// 遍历账号池全部有凭证账号，逐个拉取官方用量明细后按日求和（31 天零填充）。
+/// 此前看板用快照差分（usageFallback）作唯一数据源——快照只在打开积分页且非缓存
+/// 命中时写入，未打开应用的日子无快照，7 日趋势只剩「昨天」一格。
+/// 单账号失败跳过（accounts_ok 计数），全部失败才报错并回退过期缓存（stale）。
+/// 聚合结果缓存 10 分钟（跨账号全量拉取代价高，避免看板每次刷新都打满分页请求）。
+#[tauri::command(async)]
+pub fn workbuddy_usage_official_all(state: State<AppState>) -> Result<serde_json::Value, String> {
+    let cache_path = "workbuddy_usage_official_all_cache"; // kv 键（SQLite 化 P2）
+    let cached_val: Option<Value> = {
+        let c: Value = crate::store::db(&state.data_dir).kv_get(cache_path);
+        (c.get("status").is_some()).then_some(c)
+    };
+    if let Some(cached) = &cached_val {
+        let fetched = cached.get("fetched_at_ms").and_then(Value::as_i64).unwrap_or(0);
+        if chrono::Utc::now().timestamp_millis() - fetched < 10 * 60_000 {
+            return Ok(cached.clone());
+        }
+    }
+    let fail = |msg: &str| -> Result<Value, String> {
+        if let Some(c) = &cached_val {
+            let mut stale = c.clone();
+            stale["stale"] = serde_json::json!(true);
+            stale["stale_reason"] = serde_json::json!(msg);
+            return Ok(stale);
+        }
+        Err(msg.to_string())
+    };
+
+    // 枚举有凭证账号：账号池优先，token store 补充（按 id 去重）
+    let store: Value = crate::tasks::wb_common::load_token_store(&state);
+    let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
+    let pick = |id: &str| -> Option<(String, String, String)> {
+        let rec = tokens.get(id)?;
+        let token = as_str(fs_utils::dig(&rec, &["access_token"]))?;
+        if token.is_empty() {
+            return None;
+        }
+        let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
+        Some((id.to_string(), token, domain))
+    };
+    let pool = load_pool(&state);
+    let mut list: Vec<(String, String, String)> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for a in &pool.accounts {
+        if let Some(t) = pick(&a.id) {
+            if seen_ids.insert(a.id.clone()) {
+                list.push(t);
+            }
+        }
+    }
+    for id in tokens.keys() {
+        if let Some(t) = pick(id) {
+            if seen_ids.insert(id.clone()) {
+                list.push(t);
+            }
+        }
+    }
+    if list.is_empty() {
+        return Err("无可用账号凭证（请先在账号管理导入/扫码入池并续期）".into());
+    }
+
+    // 逐账号拉取 + 按日聚合（单账号失败跳过，不让一个失效凭证拖垮整板趋势）
+    let mut daily_credits: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut ok = 0usize;
+    let mut req_total = 0u64;
+    for (id, token, domain) in &list {
+        if let Ok(p) = usage_official_fetch(id, token, domain) {
+            ok += 1;
+            req_total += p.get("request_count_total").and_then(Value::as_u64).unwrap_or(0);
+            for row in p.get("daily").and_then(Value::as_array).into_iter().flatten() {
+                let Some(date) = row.get("date").and_then(Value::as_str) else { continue };
+                let Some(u) = row.get("usage").and_then(Value::as_f64) else { continue };
+                *daily_credits.entry(date.to_string()).or_insert(0.0) += u;
+            }
+        }
+    }
+    if ok == 0 {
+        return fail("全部账号官方用量拉取失败（凭证可能已失效，请续期后重试）");
+    }
+
+    // 31 天零填充输出（汇总口径与单账号命令一致）
+    use chrono::Datelike;
+    let today = chrono::Local::now().date_naive();
+    let start = today - chrono::Duration::days(30);
+    let mut usage_today = 0.0f64;
+    let mut usage_week = 0.0f64;
+    let mut usage_month = 0.0f64;
+    let mut daily_out: Vec<Value> = vec![];
+    for i in (0..=30).rev() {
+        let d = today - chrono::Duration::days(i);
+        let key = d.format("%Y-%m-%d").to_string();
+        let u = daily_credits.get(&key).copied().unwrap_or(0.0);
+        if i == 0 {
+            usage_today = u;
+        }
+        if i < 7 {
+            usage_week += u;
+        }
+        if d.year() == today.year() && d.month() == today.month() {
+            usage_month += u;
+        }
+        daily_out.push(serde_json::json!({ "date": key, "usage": u }));
+    }
+
+    let payload = serde_json::json!({
+        "status": "complete",
+        "source": "official_all",
+        "accounts_total": list.len(),
+        "accounts_ok": ok,
+        "range_start": start.format("%Y-%m-%d").to_string(),
+        "range_end": today.format("%Y-%m-%d").to_string(),
+        "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
+        "request_count_total": req_total,
+        "summary": {
+            "usage_today": usage_today,
+            "usage_7days": usage_week,
+            "usage_this_month": usage_month,
+        },
+        "daily": daily_out,
     });
-    let _ = fs_utils::write_json(&cache_path, &payload);
+    let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
     fs_utils::app_log(
         &state.data_dir,
-        &format!("workbuddy: 官方用量刷新（{acct_id}，{}/{} 行）", seen.len(), reported_total),
+        &format!("workbuddy: 全账号官方用量聚合（{ok}/{} 账号，{} 行）", list.len(), req_total),
     );
     Ok(payload)
 }
@@ -584,11 +706,11 @@ pub fn workbuddy_activity_info(
     user_id: Option<String>,
     refresh: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    let cache_path = state.data_dir.join("data").join("workbuddy_activity_cache.json");
+    let cache_path = "workbuddy_activity_cache"; // kv 键（SQLite 化 P2）
 
     // 选号逻辑与 workbuddy_usage_official 一致（复用同一降级链）
     //（审查 P1：选号解析提到缓存命中判断之前——缓存按账号区分，命中须同账号）
-    let store: serde_json::Value = fs_utils::read_json(&token_store_path(&state));
+    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(&state);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let pick = |id: &str| -> Option<(String, String, String)> {
         let rec = tokens.get(id)?;
@@ -615,7 +737,7 @@ pub fn workbuddy_activity_info(
     // 缓存命中条件（审查 P1）：10min 内 + 缓存 account_id 与本次解析账号一致
     //（无凭证时解析结果为 None，与无凭证缓存 payload 的 account_id=null 对齐）
     if !refresh.unwrap_or(false) {
-        let cached: serde_json::Value = fs_utils::read_json(&cache_path);
+        let cached: serde_json::Value = crate::store::db(&state.data_dir).kv_get(cache_path);
         let fetched = cached.get("fetched_at_ms").and_then(Value::as_i64).unwrap_or(0);
         let cached_acct = cached.get("account_id").and_then(Value::as_str);
         if cached.get("account_id").is_some()
@@ -679,7 +801,7 @@ pub fn workbuddy_activity_info(
         "errors": errors,
         "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
     });
-    let _ = fs_utils::write_json(&cache_path, &payload);
+    let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
     Ok(payload)
 }
 

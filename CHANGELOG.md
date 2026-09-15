@@ -4,6 +4,53 @@
 
 ---
 
+## [未发布] · SQLite 存储迁移 + Python/PowerShell 全量 Rust 化 + F-68 / F-74 / F-76~F-78 落地
+
+> 范围：自 [3.4.5]（commit 651b056）以来的全部变更。
+
+### 新增
+
+- **SQLite 存储层全量迁移（P1~P6）**：新增 `store/` 模块（`mod.rs`/`schema.rs`/`docs.rs`/`migrate.rs`）——单连接 `Mutex<Connection>`（WAL + busy_timeout=5000），kv 文档表 / 行文档表 / 列化流水表三组 DDL（`PRAGMA user_version` 版本化）；启动迁移器三态（导入成功→原 JSON 移 `backup/` + manifest 落盘 / 损坏→隔离 / 失败→原位重试），遗留根路径文件兜底且不覆盖正牌数据，全量导入零失败才置版本号。分批切换：
+  - **P2 KV 配置组**：23 个 JSON 配置文档迁入 kv 表（app_settings、api_pool、dispatch_policy、api_models、wb_model_catalog、wb_model_route 等热路径），删除 mtime 解析缓存改单行 SELECT 直读；
+  - **P3 实体/流水组**：账号池（vault 43 调用点，raw 保真保留扩展字段）、groups/冷却/积分流水（INSERT + 90 天裁剪）/签到摘要、WorkBuddy 池与 token store（单行 UPSERT）、豆包池与健康事件表（append + 裁剪）、api_keys（鉴权记账 KEYS_LOCK 保留）/api_usage/custom_models 全部入 SQLite；
+  - **P6 流水型 KV 迁出为真表**：credits 快照 → `wb_credits_history`（date PK，365 天 DELETE 裁剪）、usage_history → `usage_history_days`（PK(uid,date)，**补齐原本无界增长、缺失的 365 天裁剪**）+ 元数据表、wb_sticky_sessions → `sticky_bindings`（落库前 evict_expired）；schema v1→v2 增量迁移；
+  - **P5 明文凭据收敛验收**：专项测试锁定「迁移保真导入 → vault 收敛进 Stronghold → 库中占位化抹除」链路与 main.rs 启动顺序契约（store 迁移先于 vault 迁移，避免明文经备份文件回流）。
+- **应用内定时调度器 `tasks/scheduler.rs`**：每日签到/巡检/续期到点执行（含启动补跑，失败 30 分钟冷却重试），新增 WB/Trae 积分余额每日快照任务补齐差分时序；状态落盘 `scheduler_state.json`，`scheduler_status` 命令可查。
+- **F-76 慢请求竞速对冲（网关）**：`RaceOutcome<T>` 泛型化 + `HedgeLease` RAII（对冲侧 inflight 计数全路径配对释放），对冲阈值默认 8s 对齐运行时 clamp。
+- **F-77 账号级并发感知调度（网关）**：per-account inflight 计数、busy 过滤与全忙降级、粘性让位语义（sticky_yield/sticky_fallback）+ busy_yield/busy_fallback 调度事件日志；`/status` 暴露 inflight，前端账号列表实时在途徽标。
+- **F-78 Trae OAuth 授权闭环**：本机回环监听器（oauth_loopback）+ 系统代理豁免（含崩溃残留清理）+ code 交换分支；`client_secret` 外置 `conf/oauth_client.json`；refresh_token 生命周期（expires_at/失败计数/失效）联动池同步禁用与前端 RefreshTokenBadge 徽标；OAuth 回调页 HTML 转义修 XSS。
+- **CLI `--task-run refresh-credits`**：免 GUI 刷新全部账号积分，按积分包 CycleStartTime 归日口径重算 credits_daily 快照（实测将 API 可见历史 earned 修正为积分包周期重置口径）。
+- **F-68 Trae 项目列表/最近打开跨账号保留**：新增 `src-tauri/src/switcher/vscdb.rs`——切换恢复快照**前**抽出 `state.vscdb` 的两个全局键（`solo-lite.local-project-folders` 项目列表、`history.recentlyOpenedPathsList` 最近打开），恢复**后**按条目合并回写（快照内已有以快照为准，仅补入切换前多出的条目；数组按 id、entries 按 folderUri 去重，快照项在前；非 JSON 结构保守不改）；写前 `state.vscdb.f68.bak` 单代备份，失败自动回滚。`switcher/mod.rs::restore_profile` 仅在 icube 布局（TraeWork/Trae）且恢复成功时调用，进度流输出「项目列表/最近打开已跨账号保留（项目列表 +N / 最近打开 +N）」，合并失败仅 warn 不阻断切换。**账号分区键（`solo-lite:content-map:<uid>` 等）零改动**（跨账号合并会产生服务端归属校验失败的"幽灵会话"）。
+- **F-74 Buddy 切换时自动迁移会话（B2 会话域扩展）**：`commands/workbuddy/chatdata.rs` 新增 `BuddyApp{WorkBuddy,CodeBuddy}`——数据目录参数化为 `~/.workbuddy` / `~/.codebuddy`，备份根分离为 `data/workbuddy_chats` / `data/codebuddy_chats`（WorkBuddy 沿用原名，存量备份零迁移）；`chatdata_backup/restore/info/copy` 四命令新增可选 `app` 参数（空/未知回落 WorkBuddy＝旧行为）；核心逻辑抽出为与 Tauri 无关的 `backup_chats`/`restore_chats`/`copy_chats` 纯函数；前端账号管理页新增「WB 会话 / CB 会话」会话域切换（切换即按域重取「已备份」徽标）。
+- **F-74 Buddy 切换时自动迁移会话（B1 切换编排）**：新增设置项 `buddy_switch_migrate_chats`（**默认关**，设置页 Buddy 区「切换账号时自动迁移会话」卡片，勾选即存、失败原地回滚）。开启后 `switch_account` 的 WorkBuddy/CodeBuddy 分支会在桥的 **Stop→Restore→Start 之前**完成全部动作：① 判定当前账号（WorkBuddy 走共享 auth 文件反查，CodeBuddy 走桥 `current_account.txt` 标记优先——auth 文件会被 WorkBuddy 覆盖）→ 与目标相同或判定失败则跳过；② 备份当前账号三件套（失败仅告警并跳过迁移，**不阻断切换**）；③ `copy_chats(当前 → 目标)` 新 id 复制 + 云端映射注册。全程以 `switch-progress` 的 `stage=migrate` 行输出进度。
+
+### 变更
+
+- **【BREAKING】移除 Python 运行时依赖，全量 Rust 重写**：`tasks/`（wb_checkin / trae_checkin / doubao_quota / doubao_session / doubao_chats / ui_click 等 CLI 任务域）与 `device_proxy/`（hyper 自建 MITM：JWT 捕获、签到头改写、WS 帧解析、上游 VPN 透传、抓包脱敏日志）进程内承接原 src-python 全部能力，Python 100% 对齐补齐（`--capture-local` 本地 Cookies 解密兜底、明文上游路由、WS 握手/响应体超时、端口占用 PID 诊断、`AUTO_CAPTURE_JWT` 环境变量开关等）；审查修复 15 项（账号池回写保留全字段、并发 permit 持有至连接结束、WS 分帧累积/控制帧/帧脱敏、JWT+refresh 原子更新、Exit 还原 VPN 原值、WB 托盘/启动补签轮次锁等）。**打包产物不再携带 Python 运行时；计划任务直调主 exe（`--task-run <name>`），原 python 脚本 CLI 入口全部移除。**
+- **trae-switch-bridge.ps1 全量 Rust 化**：原 PowerShell 1534 行 / 24 函数对译为 `switcher/` 模块（mod / profile / locate / proc / machine / copy / icube / chromium / authfile）——exe 六级发现（`lnk`/`windows-registry` crate 替代 COM 与 Get-ItemProperty）、进程三级关闭（EnumWindows WM_CLOSE → TerminateProcess，sysinfo 0.33 锁定版对齐 MSRV 1.85）、6 层设备标识重置、三布局快照管线（.bak 单代轮转、完整性四项校验、vscdb -wal/-shm 边车、mtime 锚点防假阳性）细节全保留；前端零改动（NDJSON 行与 `*-done` 事件逐字段兼容、stage 文案逐字保留）、快照数据零迁移；8 处 powershell 管道调用点收敛为进程内直调，豆包 keepalive 计划任务启动器改直调主 exe `--task-run doubao-keepalive`（旧 cmd 启动期原地迁移）。
+- **积分「获得积分」归日口径重算**：原恒等式反推口径（earned = total − 昨日total + consumed）在积分包过期/消耗波动时虚增（实测昨日 +1300 失真）；改为「某日获得 = 该日新开积分包（entitlement_base_info.start_time 即 CycleStartTime）的 credits_limit 合计」（签到包与购买包均计，固定 UTC+8 归日，跨账号合并）；consumed 口径不变，API 可见范围内历史快照一并修正；移除 `CreditStats.today_non_checkin_earned` 失效口径。
+- **Buddy 资源调度页布局调整**：资源开关与调度参数合并为单一面板共用「保存」按钮；账号池选择上移至模型目录（Buddy）之前。
+- **积分看板增强**：Trae 积分到期日历移除 JWT token 条目、新增「剩余 X / 总 Y」展示（贯通 total_credits=积分包 credits_limit 合计）；Buddy 近 7 日积分消耗主数据源改为官方用量聚合（`workbuddy_usage_official_all`，31 天零填充 + 10 分钟缓存 + stale 回退），快照差分降级为回退；Buddy 积分包到期日历过滤剩余积分为 0 的包。
+- `run_in_background` 新增 `pre` 前置作业参数（其余调用点传 `None`，行为不变）；切换守卫 `expected_uid` 语义未改动。
+- `docs/backlog.md` v2.7：**W-01（Work 积分 209 接入 API 网关）标记 ❌ 已排除**——Trae 积分签到调整，前提与收益均不成立；条目与 §三 专题保留作技术留档，§四新增排除行、§五排序移除。F-68 / F-74 标记已完成。本周期 backlog 还登记 F-74 会话迁移（v2.1）、F-75 macOS 平台支持与 Windows 依赖分层迁移方案（v2.2）、F-76/F-77 网关优化；另完成 Python→Rust 迁移文档收尾（AGENT.md / tech-framework / user-manual 全量改 Rust tasks 表述）与五份主文档全面审校、完成计划归档。
+
+### 修复
+
+- **[P1] 证书安装 UAC 后闪退**（根因 icacls/NTFS 实验复现，对齐 3.4.5 用户反馈）：`harden_ca_dir` grant 不带 (OI)(CI) 继承标志 + `/inheritance:r` 致目录 DACL 清空（连属主都拒绝访问），certutil 提权也读不到 ca.cer → UAC 允许后控制台一闪而过、证书从未装上。修复：grant 加继承标志使收紧真正生效 + 双探针自验证（任一失败 `/reset /T` 回滚 fail-open）；`cert_install` 失败自愈（icacls /reset 后自动重试一次）；UAC 取消映射退出码 1223（原误报成功）+ 退出码翻译（0x80070005=权限不足）；`ensure_ca` 已存在分支缺 ca.cer 时从 ca.crt 补导出 DER；Dashboard 安装成功 toast 补 certmgr 搜索 `TraeDeviceProxyCA` 验证指引。
+- **[P1] 一键签到结果展示「积分+0」**（移植 main 12d051e 语义至 Rust）：`trae_checkin.rs` 信封宽容解析（沿 data/result/resp/response/info 递归下钻限深 8 层）+ `parse_claim_reward` 多层信封内层优先、跳过 0 值占位字段（`credits:0` 不再提前命中错判 delta，仅接受正值）+ `as_int_tolerant` 宽容归一；`Checkin.tsx` 兜底：delta 未获取到时显示「已签 · 余额 N/已签到」，already 分支不再把余额当增量展示。
+- **SQLite 迁移复审修复（P7 + 收尾）**：① accounts.user_id UNIQUE 防线——历史 JSON 遗留重复 uid 保序取首条，不再卡死启动迁移/静默清空账号表；② `Store::open` 损坏库自愈——健康探针失败后隔离主库/-wal/-shm 为 `*.corrupt-<ts>`（保留现场可人工抢救）+ app_log，重建空库不闪退；③ CLI 分支先执行 `migrate_on_startup`（否则升级后首次 GUI 前触发的计划任务对空库静默空转，且窗口内写入会被 GUI 首启迁移整表覆盖）；④ main.rs 迁移块前移至 settings/trim_logs 之前（否则升级首启读到全默认设置、日志按默认保留期误裁）；⑤ `import_accounts` 改 raw 保真导入（device_proxy 写入的 struct 外扩展字段如 refresh_token_updated_at 不再被 typed roundtrip 丢弃）+ 去重丢弃数写 app_log（静默丢账号可观测）；⑥ `wb_upstream::refresh_access_token` 死引用修复——统一走 store wb_tokens 表，网关 401 刷新不再错位到 data_dir 根路径的旧文件。
+- **F-74 复审 2 处缺口**：BuddyAccounts 徽标刷新 `useCallback([])` 固定身份闭包捕获首渲染 chatApp 恒为 WorkBuddy——切域后手动刷新/删除/导入/快照均按过期域重拉徽标，改经 `chatAppRef` 读最新值；切换失败客户端不重启（迁移前置作业内先杀客户端，而「目标账号无快照」预检失败路径在 stop_app 之前返回且无 start_app）——前置 `buddy_target_slot_exists` 预检，无快照跳过迁移。
+
+### 移除
+
+- `src-python/`（全部运行时脚本与测试）、`python.rs` 子进程管线、打包链 `prepare_python_runtime` / `make_portable_zip`；`src-ps/`、`tests/ps/`（Pester 黑盒测试由 cargo test 承接）；`tauri.conf.json` 相关 resources 与 `state.rs::resolve_ps_dir`。
+
+### 测试
+
+- cargo 单测 311 → **396** 全绿（本周期累计新增：switcher 29、store 基础设施与迁移 10+、`switcher::vscdb` 7（TEXT/BLOB 读取、缺键整体补入、数组按 id 去重、entries 按 folderUri 去重、完全一致零写入、非 JSON 保守不改、文件缺失安全跳过）、`chatdata::f74_app_tests` 2（应用域解析宽容回落、两域目录与备份根互不干扰）、签到信封解析 3、证书 ACL 回归等）；vitest 26/26、`tsc --noEmit` 全绿；全周期 cargo build 零编译警告。
+
+---
+
 ## [3.4.5] · feature/buddy 批次 5（生态吸收与网关增强，T5.2~T5.6/T5.8）
 
 ### 新增

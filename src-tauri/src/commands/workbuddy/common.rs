@@ -1,14 +1,12 @@
 //! WorkBuddy 共享底层（原 workbuddy.rs 机械拆分）：路径常量、账号池/凭证库/设置读写、
-//! 字段提取、脚本启动、续期互斥锁、会话 uid 防护、CLI 设置回滚等被多域复用的辅助。
+//! 字段提取、进程检测、续期互斥锁、会话 uid 防护、CLI 设置回滚等被多域复用的辅助。
 //! 函数逻辑零改动，仅将跨子模块引用项提升为 `pub(super)`。
 
 use sha2::{Digest, Sha256};
-use std::io::{BufRead, BufReader};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -44,22 +42,6 @@ pub(super) fn wb_data_dir() -> PathBuf {
 
 pub(super) fn snapshot_json_path() -> PathBuf {
     wb_data_dir().join("storage").join("skeleton").join("account-snapshot.json")
-}
-
-fn pool_path(state: &AppState) -> PathBuf {
-    state.data_dir.join("data").join("workbuddy_accounts.json")
-}
-
-pub(super) fn token_store_path(state: &AppState) -> PathBuf {
-    state.data_dir.join("data").join("workbuddy_token_store.json")
-}
-
-fn settings_path(state: &AppState) -> PathBuf {
-    state.data_dir.join("data").join("workbuddy_settings.json")
-}
-
-pub(super) fn checkin_results_path(state: &AppState) -> PathBuf {
-    state.data_dir.join("data").join("workbuddy_checkin_results.json")
 }
 
 pub(super) fn account_id_of(token: &str) -> String {
@@ -220,15 +202,19 @@ impl WorkBuddySettings {
 // ── 工具函数 ────────────────────────────────────────────────────────────────
 
 pub(super) fn load_pool(state: &AppState) -> WbPool {
-    fs_utils::read_json(&pool_path(state))
+    // SQLite 化（P3）：workbuddy_accounts.json → wb_accounts 表
+    let v = crate::store::docs::wb_pool_load(&crate::store::db(&state.data_dir));
+    serde_json::from_value(v).unwrap_or_default()
 }
 
 pub(super) fn save_pool(state: &AppState, pool: &WbPool) -> Result<(), String> {
-    fs_utils::write_json(&pool_path(state), pool)
+    let v = serde_json::to_value(pool).map_err(|e| format!("序列化失败: {e}"))?;
+    crate::store::docs::wb_pool_save(&crate::store::db(&state.data_dir), &v)
 }
 
 pub(super) fn load_settings(state: &AppState) -> WorkBuddySettings {
-    let mut s: WorkBuddySettings = fs_utils::read_json(&settings_path(state));
+    // SQLite 化（P2）：workbuddy_settings.json → kv `workbuddy_settings`
+    let mut s: WorkBuddySettings = crate::store::db(&state.data_dir).kv_get("workbuddy_settings");
     // 审查 P2：单字段非法只钳制该字段为默认值，不再整体 with_defaults() 重置
     //（避免损坏一个字段连带丢掉轮换/通知等其余配置）
     if s.lazy_refresh_hours <= 0 {
@@ -238,9 +224,9 @@ pub(super) fn load_settings(state: &AppState) -> WorkBuddySettings {
 }
 
 /// 失败通知统一入口（F-19）：桌面通知（有 AppHandle 时）+ 企业微信/Server酱可选渠道。
-/// 渠道配置来自 workbuddy_settings.json；渠道失败静默记日志，不影响主流程。
+/// 渠道配置来自 kv `workbuddy_settings`；渠道失败静默记日志，不影响主流程。
 pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &str, body: &str) {
-    let s: WorkBuddySettings = fs_utils::read_json(&data_dir.join("data").join("workbuddy_settings.json"));
+    let s: WorkBuddySettings = crate::store::db(data_dir).kv_get("workbuddy_settings");
     let channels = crate::notify::NotifyChannels {
         wechat_webhook: s.notify_wechat_webhook.clone().filter(|x| !x.trim().is_empty()),
         serverchan_sendkey: s.notify_serverchan_sendkey.clone().filter(|x| !x.trim().is_empty()),
@@ -289,34 +275,29 @@ pub fn workbuddy_settings_get(state: State<AppState>) -> WorkBuddySettings {
 
 #[tauri::command]
 pub fn workbuddy_settings_set(state: State<AppState>, patch: WorkBuddySettings) -> Result<(), String> {
-    fs_utils::write_json(&settings_path(&state), &patch)
+    crate::store::db(&state.data_dir).kv_set("workbuddy_settings", &patch)
 }
 
 // ── 工具侧凭证副本写入（F-10 双源化）───────────────────────────────────────
 
 pub(super) fn upsert_token_store(state: &AppState, id: &str, creds: &serde_json::Value) -> Result<(), String> {
-    let mut store: serde_json::Value = fs_utils::read_json(&token_store_path(state));
-    if !store.is_object() {
-        store = serde_json::json!({});
-    }
-    let obj = store.as_object_mut().unwrap();
-    if obj.get("version").is_none() {
-        obj.insert("version".into(), serde_json::json!(1));
-    }
-    let tokens = obj.entry("tokens").or_insert_with(|| serde_json::json!({}));
-    if let Some(t) = tokens.as_object_mut() {
-        let mut rec = t.get(id).cloned().unwrap_or(serde_json::json!({}));
-        if let Some(rm) = rec.as_object_mut() {
-            for (k, v) in creds.as_object().unwrap_or(&serde_json::Map::new()) {
-                if !v.is_null() {
-                    rm.insert(k.clone(), v.clone());
-                }
+    // SQLite 化（P3）：wb_tokens 表单行 UPSERT（merge 语义保留）
+    let store = crate::store::db(&state.data_dir);
+    let existing = crate::store::docs::wb_token_store_load(&store);
+    let mut rec = existing
+        .get("tokens")
+        .and_then(|t| t.get(id))
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    if let Some(rm) = rec.as_object_mut() {
+        for (k, v) in creds.as_object().unwrap_or(&serde_json::Map::new()) {
+            if !v.is_null() {
+                rm.insert(k.clone(), v.clone());
             }
-            rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
         }
-        t.insert(id.to_string(), rec);
+        rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
     }
-    fs_utils::write_json(&token_store_path(state), &store)
+    crate::store::docs::wb_token_store_upsert(&store, id, &rec)
 }
 
 // ── M3 凭证续期互斥（F-09，Rust 侧手动触发；schtasks 每周兜底走 python --renew-only）──
@@ -330,120 +311,6 @@ pub(super) fn wb_renew_locks(
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     > = std::sync::OnceLock::new();
     LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-// ── M4 python 脚本管线（NDJSON 事件）───────────────────────────────────────
-
-/// 脚本退出等待：轮询间隔 500ms；超时上限 15 分钟——签到脚本含重试轮次、网络/验证码
-/// 等待的合理上限，超过即判定 python 挂死，kill 兜底，防止轮次锁被永久持有（审查 P0）
-const WB_WAIT_POLL: Duration = Duration::from_millis(500);
-const WB_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-
-/// 轮次等待超时判定（纯函数便于单测）：累计等待达到上限即判超时
-fn wb_wait_timed_out(elapsed: Duration) -> bool {
-    elapsed >= WB_WAIT_TIMEOUT
-}
-
-/// 启动 python 脚本并把 stdout 逐行 emit 为 NDJSON 事件；done 行附带完成事件。
-/// `round`：签到/成长全局轮次锁 guard，移入等待线程持有至脚本退出（含超时 kill 兜底）。
-pub(super) fn spawn_wb_script(
-    app: AppHandle,
-    state: &State<AppState>,
-    script: &str,
-    args: &[String],
-    event: &str,
-    round: tokio::sync::MutexGuard<'static, ()>,
-) -> Result<(), String> {
-    let script_path = state.python_dir.join(script);
-    if !script_path.exists() {
-        return Err(format!("找不到脚本: {}", script_path.display()));
-    }
-    let mut cmd = Command::new(&state.python_exe);
-    cmd.arg(&script_path)
-        .args(args)
-        .creation_flags(0x08000000)
-        .env("AIWORKDATA_DIR", &state.data_dir)
-        .env("PYTHONIOENCODING", "utf-8")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("启动脚本失败: {e}"))?;
-    let stdout = child.stdout.take().ok_or("脚本无输出")?;
-    let stderr = child.stderr.take();
-    let app2 = app.clone();
-    let ev = event.to_string();
-    let data_dir = state.data_dir.clone();
-    let data_dir2 = data_dir.clone();
-
-    // stderr 独立线程读取（审查 P2，写法对齐 doubao.rs）：与 stdout 循环并行消费管道，
-    // 防止 stderr 缓冲区写满使子进程阻塞、而父线程仍卡在等 stdout 的互锁死锁；
-    // 同时落日志保留排查线索
-    if let Some(stderr) = stderr {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().flatten() {
-                fs_utils::app_log(&data_dir, &format!("[wb-script] {line}"));
-            }
-        });
-    }
-
-    // stdout 循环照旧：逐行 emit，EOF（子进程 stdout 关闭）后向等待线程发信号，
-    // 保证 exit 事件仍晚于全部数据行发射
-    let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            let l = line.trim().to_string();
-            if l.is_empty() {
-                continue;
-            }
-            // done 行同时发独立 done 事件（前端据 "type":"done" 归约即可，无需额外事件名）
-            let _ = app2.emit(&ev, &l);
-        }
-        let _ = eof_tx.send(());
-    });
-
-    // 等待线程：try_wait 每 500ms 轮询，累计超 15 分钟仍不退出 → kill 兜底并回收
-    // （python 挂死时原 child.wait() 无超时会使轮次锁永久持有、功能假死，审查 P0）；
-    // 轮次锁 guard 在此线程持有至子进程确定退出，RAII 防泄漏
-    let app3 = app.clone();
-    let ev2 = event.to_string();
-    std::thread::spawn(move || {
-        let _round_guard = round;
-        let started = std::time::Instant::now();
-        let mut timed_out = false;
-        let status: std::io::Result<std::process::ExitStatus> = loop {
-            match child.try_wait() {
-                Ok(Some(s)) => break Ok(s),
-                Ok(None) => {
-                    if wb_wait_timed_out(started.elapsed()) {
-                        timed_out = true;
-                        let _ = child.kill();
-                        // kill 后回收；try_wait 极端竞态未及终态时以阻塞 wait 兜底
-                        break match child.try_wait().ok().flatten() {
-                            Some(s) => Ok(s),
-                            None => child.wait(),
-                        };
-                    }
-                    std::thread::sleep(WB_WAIT_POLL);
-                }
-                Err(e) => break Err(e),
-            }
-        };
-        // 等全部 stdout 行 emit 完再发退出事件（正常路径/超时 kill 后管道均会关闭，
-        // EOF 信号立即到达；孙进程继承句柄等边缘导致 EOF 延迟时短超时兜底，不阻塞解锁）
-        let _ = eof_rx.recv_timeout(Duration::from_secs(2));
-        if timed_out {
-            fs_utils::app_log(
-                &data_dir2,
-                &format!(
-                    "[wb-script] {ev2} 脚本超过 {:?} 未退出，已强制结束（轮次锁释放）",
-                    WB_WAIT_TIMEOUT
-                ),
-            );
-        }
-        let _ = app3.emit(&ev2, format!("{{\"type\":\"exit\",\"ok\":{}}}", status.map(|s| s.success()).unwrap_or(false)));
-    });
-    Ok(())
 }
 
 // ── CLI settings.json 回滚（审查 P2 原子写）────────────────────────────────
@@ -501,18 +368,4 @@ pub(super) fn wb_chat_uid_guard(state: &AppState, user_id: &str) -> Result<(), S
         return Err(format!("账号不在池中: {user_id}"));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wb_wait_timed_out_boundary() {
-        // 未达上限：继续轮询；恰好达到/超过上限：判超时（kill 兜底，轮次锁可释放）
-        assert!(!wb_wait_timed_out(Duration::ZERO));
-        assert!(!wb_wait_timed_out(WB_WAIT_TIMEOUT - Duration::from_millis(1)));
-        assert!(wb_wait_timed_out(WB_WAIT_TIMEOUT));
-        assert!(wb_wait_timed_out(WB_WAIT_TIMEOUT * 2));
-    }
 }

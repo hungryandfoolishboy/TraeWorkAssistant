@@ -1,18 +1,28 @@
-use std::io::{BufRead, BufReader};
+//! 代理控制命令（P4-8 Rust 化）：直接驱动进程内 [`crate::device_proxy::ProxyServer`]，
+//! 不再派发 python 子进程。本文件仅保留「系统代理编排 + 看门狗 + 托盘同步」编排层，
+//! MITM/JWT 捕获/日志等细节全部在 device_proxy 模块内完成（日志经 ProxyLog 直接
+//! emit `proxy-log` / `account-captured` 事件，与原 stdout 消费通路对齐）。
+
 use std::os::windows::process::CommandExt;
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::watch;
 
 use crate::fs_utils;
 use crate::state::AppState;
 
-/// 看门狗标记：用户主动停止代理时置 true，用于区分「主动停止」与「代理进程意外崩溃」。
-/// 代理进程意外退出时，系统代理仍指向死端口 127.0.0.1:8899，需自动还原以避免全局断网。
+/// 看门狗标记：用户主动停止代理时置 true，用于区分「主动停止」与「代理异常崩溃」。
+/// 代理意外退出时，系统代理仍指向死端口 127.0.0.1:8899，需自动还原以避免全局断网。
 static PROXY_INTENTIONAL_STOP: AtomicBool = AtomicBool::new(false);
+
+/// 代理代际计数：每次启动递增。看门狗据此丢弃「迟到的崩溃报告」，
+/// 避免崩溃后用户秒速重启新代理时，旧看门狗误还原新实例的系统代理。
+static PROXY_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// 启动代理前已存在的系统代理（通常是用户的 VPN 梯子，如 Clash/v2rayN 的本地代理）。
 /// 我们启动时会把系统代理全局指向本机 127.0.0.1:8899，并把这个外部代理作为「上游」透传，
@@ -20,18 +30,12 @@ static PROXY_INTENTIONAL_STOP: AtomicBool = AtomicBool::new(false);
 /// 存储 (enabled, server, override)。
 static PREV_SYSTEM_PROXY: Mutex<Option<(bool, String, String)>> = Mutex::new(None);
 
+/// 运行中的代理句柄（进程内 ProxyServer + 启动元数据）。
+/// Drop 不需要 kill 子进程：ProxyServer 析构即发送 shutdown 信号终止 accept 循环。
 pub struct ProxyHandle {
-    pub child: Child,
-    pub port: u16,
+    pub server: crate::device_proxy::ProxyServer,
     pub started_at: i64,
-    pub captured: Arc<AtomicI64>,
-}
-
-impl Drop for ProxyHandle {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+    pub gen: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -49,48 +53,36 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 查询监听指定端口的进程 PID 列表（对齐 Python port_pids 诊断；netstat -ano 解析，
+/// 探测失败返回空表，仅供错误信息展示）。列格式：TCP 本地地址 远程地址 状态 PID。
+fn port_pids(port: u16) -> Vec<String> {
+    let Ok(out) = Command::new("netstat")
+        .args(["-ano", "-p", "TCP"])
+        .creation_flags(0x08000000)
+        .output()
+    else {
+        return vec![];
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let suffix = format!(":{port}");
+    let mut pids: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 5
+            && cols[0].eq_ignore_ascii_case("TCP")
+            && cols[1].ends_with(&suffix)
+            && cols[3].eq_ignore_ascii_case("LISTENING")
+            && !pids.iter().any(|p| p == cols[4])
+        {
+            pids.push(cols[4].to_string());
+        }
+    }
+    pids
+}
+
 /// 安全获取 Mutex 锁，即使中毒也能恢复（避免 panic 级联）。
 fn safe_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// 结束与本应用 device_proxy.py 同脚本路径的遗留 python 进程（父进程已死的孤儿代理），
-/// 返回被结束的 PID 列表。按完整脚本路径匹配，不误伤其他程序/其他安装副本。
-#[cfg(target_os = "windows")]
-fn kill_stale_proxy_processes(script_path: &std::path::Path) -> Vec<u32> {
-    let me = script_path.to_string_lossy().replace('/', "\\").to_lowercase();
-    let out = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
-        ])
-        .creation_flags(0x08000000)
-        .output();
-    let Ok(out) = out else { return Vec::new() };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let Ok(items) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
-        return Vec::new();
-    };
-    let items = match items {
-        serde_json::Value::Array(a) => a,
-        v @ serde_json::Value::Object(_) => vec![v],
-        _ => return Vec::new(),
-    };
-    let mut killed = Vec::new();
-    for it in items {
-        let cl = it["CommandLine"].as_str().unwrap_or("").replace('/', "\\").to_lowercase();
-        let pid = it["ProcessId"].as_u64().unwrap_or(0) as u32;
-        if pid != 0 && cl.contains(&me) && Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).creation_flags(0x08000000).output().map(|o| o.status.success()).unwrap_or(false) {
-            killed.push(pid);
-        }
-    }
-    killed
-}
-
-#[cfg(not(target_os = "windows"))]
-fn kill_stale_proxy_processes(_script_path: &std::path::Path) -> Vec<u32> {
-    Vec::new()
 }
 
 /// 同步托盘「代理」菜单文本（未运行显示"启动"，运行中显示"停止"）；
@@ -103,75 +95,47 @@ fn sync_tray_proxy_text(app: &tauri::AppHandle, running: bool) {
     }
 }
 
-// async：内含 PowerShell 孤儿进程扫描（Get-CimInstance 可达数秒）、sleep 与注册表操作，
-// 同步命令会冻结 UI（项目约定：阻塞型命令一律 #[tauri::command(async)]，审查修复）
-#[tauri::command(async)]
-pub fn proxy_start(
-    app: AppHandle,
-    state: State<AppState>,
-    proxy_state: State<Mutex<Option<ProxyHandle>>>,
+// ---------------- 启动 / 停止 核心逻辑（页面命令 / 托盘菜单共用） ----------------
+
+/// 启动代理核心逻辑（对齐 Python 桌面端注入的环境变量集合，但全部改为进程内配置）
+pub async fn do_start(
+    app: &AppHandle,
+    state: &AppState,
+    proxy_state: &Mutex<Option<ProxyHandle>>,
     port: u16,
 ) -> Result<ProxyStatus, String> {
     // 标记「非主动停止」，供看门狗区分崩溃与用户停止
     PROXY_INTENTIONAL_STOP.store(false, Ordering::Relaxed);
-    // [诊断] 记录命令是否到达 Rust 与关键路径解析
-    fs_utils::app_log(
-        &state.data_dir,
-        &format!(
-            "proxy_start 已到达 Rust: python_dir={:?}, python_exe={}, device_proxy.py 存在={}",
-            state.python_dir,
-            state.python_exe,
-            state.python_dir.join("device_proxy.py").exists()
-        ),
-    );
     {
-        let guard = safe_lock(&proxy_state);
-        if guard.is_some() {
-            return Err("代理已在运行".into());
-        }
+        let mut g = safe_lock(proxy_state);
+        match &*g {
+            Some(h) if h.server.is_running() => return Err("代理已在运行".into()),
+            // 残留死句柄（崩溃后看门狗尚未清理）：直接回收后继续启动
+            Some(_) => g.take(),
+            None => None,
+        };
     }
     // 兜底：端口为 0 时退化为固定端口 8899，避免注入 TRAE 的代理地址无效（见 store.ts 同款兜底）
     let port = if port == 0 { 8899 } else { port };
     // 记录本次使用的端口：cleanup_stale_local_proxy 据此识别「指向已停止本地代理的残留系统代理」
     let _ = std::fs::write(state.data_dir.join("last_proxy_port.txt"), port.to_string());
-    // 本机代理监听地址（系统代理将指向它）
     let proxy_addr = format!("127.0.0.1:{port}");
-    let script_path = state.python_dir.join("device_proxy.py");
-    if !script_path.exists() {
-        return Err(format!("找不到脚本: {}", script_path.display()));
-    }
 
-    // 端口预检：Python 侧已改独占绑定（bind 失败即退出），此处先探测真实占用并
-    // 清理遗留孤儿代理进程（issue #7：曾因 SO_REUSEADDR 出现「假启动」+ 孤儿接客）
+    // 端口预检（友好报错；真正的独占绑定在 ProxyServer::start 内以
+    // SO_EXCLUSIVEADDRUSE 完成，issue #7 防重复绑定「假启动」）
     match std::net::TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => drop(l),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            let killed = kill_stale_proxy_processes(&script_path);
-            if !killed.is_empty() {
-                fs_utils::app_log(&state.data_dir, &format!("已清理遗留代理进程 PID: {killed:?}"));
-            }
-            // 给被终止进程一点释放端口的时间，再验证端口是否真正可用
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            if let Err(e2) = std::net::TcpListener::bind(("127.0.0.1", port)) {
-                if e2.kind() == std::io::ErrorKind::AddrInUse {
-                    return Err(format!(
-                        "端口 {port} 被其他程序占用且无法自动清理，请修改代理端口或手动结束后重试"
-                    ));
-                }
-                return Err(format!("端口探测失败: {e2}"));
-            }
+            // PID 诊断（对齐 Python 绑定失败时列出占用进程）
+            let pids = port_pids(port);
+            let pid_info = if pids.is_empty() { "未知".to_string() } else { pids.join(",") };
+            return Err(format!(
+                "端口 {port} 被其他程序占用（PID: {pid_info}），请修改代理端口或手动结束后重试"
+            ));
         }
         Err(e) => return Err(format!("端口探测失败: {e}")),
     }
 
-    let data_dir = state.data_dir.to_string_lossy().to_string();
-    let port_s = port.to_string();
-    let settings = state.settings();
-    let proxy_domains = settings.proxy_domains.clone();
-    let proxy_log_path = settings.proxy_log_path.clone().unwrap_or_else(|| {
-        // 默认路径：%APPDATA%\AIWorkAssistant\logs（代理请求日志直接存放在 logs/ 下）
-        state.logs_dir().to_string_lossy().to_string()
-    });
     // 捕获启动前的系统代理（通常是用户的 VPN 梯子，如 Clash/v2rayN 本地代理）。
     // 启动后我们会把系统代理全局指向本机 127.0.0.1:8899，从而拦截所有流量；
     // 若不把原本的 VPN 代理作为「上游」透传，外网(google/github)会直接连不通 ——
@@ -204,135 +168,52 @@ pub fn proxy_start(
         }
     };
 
-    let mut cmd = Command::new(&state.python_exe);
-    cmd.arg(&script_path)
-        .creation_flags(0x08000000)
-        .env("AIWORKDATA_DIR", &data_dir)
-        .env("PROXY_PORT", &port_s)
-        .env("AUTO_CAPTURE_JWT", "1")
-        .env("PROXY_DOMAINS", &proxy_domains)
-        .env("PROXY_LOG_PATH", &proxy_log_path)
-        .env("PYTHONIOENCODING", "utf-8");
-    if let Some(up) = &upstream_proxy {
-        cmd.env("UPSTREAM_PROXY", up);
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("启动代理失败: {e}"))?;
-    // 挂入 Job Object（kill-on-close）：应用崩溃/被强杀时 OS 自动回收子进程，
-    // 与 RunEvent::Exit 的 Drop 清理互补，彻底杜绝孤儿代理（issue #7）
-    crate::python::assign_job_object(&child);
-    let stdout = child.stdout.take().ok_or("代理无标准输出")?;
-    let stderr = child.stderr.take();
+    let settings = state.settings();
+    let cfg = crate::device_proxy::ProxyConfig {
+        port,
+        // 设置页 PROXY_DOMAINS：逗号分隔（空串/缺省由 settings() 回填默认域名）
+        targets: settings
+            .proxy_domains
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        // AUTO_CAPTURE_JWT 环境变量开关（对齐 Python 语义：0/false/False/空 = 关，缺省开）
+        auto_capture_jwt: !std::env::var("AUTO_CAPTURE_JWT")
+            .map(|v| matches!(v.as_str(), "0" | "false" | "False" | ""))
+            .unwrap_or(false),
+        // SQLite 化（P3）：账号/冷却/凭证快照经 store 读写，仅传数据根目录
+        data_dir: state.data_dir.clone(),
+        certs_dir: state.path("certs"),
+        log_path: state.logs_dir().join("proxy.log"),
+        req_log_dir: std::path::PathBuf::from(
+            settings
+                .proxy_log_path
+                .clone()
+                .unwrap_or_else(|| state.logs_dir().to_string_lossy().to_string()),
+        ),
+        upstream: upstream_proxy.as_deref().and_then(crate::device_proxy::upstream::parse_upstream),
+    };
 
+    let gen = PROXY_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+    let server = crate::device_proxy::ProxyServer::start(cfg, Some(app.clone()))
+        .await
+        .map_err(|e| {
+            fs_utils::app_log(&state.data_dir, &format!("代理启动失败: {e}"));
+            e
+        })?;
     let started_at = now_secs();
-    let captured = Arc::new(AtomicI64::new(0));
+
+    // 看门狗：代理任务异常退出（崩溃）时还原系统代理并报警（详见 spawn_watchdog）
+    spawn_watchdog(app.clone(), state.data_dir.clone(), gen, server.exit_signal());
+
     {
-        let mut g = safe_lock(&proxy_state);
-        *g = Some(ProxyHandle {
-            child,
-            port,
-            started_at,
-            captured: captured.clone(),
-        });
+        let mut g = safe_lock(proxy_state);
+        *g = Some(ProxyHandle { server, started_at, gen });
     }
 
-    fs_utils::app_log(
-        &state.data_dir,
-        &format!("代理已启动: port={port}, pid 已归入 ProxyHandle"),
-    );
-
-    // 启动成功：向「实时代理输出」面板明确推送监听地址，便于一眼确认代理是否接上流量
-    let listen_line = format!("代理已监听 127.0.0.1:{port}（等待 Trae Work 流量…）");
-    let _ = app.emit("proxy-log", &listen_line);
-    {
-        let log_path =
-            std::path::Path::new(&data_dir).join("logs").join("proxy.log");
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        append_log(&log_path, &listen_line);
-    }
-
-    let app_for_thread = app.clone();
-    let app_for_stderr = app.clone();
-    let data_dir2 = data_dir.clone();
-    let data_dir3 = data_dir.clone();
-    let captured_thread = captured.clone();
-
-    // stdout 线程：逐行读取 -> 事件 emit + 日志追加
-    std::thread::spawn(move || {
-        let log_path = std::path::Path::new(&data_dir2).join("logs").join("proxy.log");
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                let l = l.trim().to_string();
-                if l.is_empty() {
-                    continue;
-                }
-                let _ = app_for_thread.emit("proxy-log", &l);
-                if let Some(uid) = extract_uid(&l) {
-                    captured_thread.fetch_add(1, Ordering::Relaxed);
-                    let _ = app_for_thread.emit("account-captured", &uid);
-                }
-                let _ = append_log(&log_path, &l);
-            }
-        }
-
-        // ── 看门狗 ────────────────────────────────────────────────────────────
-        // 走到这里说明子进程 stdout 已 EOF（进程退出）。
-        // 若不是「用户主动点击停止」（PROXY_INTENTIONAL_STOP 为 false），
-        // 则说明是代理进程「意外崩溃」。此时系统代理仍指向死端口 127.0.0.1:8899，
-        // 会导致本机全局断网（签到、Trae 自身流量全部 10061 失败）。
-        // 主动还原系统代理并向前端报警。
-        if !PROXY_INTENTIONAL_STOP.load(Ordering::Relaxed) {
-            let _ = app_for_thread.emit(
-                "proxy-log",
-                "[严重] 代理进程异常退出，正在还原系统代理以避免全局断网…",
-            );
-            fs_utils::app_log(std::path::Path::new(&data_dir2), "代理进程异常退出，自动还原系统代理");
-            // 还原策略与 proxy_stop 一致：启动前存在启用的外部代理（用户 VPN 梯子）→ 原样还原，
-            // 否则清空系统代理。peek 克隆（不 take）：PREV_SYSTEM_PROXY 必须保留给后续
-            // proxy_stop 继续还原（看门狗不消费快照，仅消费其副本）。
-            let res = {
-                let prev = PREV_SYSTEM_PROXY
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                match prev {
-                    Some((en, sv, ov)) if en => apply_proxy(true, &sv, &ov),
-                    _ => clear_win_proxy(),
-                }
-            };
-            if let Err(e) = res {
-                fs_utils::app_log(
-                    std::path::Path::new(&data_dir2),
-                    &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
-                );
-            }
-            let _ = app_for_thread.emit("proxy-crashed", "");
-            sync_tray_proxy_text(&app_for_thread, false);
-        }
-    });
-
-    // stderr 线程：单独读取，防止管道缓冲区写满导致子进程死锁
-    if let Some(stderr) = stderr {
-        std::thread::spawn(move || {
-            let log_path =
-                std::path::Path::new(&data_dir3).join("logs").join("proxy.log");
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(l) = line {
-                    let l = format!("[stderr] {}", l.trim());
-                    // 同时发到前端，避免 Python 启动即崩（如缺依赖）时面板空白、错误只进文件
-                    let _ = app_for_stderr.emit("proxy-log", &l);
-                    let _ = append_log(&log_path, &l);
-                }
-            }
-        });
-    }
+    fs_utils::app_log(&state.data_dir, &format!("代理已启动: port={port}, 进程内代理"));
 
     // 同步把 Windows 系统代理指向本机端口，使 TRAE 鉴权请求(api.trae.cn)汇入本代理
     match set_win_proxy(&proxy_addr) {
@@ -348,13 +229,67 @@ pub fn proxy_start(
         }
     }
 
-    sync_tray_proxy_text(&app, true);
+    sync_tray_proxy_text(app, true);
     Ok(ProxyStatus {
         running: true,
         port,
         captured: 0,
         started_at: Some(started_at),
     })
+}
+
+/// 代理异常退出看门狗（对齐 Python 版 stdout EOF 看门狗语义）：
+/// 代理任务退出（崩溃或主动 stop）都会收到 exit 信号；仅当「非主动停止」且
+/// 代际未更替时判定为崩溃 —— 系统代理仍指向死端口会导致本机全局断网（签到、
+/// Trae 流量全部 10061 失败），须立即还原并向前端报警。
+fn spawn_watchdog(app: AppHandle, data_dir: PathBuf, gen: u64, mut exit_rx: watch::Receiver<bool>) {
+    tauri::async_runtime::spawn(async move {
+        // Ok(true)=shutdown 信号 / Err=发送端析构（句柄被 drop）——均表示代理任务已退出
+        let _ = exit_rx.changed().await;
+        if PROXY_INTENTIONAL_STOP.load(Ordering::Relaxed) {
+            return;
+        }
+        // 代际已更替（崩溃后用户重启了新代理）：旧看门狗不得干扰新实例
+        if PROXY_GEN.load(Ordering::Relaxed) != gen {
+            return;
+        }
+        // 清理死句柄（仅当代际匹配，避免误清新实例）
+        if let Some(ps) = app.try_state::<Mutex<Option<ProxyHandle>>>() {
+            let mut g = ps.lock().unwrap_or_else(|e| e.into_inner());
+            if g.as_ref().map(|h| h.gen) == Some(gen) {
+                g.take();
+            }
+        }
+        let _ = app.emit(
+            "proxy-log",
+            "[严重] 代理异常退出，正在还原系统代理以避免全局断网…",
+        );
+        fs_utils::app_log(&data_dir, "代理异常退出，自动还原系统代理");
+        // 还原策略与 proxy_stop 一致：启动前存在启用的外部代理（用户 VPN 梯子）→ 原样还原，
+        // 否则清空系统代理。peek 不消费快照：PREV_SYSTEM_PROXY 必须保留给后续
+        // proxy_stop 继续还原（看门狗不消费，仅用其副本）。
+        let res = restore_system_proxy(false);
+        if let Err(e) = res {
+            if let Some(s) = app.try_state::<AppState>() {
+                fs_utils::app_log(
+                    &s.data_dir,
+                    &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
+                );
+            }
+        }
+        let _ = app.emit("proxy-crashed", "");
+        sync_tray_proxy_text(&app, false);
+    });
+}
+
+#[tauri::command]
+pub async fn proxy_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    proxy_state: State<'_, Mutex<Option<ProxyHandle>>>,
+    port: u16,
+) -> Result<ProxyStatus, String> {
+    do_start(&app, &state, &proxy_state, port).await
 }
 
 #[tauri::command]
@@ -365,42 +300,24 @@ pub fn proxy_stop(
 ) -> Result<ProxyStatus, String> {
     let mut g = safe_lock(&proxy_state);
     let (port, captured) = match &*g {
-        Some(h) => (h.port, h.captured.load(Ordering::Relaxed)),
+        Some(h) => (h.server.port, h.server.captured.load(Ordering::Relaxed)),
         None => (0, 0),
     };
     if let Some(h) = g.take() {
         // 标记「主动停止」，避免看门狗把正常停止误判为崩溃而重复还原代理
         PROXY_INTENTIONAL_STOP.store(true, Ordering::Relaxed);
-        let c = h.captured.load(Ordering::Relaxed);
+        let c = h.server.captured.load(Ordering::Relaxed);
+        // 发送 shutdown 信号终止 accept 循环并中止在途连接（句柄随即 drop，同样触发）
+        h.server.stop();
         fs_utils::app_log(&state.data_dir, &format!("代理已停止: 共捕获 {c} 个账号"));
-        // h 在此处 drop，Drop trait 会 kill + wait 子进程
     }
-    // 还原系统代理：若启动前存在外部代理(VPN)，则还原之；否则清空，避免本机全局断网
-    #[cfg(target_os = "windows")]
-    {
-        let prev = PREV_SYSTEM_PROXY
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let res = match prev {
-            Some((en, sv, ov)) if en => apply_proxy(true, &sv, &ov),
-            _ => clear_win_proxy(),
-        };
-        if let Err(e) = res {
-            fs_utils::app_log(
-                &state.data_dir,
-                &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
-            );
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Err(e) = clear_win_proxy() {
-            fs_utils::app_log(
-                &state.data_dir,
-                &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
-            );
-        }
+    // 还原系统代理（#14 共用）：若启动前存在外部代理(VPN)，则还原之；否则清空，
+    // 避免本机全局断网（consume=true 取走快照，本轮还原一次性）
+    if let Err(e) = restore_system_proxy(true) {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
+        );
     }
     sync_tray_proxy_text(&_app, false);
     Ok(ProxyStatus {
@@ -420,9 +337,9 @@ pub fn proxy_status(
     let g = safe_lock(&proxy_state);
     match &*g {
         Some(h) => ProxyStatus {
-            running: true,
-            port: h.port,
-            captured: h.captured.load(Ordering::Relaxed),
+            running: h.server.is_running(),
+            port: h.server.port,
+            captured: h.server.captured.load(Ordering::Relaxed),
             started_at: Some(h.started_at),
         },
         None => ProxyStatus {
@@ -431,42 +348,6 @@ pub fn proxy_status(
             captured: 0,
             started_at: None,
         },
-    }
-}
-
-fn extract_uid(line: &str) -> Option<String> {
-    // 形如 "...user=4487568582777872..." 或 "user_id=..."
-    if let Some(idx) = line.find("user=") {
-        let rest = &line[idx + 5..];
-        let end = rest
-            .find(|c: char| !(c.is_ascii_digit() || c == '_'))
-            .unwrap_or(rest.len());
-        let uid = &rest[..end];
-        if uid.chars().all(|c| c.is_ascii_digit()) && !uid.is_empty() {
-            return Some(uid.to_string());
-        }
-    }
-    if let Some(idx) = line.find("user_id=") {
-        let rest = &line[idx + 8..];
-        let end = rest
-            .find(|c: char| !(c.is_ascii_digit() || c == '_'))
-            .unwrap_or(rest.len());
-        let uid = &rest[..end];
-        if uid.chars().all(|c| c.is_ascii_digit()) && !uid.is_empty() {
-            return Some(uid.to_string());
-        }
-    }
-    None
-}
-
-fn append_log(path: &std::path::Path, line: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(f, "[{}] {}", crate::fs_utils::now_ts(), line);
     }
 }
 
@@ -498,6 +379,45 @@ pub(crate) fn set_win_proxy(addr: &str) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 pub(crate) fn clear_win_proxy() -> Result<(), String> {
     apply_proxy(false, "", "")
+}
+
+/// 还原系统代理（#14 提取共用）：启动前存在启用的外部代理（用户 VPN 梯子）→ 原样
+/// 还原，否则清空系统代理。`consume=true` 取走快照（proxy_stop / 应用退出，一次性）；
+/// `consume=false` 仅窥视（看门狗崩溃路径不消费，保留给后续 proxy_stop 继续还原）。
+pub(crate) fn restore_system_proxy(consume: bool) -> Result<(), String> {
+    let prev = {
+        let mut g = PREV_SYSTEM_PROXY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if consume {
+            g.take()
+        } else {
+            g.clone()
+        }
+    };
+    match prev {
+        Some((en, sv, ov)) if en => apply_proxy(true, &sv, &ov),
+        _ => clear_win_proxy(),
+    }
+}
+
+/// 应用退出路径专用（#14）：仅当「我们曾接管系统代理」时才还原，避免误关用户自己的梯子。
+/// `proxy_was_running`：退出清理时代理句柄是否存在（代理仍在运行）。
+/// - 捕获到用户 VPN 原值 → 原样还原（consume，一次性）；
+/// - 无 VPN 原值但代理在运行 → 我们曾把系统代理指向本机端口 → 清空；
+/// - 两者皆无（代理从未启动 / 已正常停止并还原过）→ 不触碰系统代理。
+pub(crate) fn restore_system_proxy_on_exit(proxy_was_running: bool) -> Result<(), String> {
+    let prev = PREV_SYSTEM_PROXY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    match prev {
+        Some((true, sv, ov)) => apply_proxy(true, &sv, &ov),
+        // 防御分支：快照存在但未启用（正常路径不会出现，get_existing 仅存启用项）
+        Some(_) => clear_win_proxy(),
+        None if proxy_was_running => clear_win_proxy(),
+        None => Ok(()),
+    }
 }
 
 /// 直开应用前的防御：若系统代理仍指向本机「我们上次使用的端口」而本地代理已停止
@@ -626,4 +546,9 @@ fn set_win_proxy(_addr: &str) -> Result<(), String> {
 #[cfg(not(target_os = "windows"))]
 fn clear_win_proxy() -> Result<(), String> {
     Err("仅 Windows 支持系统代理设置".into())
+}
+
+/// 应用退出路径使用：标记「主动停止」，让看门狗静默（退出清理由 RunEvent::Exit 统一完成）
+pub(crate) fn mark_intentional_stop() {
+    PROXY_INTENTIONAL_STOP.store(true, Ordering::Relaxed);
 }
