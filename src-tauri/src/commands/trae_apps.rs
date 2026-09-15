@@ -368,8 +368,9 @@ pub fn backfill_dc_id_for(data_dir: &std::path::Path, user_id: &str) -> Option<S
     if uid.is_empty() {
         return None;
     }
-    let accounts_path = data_dir.join("checkin_accounts.json");
-    let accounts: crate::models::AccountsFile = fs_utils::read_json(&accounts_path);
+    // SQLite 化（P4）：accounts 表（raw 读取不在此处需要；typed 已覆盖 dc_id 字段）
+    let accounts: crate::models::AccountsFile =
+        crate::store::docs::accounts_load(&crate::store::db(data_dir));
     // 已记录则跳过
     if accounts
         .accounts
@@ -417,7 +418,7 @@ pub fn backfill_dc_id_for(data_dir: &std::path::Path, user_id: &str) -> Option<S
     {
         a.dc_id = Some(dc.clone());
         a.updated_at = Some(fs_utils::now_iso());
-        if fs_utils::write_json(&accounts_path, &accounts).is_ok() {
+        if crate::store::docs::accounts_save(&crate::store::db(data_dir), &mut accounts).is_ok() {
             fs_utils::app_log(
                 data_dir,
                 &format!("已记录账户中心id(预留): user_id={uid} dc={dc}"),
@@ -432,7 +433,7 @@ pub fn backfill_dc_id_for(data_dir: &std::path::Path, user_id: &str) -> Option<S
 #[tauri::command]
 pub fn accounts_backfill_dc_ids(state: State<AppState>) -> usize {
     let accounts: crate::models::AccountsFile =
-        fs_utils::read_json(&state.path("checkin_accounts.json"));
+        crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
     let mut n = 0usize;
     for a in &accounts.accounts {
         let Some(uid) = a.user_id.clone() else { continue };

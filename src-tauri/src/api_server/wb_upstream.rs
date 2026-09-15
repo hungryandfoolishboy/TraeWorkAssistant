@@ -335,10 +335,12 @@ static TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// API 网关 401 自动续期（无 Tauri State 依赖，仅 data_dir）。
 /// 成功返回新 accessToken；失败返回 Err（调用方按 SwitchKey 换号）。
 pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Result<String, String> {
-    let store_path = data_dir.join("workbuddy_token_store.json");
+    // SQLite 化（P4）：死引用修复——原读写 data_dir **根**路径的 workbuddy_token_store.json
+    // （正牌在 data/ 子目录，此分叉使网关 401 刷新永远读写错位文件），现统一走 store wb_tokens 表
+    let store_db = crate::store::db(data_dir);
     let refresh = {
         let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let store: serde_json::Value = fs_utils::read_json(&store_path);
+        let store: serde_json::Value = crate::store::docs::wb_token_store_load(&store_db);
         let rec = store
             .get("tokens")
             .and_then(|t| t.get(account_id))
@@ -402,33 +404,31 @@ pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Res
     // 锁内重读最新 store 再合并写回（网络段已释放锁），并发刷新不丢他账号更新
     {
         let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut store: serde_json::Value = fs_utils::read_json(&store_path);
-        if !store.is_object() {
-            store = serde_json::json!({});
-        }
-        let obj = store.as_object_mut().ok_or("token store 结构异常")?;
-        obj.entry("version".to_string()).or_insert(serde_json::json!(1));
-        let tokens = obj.entry("tokens".to_string()).or_insert_with(|| serde_json::json!({}));
-        if let Some(t) = tokens.as_object_mut() {
-            let mut r = t.get(account_id).cloned().unwrap_or(serde_json::json!({}));
-            if let Some(rm) = r.as_object_mut() {
-                rm.insert("access_token".into(), serde_json::json!(new_access));
-                if let Some(nr) = &new_refresh {
-                    if !nr.is_empty() {
-                        rm.insert("refresh_token".into(), serde_json::json!(nr));
-                    }
+        let mut r = {
+            let store: serde_json::Value = crate::store::docs::wb_token_store_load(&store_db);
+            store
+                .get("tokens")
+                .and_then(|t| t.get(account_id))
+                .cloned()
+                .unwrap_or(serde_json::json!({}))
+        };
+        if let Some(rm) = r.as_object_mut() {
+            rm.insert("access_token".into(), serde_json::json!(new_access));
+            if let Some(nr) = &new_refresh {
+                if !nr.is_empty() {
+                    rm.insert("refresh_token".into(), serde_json::json!(nr));
                 }
-                if let Some(s) = expires_in {
-                    rm.insert("expires_at_ms".into(), serde_json::json!(now_ms + s * 1000));
-                }
-                if let Some(s) = refresh_expires_in {
-                    rm.insert("refresh_expires_at_ms".into(), serde_json::json!(now_ms + s * 1000));
-                }
-                rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
             }
-            t.insert(account_id.to_string(), r);
+            if let Some(s) = expires_in {
+                rm.insert("expires_at_ms".into(), serde_json::json!(now_ms + s * 1000));
+            }
+            if let Some(s) = refresh_expires_in {
+                rm.insert("refresh_expires_at_ms".into(), serde_json::json!(now_ms + s * 1000));
+            }
+            rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
         }
-        fs_utils::write_json(&store_path, &store).map_err(|e| format!("回写 token store 失败: {e}"))?;
+        crate::store::docs::wb_token_store_upsert(&store_db, account_id, &r)
+            .map_err(|e| format!("回写 token store 失败: {e}"))?;
     }
     Ok(new_access)
 }

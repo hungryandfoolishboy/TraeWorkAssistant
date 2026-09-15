@@ -160,7 +160,7 @@ pub fn accounts_list(state: State<AppState>) -> Vec<AccountView> {
 pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, String> {
     let accounts = crate::vault::load_accounts(&state);
     let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-    let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
+    let device_map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
     let views = build_account_views(&state);
 
     let merged: Vec<serde_json::Value> = views
@@ -1654,12 +1654,12 @@ fn record_refresh_failure(state: &AppState, user_id: &str, rejected: bool, err_m
 pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
     let accounts = crate::vault::load_accounts(&state);
     let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-    let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
+    let device_map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
     let credits: CreditsFile = crate::store::docs::credits_history_load(&crate::store::db(&state.data_dir));
     let rc: RemainingCreditsFile = crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
     let cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     let pay: crate::commands::trae_apps::PayStatusFile =
-        fs_utils::read_json(&state.path("pay_status.json"));
+        crate::store::docs::pay_status_load(&crate::store::db(&state.data_dir));
     let summary: CheckinSummary = crate::store::db(&state.data_dir).kv_get("checkin_summary");
     let summary_today = summary
         .time

@@ -4,7 +4,6 @@
 //! 凭证红线：token 不进日志、不进返回值（activeAccountId 为池内稳定 id）。
 //! 函数逻辑零改动，仅将跨子模块引用项提升为 `pub(super)`。
 
-use std::path::PathBuf;
 use tauri::State;
 
 use crate::fs_utils;
@@ -15,8 +14,9 @@ use super::common::{
     account_id_of, as_str, cli_settings_path, load_pool, load_settings, restore_cli_settings,
 };
 
-pub(super) fn cli_rotate_state_path(state: &AppState) -> PathBuf {
-    state.data_dir.join("data").join("wb_cli_rotate_state.json")
+/// 保存 CLI 轮换状态（SQLite 化 P4：kv `wb_cli_rotate_state`，accounts.rs 删除账号时复用）
+pub(super) fn save_cli_rotate_state(state: &AppState, st: &CliRotateState) -> Result<(), String> {
+    crate::store::db(&state.data_dir).kv_set("wb_cli_rotate_state", st)
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default, Clone)]

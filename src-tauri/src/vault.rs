@@ -347,10 +347,12 @@ pub fn remove_secret(state: &AppState, uid: &str) {
     }
 }
 
-/// 启动时幂等迁移：JSON 中的明文 jwt / refresh_token → vault，随后 JSON 占位化。
+/// 启动时幂等迁移：库中明文 jwt / refresh_token → vault，随后占位化。
+/// （SQLite 化 P4：原读 checkin_accounts.json，现读 accounts 表——main.rs 已调整为
+/// store 迁移先于本函数，JSON 导入的明文凭据在此收敛进 vault 并从库中抹除。）
 /// 失败不阻断启动（下次启动重试；vault 异常时 save_accounts 仅落盘占位信息，禁止明文）。
 pub fn migrate_on_startup(state: &AppState) {
-    let raw: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let raw: AccountsFile = crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
     let plaintext = raw
         .accounts
         .iter()

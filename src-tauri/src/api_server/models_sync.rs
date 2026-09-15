@@ -88,12 +88,6 @@ pub fn function_for_model(model_lower: &str) -> &'static str {
     }
 }
 
-/// 模型列表文件路径：base_dir/data/api_models.json（数据文件统一放 data/ 子目录）
-/// 数据文件路径：base_dir/data/name（与 AppState::path() 的路由保持一致）
-fn data_file(data_dir: &Path, name: &str) -> std::path::PathBuf {
-    data_dir.join("data").join(name)
-}
-
 /// 读取模型列表；kv 缺失或为空时写入默认列表。
 /// SQLite 化（P2）：data/api_models.json → kv `api_models`（热路径单行 SELECT+解析，
 /// 替代原 mtime 解析缓存；旧根路径兼容迁移由启动迁移器完成）。
@@ -179,7 +173,8 @@ fn normalize_order(mut fetched: Vec<ModelOption>) -> Vec<ModelOption> {
 /// `accounts` 由调用方预先经 vault 解密（含明文 jwt）
 pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<ModelOption>, String> {
     // 取第一个可用账号（最多尝试 3 个）
-    let device_map: DeviceMap = fs_utils::read_json(&data_file(data_dir, "device_map.json"));
+    // SQLite 化（P4）：device_map 表
+    let device_map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(data_dir));
     let candidates: Vec<(&crate::models::RawAccount, String, String)> = accounts
         .accounts
         .iter()

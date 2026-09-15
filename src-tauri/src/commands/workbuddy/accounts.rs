@@ -8,7 +8,7 @@ use tauri::State;
 use crate::fs_utils;
 use crate::state::AppState;
 
-use super::cli::{cli_rotate_state_path, load_cli_rotate_state};
+use super::cli::{load_cli_rotate_state, save_cli_rotate_state};
 use super::common::{
     account_id_of, as_str, as_ts_seconds, auth_file_path_of, is_running, load_pool, save_pool,
     snapshot_json_path, upsert_token_store, wb_data_dir, wb_renew_locks,
@@ -223,7 +223,7 @@ pub fn workbuddy_account_remove(state: State<AppState>, user_id: String, delete_
     let mut st = load_cli_rotate_state(&state);
     if st.active_account_id.as_deref() == Some(user_id.as_str()) {
         st.active_account_id = None;
-        let _ = fs_utils::write_json(&cli_rotate_state_path(&state), &st);
+        let _ = save_cli_rotate_state(&state, &st);
     }
     Ok(())
 }
