@@ -4,6 +4,27 @@
 
 ---
 
+## [3.5.2] · 2026-09-15 · 切换链路实测根因修复（端隔离 F2-4 / 守卫 F2-5 / 混合推导 F2-6）
+
+> 范围：切换器全链路实测问题修复——「切换不生效 / 切 CodeBuddy 连带切 WorkBuddy / 切换后账号不变 / 徽标不更新」。
+
+### 修复
+
+- **[P1] 进程识别恒不命中 → stop_app 从不关客户端**（豆包/CodeBuddy/TRAE 全线「切换不生效」根因）：sysinfo 在 Windows 返回的映像名带 `.exe` 后缀（如 `Doubao.exe`），与白名单不带后缀形态精确比较恒 false——快照在运行中被覆盖 + 启动变多开。`proc::name_matches` 匹配前统一剥离 `.exe`（大小写不敏感），附回归测试。
+- **[P1] icube 恢复残留 WAL 回放复活旧账号**（Trae「切换后账号不变/本机识别错乱」根因）：强杀后现场残留 `state.vscdb-wal/-shm`，客户端启动回放旧 WAL 把切换前账号写回恢复后的主库。恢复前先删边车；快照白名单补入 `-wal/-shm` 成对快照；恢复改对称语义（槽位没有的项删除现场残留，Live 恒等于槽位内容）。
+- **[P1] Trae/TraeWork 优雅等待 3s → 8s**：3s 实测恒超时 → 每次切换都强杀（与豆包 8s 同理，落盘/退出需要时间），是 WAL 残留的上游诱因。
+- **F2-4 端隔离：CodeBuddy 不再回写共享 auth 文件**：该文件是 WorkBuddy 专属登录驱动源，CodeBuddy 登录真源在自身 vscdb——切/存 CodeBuddy 回写共享 auth 会把 WorkBuddy 登录一并切走（实测「切 CodeBuddy 时 WorkBuddy 伴随切换」根因）。`restore_authfile` L1 按 app 跳过，`confirm_switch` 信号②（auth uid）仅 WorkBuddy 检查；旧版快照（无 vscdb）告警文案同步改为如实提示无登录数据可恢复。
+- **F2-5 账号槽位防污染**：① `save_current_login` 新增保存守卫——校验客户端实际登录（WorkBuddy=auth 文件 uid 池反查；CodeBuddy=live `storage.json` `genie.userId` 池反查）与目标账号一致，不一致拒绝保存并给出指引（实测事故：CodeBuddy 槽位互相污染后怎么切都是同一账号）；② 账号列表 CodeBuddy 端「CB当前」徽标改以 genie.userId 实测为准（回退桥标记）——桥标记在客户端手动重登后失真；③ 切换守卫 `expected_uid` 的 CodeBuddy 分支同步改 genie 实测优先。
+- **F2-6 当前登录 uid 混合推导**：切换器写 `current_account.txt` 时同步写 sidecar `current_account.meta.json`（switchedAtMs）；`trae_apps::current_cloud_uid_hybrid` 按「证据 vs 标记谁更新」判定——纯证据推导会被快照冻结的旧时间戳误导（实测指向一个月前历史账号，守卫恒跳过回写），纯标记在客户端手动重登后失真；发现/套餐页与切换守卫统一改混合推导。
+- **前端可观测**：Buddy 账号页监听 `switch-done`/`save-login-done` 自动刷新徽标（后台长流程完成时列表不再停留旧态）；切换完成后刷新本机登录徽标（立即 + 8s 兜底，等客户端写入使用证据）；设置页定时签到文案如实区分内置调度器与计划任务兜底。
+- switcher 两处 `run_action` 测试加 `test_io_lock` 串行（并行争抢 `action_gate` 致 steps[0] 越界的偶发红）。
+
+### 测试
+
+- cargo 单测 396 → **398**（`proc::name_matches` .exe 后缀回归、`trae_apps::marker_with_ts` 标记/sidecar/双端路由）；vitest 26/26、`tsc --noEmit`、`cargo check` 全绿零警告。
+
+---
+
 ## [3.5.1] · 2026-09-15 · SQLite 存储迁移 + Python/PowerShell 全量 Rust 化 + F-68 / F-74 / F-76~F-78 落地
 
 > 范围：自 [3.4.5]（commit 651b056）以来的全部变更。
