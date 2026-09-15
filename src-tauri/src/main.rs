@@ -286,6 +286,17 @@ fn main() {
         ])
         .setup(|app| {
             let state = app.state::<AppState>();
+
+            // 数据存储层 SQLite 化（docs/sqllite-storage-plan.md）：旧 JSON 导入 aiwork.sqlite
+            // 并移入 data/backup/（幂等；失败不阻断启动，下次启动重试）。
+            // 必须先于本回调内一切 kv 消费方执行（settings/trim_logs 等）——否则升级
+            // 首次启动读到全默认设置，trim_logs 会按默认保留期误裁日志。
+            // 注意：必须先于 vault 迁移执行——JSON 中的明文凭据先入库，
+            // 再由随后的 vault::migrate_on_startup 收敛进 Stronghold 并从库中占位化抹除。
+            if let Some(summary) = store::migrate::migrate_on_startup(&state.data_dir) {
+                fs_utils::app_log(&state.data_dir, &summary);
+            }
+
             let settings = state.settings();
 
             // 启动期日志清理：按 log_retention_days 丢弃过期日志行（消费设置项，避免无限增长）
@@ -294,14 +305,6 @@ fn main() {
 
             // 清理上次运行残留的临时凭据文件（崩溃时未及删除的明文文件，失败不阻断启动）
             vault::cleanup_temp_accounts(&state);
-
-            // 数据存储层 SQLite 化（docs/sqllite-storage-plan.md）：旧 JSON 导入 aiwork.sqlite
-            // 并移入 data/backup/（幂等；失败不阻断启动，下次启动重试）。
-            // 注意：必须先于 vault 迁移执行——JSON 中的明文凭据先入库，
-            // 再由随后的 vault::migrate_on_startup 收敛进 Stronghold 并从库中占位化抹除。
-            if let Some(summary) = store::migrate::migrate_on_startup(&state.data_dir) {
-                fs_utils::app_log(&state.data_dir, &summary);
-            }
 
             // 敏感数据迁移：库中明文 jwt/refresh_token → Stronghold vault（幂等，失败不阻断启动）
             vault::migrate_on_startup(&state);

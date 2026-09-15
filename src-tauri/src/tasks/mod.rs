@@ -49,6 +49,13 @@ pub fn parse_task_mode(args: &[String]) -> Option<String> {
 /// 签到类任务的 start/account 进度事件逐行打印（NDJSON 同款），
 /// 末尾 done 事件由统一出口打印，避免重复。
 pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
+    // SQLite 启动迁移（与 GUI main.rs setup 同款幂等语义）：CLI 分支先于 Tauri
+    // setup 退出，若不在此补齐，升级后首次启动 GUI 前触发的计划任务会对着
+    // store::db() 刚建的空库运行——账号/池/设置全为默认，任务静默空转，
+    // 且窗口内写入的数据会被 GUI 首启迁移整表覆盖。
+    if let Some(summary) = crate::store::migrate::migrate_on_startup(&state.data_dir) {
+        crate::fs_utils::app_log(&state.data_dir, &summary);
+    }
     /// 打印除 done 外的 NDJSON 进度事件（done 由 run_cli_task 统一收尾输出）
     fn print_progress(ev: &serde_json::Value) {
         if ev.get("type").and_then(serde_json::Value::as_str) != Some("done") {

@@ -447,14 +447,35 @@ use crate::api_server::usage::{DayStats, UsageBucket, UsageFile};
 /// accounts 表 `user_id UNIQUE` 防线：非空 uid 重复时保序取首条（SQLite UNIQUE
 /// 允许多个 NULL/空 uid 占位账号并存）。迁移导入与运行期保存共用——否则历史
 /// JSON 中遗留的重复 uid 会让整个保存事务失败、启动迁移永久卡住（账号「消失」）。
-fn dedup_account_rows(rows: Vec<(Option<String>, String)>) -> Vec<(Option<String>, String)> {
+/// 返回 (去重后行, 丢弃数)；丢弃数供调用方写日志（静默丢账号不可观测）。
+fn dedup_account_rows(rows: Vec<(Option<String>, String)>) -> (Vec<(Option<String>, String)>, usize) {
     let mut seen: std::collections::HashSet<String> = Default::default();
-    rows.into_iter()
+    let mut dropped = 0usize;
+    let out = rows
+        .into_iter()
         .filter(|(uid, _)| match uid {
-            Some(u) if !u.is_empty() => seen.insert(u.clone()),
+            Some(u) if !u.is_empty() => {
+                if seen.insert(u.clone()) {
+                    true
+                } else {
+                    dropped += 1;
+                    false
+                }
+            }
             _ => true,
         })
-        .collect()
+        .collect();
+    (out, dropped)
+}
+
+/// dedup 丢弃账号的可观测性：触发即写 app_log（账号属核心数据，静默丢弃须留痕）
+fn log_dedup_dropped(s: &Store, dropped: usize, scope: &str) {
+    if dropped > 0 {
+        crate::fs_utils::app_log(
+            &s.data_dir,
+            &format!("accounts 保存去重（{scope}）：丢弃 {dropped} 条重复 user_id 账号（保序取首条）"),
+        );
+    }
 }
 
 pub fn accounts_load(s: &Store) -> AccountsFile {
@@ -484,6 +505,8 @@ pub fn accounts_save(s: &Store, f: &AccountsFile) -> Result<(), String> {
         ));
     }
     let rows = dedup_account_rows(rows);
+    log_dedup_dropped(s, rows.1, "accounts_save");
+    let rows = rows.0;
     s.with_conn(move |c| {
         c.execute_batch("BEGIN; DELETE FROM accounts;")?;
         {
@@ -541,6 +564,8 @@ pub fn accounts_save_raw(s: &Store, root: &Value) -> Result<(), String> {
         ));
     }
     let rows = dedup_account_rows(rows);
+    log_dedup_dropped(s, rows.1, "accounts_save_raw");
+    let rows = rows.0;
     s.with_conn(move |c| {
         c.execute_batch("BEGIN; DELETE FROM accounts;")?;
         {

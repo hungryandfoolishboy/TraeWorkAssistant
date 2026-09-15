@@ -21,6 +21,8 @@ use serde::Serialize;
 
 pub struct Store {
     conn: Mutex<rusqlite::Connection>,
+    /// 数据根目录（供 docs 层写 app_log 等辅助用途；db_path 上两级）
+    data_dir: PathBuf,
 }
 
 fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<Store>>> {
@@ -38,27 +40,27 @@ pub fn db(data_dir: &Path) -> Arc<Store> {
     if let Some(s) = reg.get(&db_path) {
         return s.clone();
     }
-    let store = Store::open(&db_path);
+    let store = Store::open(&db_path, data_dir);
     reg.insert(db_path, store.clone());
     store
 }
 
 impl Store {
-    fn open(path: &Path) -> Arc<Store> {
-        match Self::try_open(path) {
+    fn open(path: &Path, data_dir: &Path) -> Arc<Store> {
+        match Self::try_open(path, data_dir) {
             Ok(s) => s,
             Err(e) => {
                 // 库损坏/不可用自愈：隔离现场后重建空库再试一次。个人应用数据可由
                 // data/backup/ 与各上游重新拉取兜底；隔离件保留待人工诊断，绝不静默删除。
                 eprintln!("[store] SQLite 打开失败 {}: {e}，隔离损坏库并重建", path.display());
                 quarantine_corrupt_db(path, &e);
-                Self::try_open(path)
+                Self::try_open(path, data_dir)
                     .unwrap_or_else(|e2| panic!("SQLite 重建仍失败 {}: {e2}", path.display()))
             }
         }
     }
 
-    fn try_open(path: &Path) -> Result<Arc<Store>, String> {
+    fn try_open(path: &Path, data_dir: &Path) -> Result<Arc<Store>, String> {
         let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.pragma_update(None, "synchronous", "NORMAL").ok();
@@ -68,7 +70,7 @@ impl Store {
         // 健康探针：损坏库可能 open 成功但任何查询失败（页损坏等），在此暴露
         conn.query_row("SELECT count(*) FROM kv", [], |r| r.get::<_, i64>(0))
             .map_err(|e| format!("库健康探针失败: {e}"))?;
-        Ok(Arc::new(Store { conn: Mutex::new(conn) }))
+        Ok(Arc::new(Store { conn: Mutex::new(conn), data_dir: data_dir.to_path_buf() }))
     }
 
     /// 在连接上执行（串行化访问的统一出口）

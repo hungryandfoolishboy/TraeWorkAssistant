@@ -24,7 +24,6 @@ const KV_ENTRIES: &[(&str, &str)] = &[
     ("data/trae_model_meta.json", "trae_model_meta"),
     ("data/wb_model_route.json", "wb_model_route"),
     ("data/wb_template_map.json", "wb_template_map"),
-    ("data/wb_sticky_sessions.json", "wb_sticky_sessions"),
     ("data/checkin_summary.json", "checkin_summary"),
     ("data/workbuddy_settings.json", "workbuddy_settings"),
     ("data/workbuddy_credits_cache.json", "workbuddy_credits_cache"),
@@ -310,14 +309,11 @@ fn move_legacy_root_to_backup(data_dir: &Path, name: &str) {
 
 // ── 结构化导入器（读原 struct → docs::save；解析失败 = Corrupt）──────────────
 
+/// raw 形态导入（保真）：device_proxy 会向账号 JSON 写入 struct 外扩展字段
+///（refresh_token_updated_at 等，typed roundtrip 会丢），与 accounts_save_raw
+/// 运行时语义对齐；整文件 JSON 解析失败仍判 Corrupt。
 fn import_accounts(store: &Store, path: &Path) -> ImportStatus {
-    match std::fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<crate::models::AccountsFile>(&text) {
-            Ok(f) => wrap(docs::accounts_save(store, &f)),
-            Err(e) => ImportStatus::Corrupt(e.to_string()),
-        },
-        Err(e) => ImportStatus::Error(e.to_string()),
-    }
+    parse_then(path, |v| docs::accounts_save_raw(store, &v))
 }
 
 fn import_device_map(store: &Store, path: &Path) -> ImportStatus {
