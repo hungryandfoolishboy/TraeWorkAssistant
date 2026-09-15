@@ -254,7 +254,6 @@ pub fn sticky_bindings_save(s: &Store, root: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::models::{AccountsFile, RemainingCreditsFile};
-    use std::path::PathBuf;
 
     fn tmp_store(tag: &str) -> (std::path::PathBuf, super::super::Arc<Store>) {
         let d = std::env::temp_dir().join(format!("twa_docs_{tag}_{}", std::process::id()));

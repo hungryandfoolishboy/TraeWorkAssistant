@@ -105,7 +105,14 @@ pub fn ensure_ca(certs_dir: &std::path::Path) -> Result<CaAuthority, String> {
             .map_err(|e| format!("读取 CA 证书失败: {e}"))?;
         let key_pem = std::fs::read_to_string(&key_pem_path)
             .map_err(|e| format!("读取 CA 私钥失败: {e}"))?;
-        load_issuer(&cert_pem, &key_pem)?
+        let issuer = load_issuer(&cert_pem, &key_pem)?;
+        // ca.cer 缺失则从 ca.crt(PEM) 补导出 DER：老版本/异常过程可能只留下
+        // ca.crt+ca.key，certutil 安装依赖 ca.cer，缺失会在 UAC 后立即失败（闪退）
+        if !cer_der_path.exists() {
+            let der = pem_to_der(&cert_pem)?;
+            std::fs::write(&cer_der_path, der).map_err(|e| format!("补写 ca.cer 失败: {e}"))?;
+        }
+        issuer
     } else {
         let issuer = generate_ca()?;
         // 先落盘再使用：ca.cer(DER) 供 certutil 安装，ca.crt/ca.key 供下次启动加载
@@ -162,6 +169,20 @@ fn load_issuer(cert_pem: &str, key_pem: &str) -> Result<Issuer<'static, KeyPair>
     Issuer::from_ca_cert_pem(cert_pem, key_pair).map_err(|e| format!("解析 CA 证书失败: {e}"))
 }
 
+/// PEM(CERTIFICATE) → DER：提取 base64 主体并解码（供补写 ca.cer）
+fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let body = pem
+        .split("-----BEGIN CERTIFICATE-----")
+        .nth(1)
+        .and_then(|s| s.split("-----END CERTIFICATE-----").next())
+        .ok_or_else(|| "ca.crt 缺少 CERTIFICATE PEM 块".to_string())?;
+    let cleaned: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(cleaned.as_bytes())
+        .map_err(|e| format!("ca.crt base64 解码失败: {e}"))
+}
+
 /// rustls CryptoProvider：tokio-rustls 默认启用 aws-lc-rs，全进程共享单例
 fn load_crypto_provider() -> CryptoProvider {
     // install_default 幂等：已被 tungstenite/其他模块安装过则忽略
@@ -200,18 +221,28 @@ fn harden_ca_dir(certs_dir: &std::path::Path) {
                 .creation_flags(0x08000000) // CREATE_NO_WINDOW
                 .output()
         };
-        let _ = run(&["/inheritance:r", "/grant:r", &format!("{user}:F")]);
-        // 验证收紧后仍可读（读目录下任一文件）；不可读则恢复默认继承
-        let readable = certs_dir
+        // 记录收紧前已有文件：NTFS 动态继承下 /inheritance:r 移除目录可继承 ACE
+        // 时，已有子文件的继承 ACE 会被同步清空（DACL 变空 → 连属主都拒绝访问）
+        let existing: Vec<std::path::PathBuf> = certs_dir
             .read_dir()
-            .and_then(|mut it| {
-                it.next()
-                    .map(|e| std::fs::File::open(e?.path()).map(|_| ()))
-                    .unwrap_or(Ok(()))
-            })
-            .is_ok();
-        if !readable {
-            let _ = run(&["/reset"]);
+            .map(|it| it.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        // grant 必须带 (OI)(CI) 继承标志：否则目录 DACL 无可继承 ACE，
+        // 已有子文件继承 ACE 被动态清空、新建子文件依赖进程默认 DACL——
+        // 旧实现（无标志）正是用户「certutil 提权也读不到 ca.cer」的根因。
+        // icacls 退出码必须检查：grant 侧失败（如用户名解析失败）而
+        // /inheritance:r 已生效时，目录会变成空 DACL（protected + 零 ACE）
+        let hardened = run(&["/inheritance:r", "/grant:r", &format!("{user}:(OI)(CI)F")])
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        // 自验证双探针：① 收紧前已有的文件收紧后必须仍可读（能发现继承 ACE
+        // 被动态清空的真实伤害）；② 目录下新建临时文件可读（校验未来子文件的
+        // 继承行为）。任一失败立即 /reset 回滚——fail-open：ACL 仅纵深防御，
+        // 绝不能因此破坏代理自身的 CA 读写
+        let existing_ok = hardened && existing.iter().all(|p| std::fs::File::open(p).is_ok());
+        let probe_ok = existing_ok && probe_new_file_readable(certs_dir);
+        if !probe_ok {
+            let _ = run(&["/reset", "/T"]);
         }
     }
     #[cfg(not(target_os = "windows"))]
@@ -220,9 +251,39 @@ fn harden_ca_dir(certs_dir: &std::path::Path) {
     }
 }
 
+/// 在目录下新建临时文件并重读，验证子文件继承到的 ACL 允许当前用户读写；
+/// 用于发现「目录 DACL 收紧后变空/丢失访问权」的坏状态。尽力而为。
+#[cfg(target_os = "windows")]
+fn probe_new_file_readable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".acl_probe");
+    let ok = std::fs::write(&probe, b"probe")
+        .and_then(|_| std::fs::read(&probe).map(|d| d == b"probe"))
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_ca_cer_is_regenerated_from_pem() {
+        let tmp = std::env::temp_dir().join(format!("aiwork_ca_test2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let _ca = ensure_ca(&tmp).expect("ensure_ca should generate");
+        assert!(tmp.join("ca.cer").exists());
+        // 模拟老版本/异常过程只留下 ca.crt+ca.key：删除 ca.cer 后重载应自动补写
+        std::fs::remove_file(tmp.join("ca.cer")).unwrap();
+        let _ca2 = ensure_ca(&tmp).expect("reload");
+        let der = std::fs::read(tmp.join("ca.cer")).unwrap();
+        assert!(!der.is_empty());
+        let pem = std::fs::read_to_string(tmp.join("ca.crt")).unwrap();
+        assert_eq!(der, pem_to_der(&pem).unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn generated_ca_roundtrip_and_leaf() {
