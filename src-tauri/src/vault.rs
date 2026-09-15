@@ -197,7 +197,8 @@ fn open(state: &AppState) -> Result<std::sync::MutexGuard<'static, Option<Strong
 /// 从磁盘加载账号文件，并从 vault 回填占位账号的明文凭据（仅内存，不落明文盘）。
 /// JSON 中已有的明文凭据优先（更新鲜，例如 MITM 新捕获，待下次保存迁移进 vault）。
 pub fn load_accounts(state: &AppState) -> AccountsFile {
-    let mut file: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    // SQLite 化（P3）：checkin_accounts.json → accounts 表（行保序、user_id 可空）
+    let mut file: AccountsFile = crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
     let Ok(guard) = open(state) else {
         return file; // vault 不可用：降级返回 JSON 原样（占位 jwt 视为空，上层自行报错）
     };
@@ -245,7 +246,7 @@ pub fn save_accounts(state: &AppState, accounts: &mut AccountsFile) -> Result<()
             &format!("vault 写入失败，已仅保存账号占位信息（禁止明文落盘）: {reason}"),
         );
     }
-    fs_utils::write_json(&state.path("checkin_accounts.json"), accounts)?;
+    crate::store::docs::accounts_save(&crate::store::db(&state.data_dir), accounts)?;
     vault_result.map_err(|reason| {
         format!(
             "加密存储失败，已仅保存账号占位信息，签到功能不可用直至修复（vault 错误: {reason}）"

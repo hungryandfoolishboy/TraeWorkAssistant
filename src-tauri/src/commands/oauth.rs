@@ -179,7 +179,7 @@ fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
     let mut dev: OAuthDevice = store.kv_get("oauth_device");
     if dev.machine_id.is_empty() || dev.device_id.is_empty() {
         if dev.device_id.is_empty() {
-            let map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
+            let map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
             if let Some((_, entry)) = map.iter().min_by_key(|(k, _)| k.as_str()) {
                 if !entry.device_id.is_empty() {
                     dev.device_id = entry.device_id.clone();
@@ -558,9 +558,9 @@ pub fn oauth_login(
         // 设置分组
         if let Some(g) = group_id {
             let mut groups: crate::models::GroupsFile =
-                fs_utils::read_json(&state.path("groups.json"));
+                crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
             groups.membership.insert(user_id.clone(), g);
-            fs_utils::write_json(&state.path("groups.json"), &groups)?;
+            crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
         }
 
         fs_utils::app_log(

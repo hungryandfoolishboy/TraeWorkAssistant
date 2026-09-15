@@ -81,7 +81,7 @@ pub fn derive_device(uid: &str) -> DeviceEntry {
 /// 否则按 uid 确定性派生（与签到脚本同算法，无需写盘）。
 /// 参数为 &AppState（tauri State 经 Deref 自动传入，测试也可直接构造）
 pub fn resolve_device(state: &crate::state::AppState, uid: &str) -> DeviceEntry {
-    let map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
+    let map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
     map.get(uid)
         .cloned()
         .unwrap_or_else(|| derive_device(uid))
@@ -159,7 +159,7 @@ pub fn accounts_list(state: State<AppState>) -> Vec<AccountView> {
 #[tauri::command]
 pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, String> {
     let accounts = crate::vault::load_accounts(&state);
-    let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
     let views = build_account_views(&state);
 
@@ -296,7 +296,7 @@ pub fn accounts_import(
     let (accounts_arr, groups_arr) = parse_import_file(&content)?;
 
     let mut accounts = crate::vault::load_accounts(&state);
-    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
 
     // 已有 uid 集合（user_id 字段 + JWT 解析），与自动发现共用同一去重口径
     let mut known: std::collections::HashSet<String> = build_known_uids(&accounts);
@@ -398,7 +398,7 @@ pub fn accounts_import(
 
     if report.added > 0 || report.groups_added > 0 {
         crate::vault::save_accounts(&state, &mut accounts)?;
-        fs_utils::write_json(&state.path("groups.json"), &groups)?;
+        crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
         fs_utils::app_log(
             &state.data_dir,
             &format!(
@@ -487,7 +487,7 @@ pub fn accounts_import_preview(
     let (accounts_arr, groups_arr) = parse_import_file(&content)?;
     let accounts = crate::vault::load_accounts(&state);
     let known = build_known_uids(&accounts);
-    let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     let existing_group_ids: std::collections::HashSet<String> =
         groups.groups.iter().map(|g| g.id.clone()).collect();
 
@@ -573,9 +573,9 @@ pub fn account_add_manual(
     });
     crate::vault::save_accounts(&state, &mut accounts)?;
     if let Some(g) = group_id {
-        let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+        let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
         groups.membership.insert(uid, g);
-        fs_utils::write_json(&state.path("groups.json"), &groups)?;
+        crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     }
     Ok(())
 }
@@ -594,9 +594,9 @@ pub fn account_delete(
     // 同步清理 vault 中的凭据记录（失败仅记录日志，不阻断删除）
     crate::vault::remove_secret(&state, &user_id);
 
-    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     groups.membership.remove(&user_id);
-    fs_utils::write_json(&state.path("groups.json"), &groups)?;
+    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
 
     if delete_profile {
         // P0 防目录逃逸：user_id 直接拼进 profiles/ 路径并整目录删除，先做字符集白名单校验
@@ -676,7 +676,7 @@ pub struct GroupView {
 
 #[tauri::command]
 pub fn groups_list(state: State<AppState>) -> Vec<GroupView> {
-    let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     groups
         .groups
         .iter()
@@ -702,7 +702,7 @@ pub fn groups_list(state: State<AppState>) -> Vec<GroupView> {
 
 #[tauri::command]
 pub fn group_create(state: State<AppState>, name: String, color: String) -> Result<String, String> {
-    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     let id = format!("g_{}", chrono::Local::now().timestamp_millis());
     let order = (groups.groups.len() as i32) + 1;
     groups.groups.push(Group {
@@ -711,7 +711,7 @@ pub fn group_create(state: State<AppState>, name: String, color: String) -> Resu
         color,
         order,
     });
-    fs_utils::write_json(&state.path("groups.json"), &groups)?;
+    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     Ok(id)
 }
 
@@ -723,7 +723,7 @@ pub fn group_update(
     color: Option<String>,
     order: Option<i32>,
 ) -> Result<(), String> {
-    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     let g = groups
         .groups
         .iter_mut()
@@ -738,16 +738,16 @@ pub fn group_update(
     if let Some(o) = order {
         g.order = o;
     }
-    fs_utils::write_json(&state.path("groups.json"), &groups)?;
+    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     Ok(())
 }
 
 #[tauri::command]
 pub fn group_delete(state: State<AppState>, id: String) -> Result<(), String> {
-    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     groups.groups.retain(|g| g.id != id);
     groups.membership.retain(|_, v| *v != id);
-    fs_utils::write_json(&state.path("groups.json"), &groups)?;
+    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     Ok(())
 }
 
@@ -757,7 +757,7 @@ pub fn group_move(
     user_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     match group_id {
         Some(g) => {
             groups.membership.insert(user_id, g);
@@ -766,7 +766,7 @@ pub fn group_move(
             groups.membership.remove(&user_id);
         }
     }
-    fs_utils::write_json(&state.path("groups.json"), &groups)?;
+    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     Ok(())
 }
 
@@ -1142,7 +1142,7 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
     let dev = resolve_device(&state, &user_id);
     let stats = calc_remaining_credits(jwt, &dev)?;
     // 写入缓存
-    let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
+    let mut rc: RemainingCreditsFile = crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
     rc.credits.insert(user_id.clone(), stats.total);
     rc.general.insert(user_id.clone(), stats.general);
     rc.work.insert(user_id.clone(), stats.work);
@@ -1167,7 +1167,7 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
         }
     }
     rc.updated_at = Some(fs_utils::now_iso());
-    fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
+    crate::store::docs::remaining_credits_save(&crate::store::db(&state.data_dir), &rc)?;
     Ok(stats.total)
 }
 
@@ -1184,8 +1184,8 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
 /// 重算 credits_daily.json 快照（今日 earned + API 可见历史修正）。
 pub fn refresh_remaining_credits_impl(state: &AppState) -> Result<usize, String> {
     let accounts = crate::vault::load_accounts(state);
-    let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
-    let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let mut rc: RemainingCreditsFile = crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
+    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     let mut ok_count = 0usize;
     let mut thawed_count = 0usize;
     let mut pack_earned_daily: std::collections::BTreeMap<String, f64> = Default::default();
@@ -1257,14 +1257,14 @@ pub fn refresh_remaining_credits_impl(state: &AppState) -> Result<usize, String>
         }
     }
     rc.updated_at = Some(fs_utils::now_iso());
-    fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
+    crate::store::docs::remaining_credits_save(&crate::store::db(&state.data_dir), &rc)?;
 
     // 记录每日积分快照（total / earned / consumed）
     record_daily_snapshot(state, &rc, &pack_earned_daily);
 
     if thawed_count > 0 {
         cd.updated_at = Some(fs_utils::now_iso());
-        fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
+        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
     }
     Ok(ok_count)
 }
@@ -1288,7 +1288,7 @@ fn record_daily_snapshot(
     let total: f64 = rc.credits.values().sum();
     let total = (total * 100.0).round() / 100.0;
 
-    let mut file: CreditsDailyFile = fs_utils::read_json(&state.path("credits_daily.json"));
+    let mut file: CreditsDailyFile = crate::store::docs::credits_daily_load(&crate::store::db(&state.data_dir));
 
     // 昨日积分总数：取 today 之前最近一条快照
     let yesterday_total = file
@@ -1374,23 +1374,23 @@ fn record_daily_snapshot(
     };
     file.snapshots.retain(|s| s.date >= cutoff);
 
-    let _ = fs_utils::write_json(&state.path("credits_daily.json"), &file);
+    let _ = crate::store::docs::credits_daily_save(&crate::store::db(&state.data_dir), &file);
 }
 
 /// 获取每日积分快照列表
 #[tauri::command]
 pub fn credits_daily_list(state: State<AppState>) -> Vec<CreditsDailySnapshot> {
-    let file: CreditsDailyFile = fs_utils::read_json(&state.path("credits_daily.json"));
+    let file: CreditsDailyFile = crate::store::docs::credits_daily_load(&crate::store::db(&state.data_dir));
     file.snapshots
 }
 
 /// 手动清除指定账号的冷却状态
 #[tauri::command]
 pub fn cooldown_clear(state: State<AppState>, user_id: String) -> Result<(), String> {
-    let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     if cd.cooldowns.remove(&user_id).is_some() {
         cd.updated_at = Some(fs_utils::now_iso());
-        fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
+        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
     }
     Ok(())
 }
@@ -1402,12 +1402,12 @@ pub fn cooldown_clear_all(
     state: State<AppState>,
     runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
 ) -> Result<usize, String> {
-    let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     let file_count = cd.cooldowns.len();
     if file_count > 0 {
         cd.cooldowns.clear();
         cd.updated_at = Some(fs_utils::now_iso());
-        fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
+        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
     }
 
     // 同时清除运行中 API 池的内存冷却状态
@@ -1583,10 +1583,10 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
     // 自动解冻（含 SessionDead）：新 JWT 刚从 ExchangeToken 换发、必然有效，
     // 此前签到 401 打上的 SessionDead 永久冷却若不清除，调度会永远跳过该账号
     //（自动解冻逻辑明确排除 SessionDead，见 refresh_remaining_credits）
-    let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     if let Some(entry) = cd.cooldowns.remove(user_id) {
         cd.updated_at = Some(fs_utils::now_iso());
-        fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
+        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
         fs_utils::app_log(
             &state.data_dir,
             &format!("JWT 刷新成功自动解冻 [{}]（原冷却类型={}）", log_name, entry.error_type),
@@ -1653,14 +1653,14 @@ fn record_refresh_failure(state: &AppState, user_id: &str, rejected: bool, err_m
 /// 构建账号视图（聚合 JWT / 分组 / 设备 / 积分 / 今日签到 / 冷却状态 / 套餐身份）。
 pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
     let accounts = crate::vault::load_accounts(&state);
-    let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
-    let credits: CreditsFile = fs_utils::read_json(&state.path("credits_history.json"));
-    let rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
-    let cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let credits: CreditsFile = crate::store::docs::credits_history_load(&crate::store::db(&state.data_dir));
+    let rc: RemainingCreditsFile = crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
+    let cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     let pay: crate::commands::trae_apps::PayStatusFile =
         fs_utils::read_json(&state.path("pay_status.json"));
-    let summary: CheckinSummary = fs_utils::read_json(&state.path("checkin_summary.json"));
+    let summary: CheckinSummary = crate::store::db(&state.data_dir).kv_get("checkin_summary");
     let summary_today = summary
         .time
         .as_ref()

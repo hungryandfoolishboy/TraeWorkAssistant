@@ -656,7 +656,7 @@ fn query_pay_status(jwt: &str, dev: &crate::models::DeviceEntry) -> Result<PaySt
 #[tauri::command(async)]
 pub fn refresh_pay_status(state: State<AppState>) -> Result<usize, String> {
     let accounts = crate::vault::load_accounts(&state);
-    let mut file: PayStatusFile = fs_utils::read_json(&state.path("pay_status.json"));
+    let mut file: PayStatusFile = crate::store::docs::pay_status_load(&crate::store::db(&state.data_dir));
     let mut ok = 0usize;
     for a in &accounts.accounts {
         // 无 JWT 的占位账号（自动发现入池）跳过
@@ -679,6 +679,6 @@ pub fn refresh_pay_status(state: State<AppState>) -> Result<usize, String> {
         }
     }
     file.updated_at = Some(fs_utils::now_iso());
-    fs_utils::write_json(&state.path("pay_status.json"), &file)?;
+    crate::store::docs::pay_status_save(&crate::store::db(&state.data_dir), &file)?;
     Ok(ok)
 }

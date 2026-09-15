@@ -60,12 +60,15 @@ pub async fn do_start(
     let accounts = crate::vault::load_accounts(state);
     // SQLite 化（P2）：api_pool.json → kv `api_pool`
     let pool_file: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
-    let groups_file: crate::models::GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    // SQLite 化（P3）：groups/cooldowns/remaining_credits/device_map 经 store 读取
+    let groups_file: crate::models::GroupsFile =
+        crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     let cooldowns_file: AccountCooldownsFile =
-        fs_utils::read_json(&state.path("account_cooldowns.json"));
+        crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     let credits_file: RemainingCreditsFile =
-        fs_utils::read_json(&state.path("remaining_credits.json"));
-    let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
+        crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
+    let device_map: DeviceMap =
+        crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
 
     // 调度策略（T10）：api_pool.json.strategy，空/未知值回退 expire_first
     let strategy = crate::api_server::pool::PoolStrategy::parse(&pool_file.strategy);

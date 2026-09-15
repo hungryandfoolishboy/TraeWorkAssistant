@@ -44,18 +44,6 @@ pub(super) fn snapshot_json_path() -> PathBuf {
     wb_data_dir().join("storage").join("skeleton").join("account-snapshot.json")
 }
 
-fn pool_path(state: &AppState) -> PathBuf {
-    state.data_dir.join("data").join("workbuddy_accounts.json")
-}
-
-pub(super) fn token_store_path(state: &AppState) -> PathBuf {
-    state.data_dir.join("data").join("workbuddy_token_store.json")
-}
-
-pub(super) fn checkin_results_path(state: &AppState) -> PathBuf {
-    state.data_dir.join("data").join("workbuddy_checkin_results.json")
-}
-
 pub(super) fn account_id_of(token: &str) -> String {
     let mut h = Sha256::new();
     h.update(token.as_bytes());
@@ -214,11 +202,14 @@ impl WorkBuddySettings {
 // ── 工具函数 ────────────────────────────────────────────────────────────────
 
 pub(super) fn load_pool(state: &AppState) -> WbPool {
-    fs_utils::read_json(&pool_path(state))
+    // SQLite 化（P3）：workbuddy_accounts.json → wb_accounts 表
+    let v = crate::store::docs::wb_pool_load(&crate::store::db(&state.data_dir));
+    serde_json::from_value(v).unwrap_or_default()
 }
 
 pub(super) fn save_pool(state: &AppState, pool: &WbPool) -> Result<(), String> {
-    fs_utils::write_json(&pool_path(state), pool)
+    let v = serde_json::to_value(pool).map_err(|e| format!("序列化失败: {e}"))?;
+    crate::store::docs::wb_pool_save(&crate::store::db(&state.data_dir), &v)
 }
 
 pub(super) fn load_settings(state: &AppState) -> WorkBuddySettings {
@@ -290,28 +281,23 @@ pub fn workbuddy_settings_set(state: State<AppState>, patch: WorkBuddySettings) 
 // ── 工具侧凭证副本写入（F-10 双源化）───────────────────────────────────────
 
 pub(super) fn upsert_token_store(state: &AppState, id: &str, creds: &serde_json::Value) -> Result<(), String> {
-    let mut store: serde_json::Value = fs_utils::read_json(&token_store_path(state));
-    if !store.is_object() {
-        store = serde_json::json!({});
-    }
-    let obj = store.as_object_mut().unwrap();
-    if obj.get("version").is_none() {
-        obj.insert("version".into(), serde_json::json!(1));
-    }
-    let tokens = obj.entry("tokens").or_insert_with(|| serde_json::json!({}));
-    if let Some(t) = tokens.as_object_mut() {
-        let mut rec = t.get(id).cloned().unwrap_or(serde_json::json!({}));
-        if let Some(rm) = rec.as_object_mut() {
-            for (k, v) in creds.as_object().unwrap_or(&serde_json::Map::new()) {
-                if !v.is_null() {
-                    rm.insert(k.clone(), v.clone());
-                }
+    // SQLite 化（P3）：wb_tokens 表单行 UPSERT（merge 语义保留）
+    let store = crate::store::db(&state.data_dir);
+    let existing = crate::store::docs::wb_token_store_load(&store);
+    let mut rec = existing
+        .get("tokens")
+        .and_then(|t| t.get(id))
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    if let Some(rm) = rec.as_object_mut() {
+        for (k, v) in creds.as_object().unwrap_or(&serde_json::Map::new()) {
+            if !v.is_null() {
+                rm.insert(k.clone(), v.clone());
             }
-            rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
         }
-        t.insert(id.to_string(), rec);
+        rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
     }
-    fs_utils::write_json(&token_store_path(state), &store)
+    crate::store::docs::wb_token_store_upsert(&store, id, &rec)
 }
 
 // ── M3 凭证续期互斥（F-09，Rust 侧手动触发；schtasks 每周兜底走 python --renew-only）──

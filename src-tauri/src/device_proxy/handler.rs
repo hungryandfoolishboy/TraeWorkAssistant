@@ -89,12 +89,8 @@ pub struct ProxyCtx {
     pub targets: Vec<String>,
     /// 自动捕获 JWT 写回 accounts（AUTO_CAPTURE_JWT，默认开）
     pub auto_capture_jwt: bool,
-    /// data/checkin_accounts.json
-    pub accounts_path: PathBuf,
-    /// account_cooldowns.json
-    pub cooldowns_path: PathBuf,
-    /// data/doubao_captured_credentials.json
-    pub doubao_cred_path: PathBuf,
+    /// 数据根目录（SQLite 化 P3：accounts/cooldowns/凭证快照均经 store 读写）
+    pub data_dir: PathBuf,
 }
 
 impl ProxyCtx {
@@ -417,7 +413,9 @@ fn update_account_jwt_and_refresh(
     refresh_token: Option<&str>,
 ) -> &'static str {
     let _g = accounts_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let mut cfg: serde_json::Value = crate::fs_utils::read_json(&ctx.accounts_path);
+    // SQLite 化（P3）：raw 读 accounts 表（保留扩展字段；沿用原 JSON 处理逻辑）
+    let mut cfg: serde_json::Value =
+        crate::store::docs::accounts_load_raw(&crate::store::db(&ctx.data_dir));
     if !cfg.get("accounts").map(|a| a.is_array()).unwrap_or(false) {
         cfg["accounts"] = serde_json::Value::Array(vec![]);
     }
@@ -517,19 +515,18 @@ fn update_account_jwt_and_refresh(
 }
 
 fn write_accounts(ctx: &ProxyCtx, cfg: &serde_json::Value) -> Result<(), String> {
-    if let Some(parent) = ctx.accounts_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    crate::fs_utils::write_json(&ctx.accounts_path, cfg)
+    // SQLite 化（P3）：raw 写 accounts 表（保留扩展字段如 refresh_token_updated_at）
+    crate::store::docs::accounts_save_raw(&crate::store::db(&ctx.data_dir), cfg)
 }
 
 /// 新 JWT 捕获成功 → 自动解除该账号冷却（对齐 Python clear_cooldown 意图；
 /// Python 版实为 NameError 空转，此处为真实修复）
 fn clear_cooldown(ctx: &ProxyCtx, user_id: &str) {
-    let mut cd: crate::models::AccountCooldownsFile = crate::fs_utils::read_json(&ctx.cooldowns_path);
+    // SQLite 化（P3）：冷却状态经 store 读写
+    let mut cd = crate::store::docs::account_cooldowns_load(&crate::store::db(&ctx.data_dir));
     if cd.cooldowns.remove(user_id).is_some() {
         cd.updated_at = Some(crate::fs_utils::now_iso());
-        if crate::fs_utils::write_json(&ctx.cooldowns_path, &cd).is_ok() {
+        if crate::store::docs::account_cooldowns_save(&crate::store::db(&ctx.data_dir), &cd).is_ok() {
             ctx.log.log(&format!(
                 "  [冷却解除] uid={user_id}（新 JWT 捕获成功，自动解除登录失效标记）"
             ));
@@ -677,12 +674,8 @@ fn try_capture_doubao_credentials(ctx: &ProxyCtx, host: &str, req_headers: &[(St
         return;
     }
     *cache = Some(captured.clone());
-    if let Some(parent) = ctx.doubao_cred_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(s) = serde_json::to_string_pretty(&captured) {
-        let _ = std::fs::write(&ctx.doubao_cred_path, s);
-    }
+    // SQLite 化（P3）：凭证快照 → kv `doubao_captured_credentials`
+    let _ = crate::store::db(&ctx.data_dir).kv_set("doubao_captured_credentials", &captured);
     ctx.log.log(&format!(
         "  [doubao] 抓到会话凭证: sessionid={} 字符{}{}{}",
         session_id.len(),
@@ -1117,9 +1110,7 @@ mod tests {
             req_logger: Arc::new(crate::device_proxy::logger::RequestLogger::new(dir.clone())),
             targets: vec![],
             auto_capture_jwt: true,
-            accounts_path: dir.join("checkin_accounts.json"),
-            cooldowns_path: dir.join("account_cooldowns.json"),
-            doubao_cred_path: dir.join("doubao_captured_credentials.json"),
+            data_dir: dir.clone(),
         }
     }
 
@@ -1141,14 +1132,15 @@ mod tests {
         let ctx = test_ctx("atomic");
         let old_jwt = make_jwt(1893456000);
         let new_jwt = make_jwt(1893456000 + 3600);
-        std::fs::write(
-            &ctx.accounts_path,
-            serde_json::json!({"accounts": [{"name": "n", "UserID": "u-test", "jwt": old_jwt}]}).to_string(),
+        crate::store::docs::accounts_save_raw(
+            &crate::store::db(&ctx.data_dir),
+            &serde_json::json!({"accounts": [{"name": "n", "UserID": "u-test", "jwt": old_jwt}]}),
         )
         .unwrap();
         let status = update_account_jwt_and_refresh(&ctx, "u-test", &new_jwt, Some("rt-new"));
         assert_eq!(status, "updated");
-        let cfg: serde_json::Value = crate::fs_utils::read_json(&ctx.accounts_path);
+        let cfg: serde_json::Value =
+            crate::store::docs::accounts_load_raw(&crate::store::db(&ctx.data_dir));
         let acc = &cfg["accounts"][0];
         assert_eq!(acc["jwt"].as_str(), Some(new_jwt.as_str()), "JWT 应已更新");
         assert_eq!(acc["refresh_token"].as_str(), Some("rt-new"), "refresh_token 应同次写盘更新");
@@ -1163,7 +1155,8 @@ mod tests {
         let uid = "日本語ユーザー001";
         let status = update_account_jwt(&ctx, uid, &jwt);
         assert_eq!(status, "appended");
-        let cfg: serde_json::Value = crate::fs_utils::read_json(&ctx.accounts_path);
+        let cfg: serde_json::Value =
+            crate::store::docs::accounts_load_raw(&crate::store::db(&ctx.data_dir));
         let acc = &cfg["accounts"][0];
         assert_eq!(acc["UserID"].as_str(), Some(uid));
         assert_eq!(acc["name"].as_str(), Some("auto_日本語ユーザー0")); // chars().take(8)

@@ -520,7 +520,7 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
         return Ok(json!({"ok": true, "cached": true, "accounts": accounts}));
     }
 
-    let pool: Value = fs_utils::read_json(&wb_common::pool_path(state));
+    let pool: Value = crate::store::docs::wb_pool_load(&crate::store::db(&state.data_dir));
     let mut accounts: Vec<Value> = pool
         .get("accounts")
         .and_then(Value::as_array)

@@ -183,10 +183,8 @@ pub async fn do_start(
         auto_capture_jwt: !std::env::var("AUTO_CAPTURE_JWT")
             .map(|v| matches!(v.as_str(), "0" | "false" | "False" | ""))
             .unwrap_or(false),
-        // 路径布局与 Python 版完全一致（data/ 子目录），保证老数据无缝衔接
-        accounts_path: state.path("checkin_accounts.json"),
-        cooldowns_path: state.path("account_cooldowns.json"),
-        doubao_cred_path: state.path("doubao_captured_credentials.json"),
+        // SQLite 化（P3）：账号/冷却/凭证快照经 store 读写，仅传数据根目录
+        data_dir: state.data_dir.clone(),
         certs_dir: state.path("certs"),
         log_path: state.logs_dir().join("proxy.log"),
         req_log_dir: std::path::PathBuf::from(

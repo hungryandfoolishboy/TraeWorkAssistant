@@ -294,8 +294,8 @@ fn fetch_balance(agent: &ureq::Agent, headers: &[(String, String)], base: &str) 
 
 /// 刷新成功后回写账号池 token 过期时间（调度/到期日历数据源）
 fn sync_pool_expiry(state: &AppState, aid: &str, creds: &Creds) {
-    let path = wb_common::pool_path(state);
-    let mut pool: Value = fs_utils::read_json(&path);
+    // SQLite 化（P3）：wb_accounts 表
+    let mut pool: Value = crate::store::docs::wb_pool_load(&crate::store::db(&state.data_dir));
     let mut changed = false;
     if let Some(accounts) = pool.get_mut("accounts").and_then(Value::as_array_mut) {
         for a in accounts.iter_mut() {
@@ -313,17 +313,14 @@ fn sync_pool_expiry(state: &AppState, aid: &str, creds: &Creds) {
         }
     }
     if changed {
-        let _ = fs_utils::write_json(&path, &pool);
+        let _ = crate::store::docs::wb_pool_save(&crate::store::db(&state.data_dir), &pool);
     }
 }
 
-/// 签到结果 90 天滚动存储（趋势/日志数据源，F-55/F-22）
+/// 签到结果 90 天滚动存储（趋势/日志数据源，F-55/F-22；SQLite 化 P3：wb_checkin_results 表）
 fn append_results(state: &AppState, events: &[Value]) {
-    let path = wb_common::checkin_results_path(state);
-    let mut data: Value = fs_utils::read_json(&path);
-    if !data.is_object() {
-        data = json!({"results": []});
-    }
+    let store = crate::store::db(&state.data_dir);
+    let mut data: Value = crate::store::docs::wb_checkin_results_load(&store);
     let results: Vec<Value> = data
         .get("results")
         .and_then(Value::as_array)
@@ -352,7 +349,7 @@ fn append_results(state: &AppState, events: &[Value]) {
         kept.push(rec);
     }
     data["results"] = json!(kept);
-    let _ = fs_utils::write_json(&path, &data);
+    let _ = crate::store::docs::wb_checkin_results_save(&store, &data);
 }
 
 // ── 签到主流程 ─────────────────────────────────────────────────────────────
@@ -435,7 +432,7 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
 /// 返回 done 事件（ok/already/failed 计数），供启动补签/托盘静默路径直接消费。
 pub fn run_checkin_round(state: &AppState, opts: &CheckinOpts, emit: &mut dyn FnMut(&Value)) -> Value {
     let agent = http_agent(30);
-    let pool: Value = fs_utils::read_json(&wb_common::pool_path(state));
+    let pool: Value = crate::store::docs::wb_pool_load(&crate::store::db(&state.data_dir));
     let mut accounts: Vec<Value> = pool
         .get("accounts")
         .and_then(Value::as_array)
@@ -751,7 +748,7 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
 /// 成长中心整轮：NDJSON 输出（wb-checkin-progress 管线复用）
 pub fn run_growth_round(state: &AppState, flags: &GrowthOpts, uids: &[String], emit: &mut dyn FnMut(&Value)) {
     let agent = http_agent(30);
-    let pool: Value = fs_utils::read_json(&wb_common::pool_path(state));
+    let pool: Value = crate::store::docs::wb_pool_load(&crate::store::db(&state.data_dir));
     let mut accounts: Vec<Value> = pool
         .get("accounts")
         .and_then(Value::as_array)
@@ -775,7 +772,7 @@ pub fn run_growth_round(state: &AppState, flags: &GrowthOpts, uids: &[String], e
 /// 返回末行 JSON 摘要（零 token 输出）。
 pub fn run_renew_only(state: &AppState, lazy_hours: i64) -> Value {
     let agent = http_agent(30);
-    let pool: Value = fs_utils::read_json(&wb_common::pool_path(state));
+    let pool: Value = crate::store::docs::wb_pool_load(&crate::store::db(&state.data_dir));
     let accounts: Vec<Value> = pool
         .get("accounts")
         .and_then(Value::as_array)

@@ -17,25 +17,7 @@ use crate::fs_utils;
 use crate::state::AppState;
 
 // ── 路径 ────────────────────────────────────────────────────────────────────
-
-pub(super) fn pool_path(state: &AppState) -> PathBuf {
-    state.data_dir.join("data").join("workbuddy_accounts.json")
-}
-
-pub fn token_store_path(state: &AppState) -> PathBuf {
-    state
-        .data_dir
-        .join("data")
-        .join("workbuddy_token_store.json")
-}
-
-/// 签到结果 90 天滚动存储文件（workbuddy_checkin_results.json）
-pub fn checkin_results_path(state: &AppState) -> PathBuf {
-    state
-        .data_dir
-        .join("data")
-        .join("workbuddy_checkin_results.json")
-}
+// （SQLite 化 P3：pool/token store/checkin results 均改走 store，文件路径函数已删除）
 
 /// 桌面 auth 文件读取路径：settings.wb_auth_file_path 人工指定优先（与
 /// commands/workbuddy/common.rs auth_file_path_of 同语义），否则默认布局。
@@ -124,8 +106,14 @@ fn read_auth_file(state: &AppState) -> Creds {
 
 /// 生效凭证 = token store 与 auth 文件中 expiresAtMs 更晚者（F-10 谁新用谁）。
 /// auth 文件仅当其 uid 与账号匹配时参与双源比较（桌面当前登录态）。
+/// 读 token store（SQLite 化 P3：wb_tokens 表；结构 {version, tokens:{id:rec}}）。
+/// 全部 token store 读点统一入口。
+pub fn load_token_store(state: &AppState) -> Value {
+    crate::store::docs::wb_token_store_load(&crate::store::db(&state.data_dir))
+}
+
 pub fn effective_creds(state: &AppState, acct_id: &str, acct_uid: &str) -> Creds {
-    let store: Value = fs_utils::read_json(&token_store_path(state));
+    let store: Value = load_token_store(state);
     let store_creds = store
         .get("tokens")
         .and_then(|t| t.get(acct_id))
@@ -148,7 +136,7 @@ pub fn effective_creds(state: &AppState, acct_id: &str, acct_uid: &str) -> Creds
 /// 写工具侧凭证副本（F-10 谁新用谁）。version≠1 拒绝写入（版本闸门）；
 /// 非空字段合并 + updated_at（与 commands/workbuddy/common.rs upsert_token_store 同语义）。
 pub fn save_token_store(state: &AppState, id: &str, creds: &Creds) -> Result<(), String> {
-    let mut store: Value = fs_utils::read_json(&token_store_path(state));
+    let mut store: Value = load_token_store(state);
     if !store.is_object() {
         store = serde_json::json!({});
     }
@@ -174,7 +162,7 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &Creds) -> Result<(),
         }
         t.insert(id.to_string(), rec);
     }
-    fs_utils::write_json(&token_store_path(state), &store)
+    crate::store::docs::wb_token_store_save(&crate::store::db(&state.data_dir), &store)
 }
 
 // ── 统一请求头（§5.3）───────────────────────────────────────────────────────

@@ -10,7 +10,7 @@ use crate::fs_utils;
 use crate::state::AppState;
 use crate::tasks::wb_checkin::{self, CheckinOpts, GrowthOpts};
 
-use super::common::{checkin_results_path, load_settings, push_notify};
+use super::common::{load_settings, push_notify};
 
 // ── M4 签到（F-15，NDJSON 管线）─────────────────────────────────────────────
 
@@ -123,7 +123,8 @@ pub fn workbuddy_checkin_results(state: State<AppState>, days: Option<i64>) -> R
     let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(days))
         .format("%Y-%m-%d")
         .to_string();
-    let raw: serde_json::Value = fs_utils::read_json(&checkin_results_path(&state));
+    let raw: serde_json::Value =
+        crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
     let mut out = Vec::new();
     if let Some(arr) = raw.get("results").and_then(|v| v.as_array()) {
         for r in arr {

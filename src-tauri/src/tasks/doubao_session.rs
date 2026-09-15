@@ -460,8 +460,9 @@ fn sync_cookie_state(state: &AppState, logs: &mut Vec<String>) -> Value {
 /// 返回 {ok, expired, error, skipped, accounts:[{user_id,status,detail,renewed?}]}
 /// probe_url 参数化供测试注入不可达端点（离线确定性，不依赖真实网络环境）。
 fn run_renewal(state: &AppState, renew_url: &str, probe_url: &str) -> Value {
-    let pool_path = state.data_dir.join("data").join("doubao_accounts.json");
-    let mut pool: Value = crate::fs_utils::read_json(&pool_path);
+    // SQLite 化（P3）：doubao_accounts 表（Value 形态沿用原 JSON 处理逻辑）
+    let mut pool: Value =
+        serde_json::to_value(crate::commands::doubao::load_pool(state)).unwrap_or(json!({}));
     if !pool.is_object() {
         pool = json!({"accounts": []});
     }
@@ -544,7 +545,9 @@ fn run_renewal(state: &AppState, renew_url: &str, probe_url: &str) -> Value {
     // 回填 updated（完整账号对象）而非 results（摘要），字段零丢失（对照 doubao_quota::run_batch）
     if !results.is_empty() {
         pool["accounts"] = Value::Array(updated);
-        let _ = crate::fs_utils::write_json(&pool_path, &pool);
+        if let Ok(file) = serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(pool) {
+            let _ = crate::commands::doubao::save_pool(state, &file);
+        }
     }
     json!({
         "ok": ok_n, "expired": expired_n, "error": error_n, "skipped": skipped_n,
@@ -608,22 +611,21 @@ mod tests {
     #[test]
     fn renewal_writeback_preserves_account_fields() {
         let state = temp_state("fields");
-        let pool_path = state.data_dir.join("data").join("doubao_accounts.json");
-        std::fs::write(
-            &pool_path,
-            r#"{"accounts":[
+        // SQLite 化（P3）：种子走 doubao_accounts 表
+        let seed: crate::commands::doubao::DoubaoAccountPool = serde_json::from_value(json!({
+            "accounts":[
                 {"user_id":"1001","name":"甲","session_id":"sid-AAA","ttwid":"tw1","sid_guard":"g1"},
                 {"user_id":"1002","name":"乙","session_id":"sid-BBB"},
                 {"user_id":"1003","name":"丙（无凭据）"}
-            ]}"#,
-        )
+            ]}))
         .unwrap();
+        crate::commands::doubao::save_pool(&state, &seed).unwrap();
         // 双端点均不可达 → 带凭据账号确定性走 error（不依赖真实网络，离线可复现）
         let summary = run_renewal(&state, "http://127.0.0.1:1/renew", "http://127.0.0.1:1/probe");
         assert_eq!(summary["error"].as_u64(), Some(2), "两个带 sid 账号应走 error");
         assert_eq!(summary["skipped"].as_u64(), Some(1));
 
-        let pool: Value = crate::fs_utils::read_json(&pool_path);
+        let pool: Value = serde_json::to_value(crate::commands::doubao::load_pool(&state)).unwrap();
         let accounts = pool["accounts"].as_array().unwrap();
         assert_eq!(accounts.len(), 3, "skipped 账号不得被删除");
         let by_uid = |u: &str| accounts.iter().find(|a| a["user_id"] == u).unwrap().clone();

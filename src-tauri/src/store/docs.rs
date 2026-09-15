@@ -195,6 +195,62 @@ pub fn accounts_save(s: &Store, f: &AccountsFile) -> Result<(), String> {
     })
 }
 
+/// 以 Value 形态读 accounts 表（`{"accounts":[...]}`；保留 struct 外字段——
+/// device_proxy 捕获路径会写入 refresh_token_updated_at 等扩展字段，typed roundtrip 会丢）
+pub fn accounts_load_raw(s: &Store) -> Value {
+    let arr: Vec<Value> = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare("SELECT data FROM accounts ORDER BY seq")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|d| serde_json::from_str(&d).ok())
+                .collect())
+        })
+        .unwrap_or_default();
+    serde_json::json!({ "accounts": arr })
+}
+
+/// 以 Value 形态整表写 accounts（pk = user_id/UserID，数字 uid 折算字符串；
+/// 与 device_proxy 原始 JSON 处理语义对齐）
+pub fn accounts_save_raw(s: &Store, root: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = root.get("accounts").and_then(Value::as_array).unwrap_or(&empty);
+    let mut rows: Vec<(Option<String>, String)> = Vec::with_capacity(arr.len());
+    for a in arr {
+        let uid = a
+            .get("user_id")
+            .or_else(|| a.get("UserID"))
+            .map(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .filter(|s| !s.is_empty());
+        rows.push((
+            uid,
+            serde_json::to_string(a).map_err(|e| format!("序列化失败: {e}"))?,
+        ));
+    }
+    s.with_conn(move |c| {
+        c.execute_batch("BEGIN; DELETE FROM accounts;")?;
+        {
+            let mut stmt = c.prepare("INSERT INTO accounts(user_id, data) VALUES(?1, ?2)")?;
+            for (uid, data) in &rows {
+                stmt.execute(rusqlite::params![uid, data])?;
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })
+}
+
 // ── 设备映射（device_map.json → device_map 表）───────────────────────────────
 
 pub fn device_map_load(s: &Store) -> DeviceMap {

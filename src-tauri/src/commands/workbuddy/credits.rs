@@ -9,7 +9,7 @@ use tauri::{AppHandle, State};
 use crate::fs_utils;
 use crate::state::AppState;
 
-use super::common::{as_str, auth_file_path_of, load_pool, save_pool, token_store_path};
+use super::common::{as_str, auth_file_path_of, load_pool, save_pool};
 
 // ── M5 积分（F-20/F-22，python 三件套 + 缓存）──────────────────────────────
 
@@ -89,7 +89,7 @@ fn backfill_edition_from_payment_type(state: &AppState) -> usize {
     if need.is_empty() {
         return 0;
     }
-    let store: Value = fs_utils::read_json(&token_store_path(state));
+    let store: Value = crate::tasks::wb_common::load_token_store(state);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
     let mut filled = 0usize;
@@ -192,8 +192,8 @@ pub fn workbuddy_usage_fallback(state: State<AppState>) -> Result<serde_json::Va
         );
     }
 
-    // 签到日志 → 每日奖励充值（90 天滚动，仅 success 事件）
-    let results: Value = fs_utils::read_json(&state.data_dir.join("data").join("workbuddy_checkin_results.json"));
+    // 签到日志 → 每日奖励充值（90 天滚动，仅 success 事件；SQLite 化 P3 走 store）
+    let results: Value = crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
     let mut recharge: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     for r in results.get("results").and_then(Value::as_array).into_iter().flatten() {
         if r.get("status").and_then(Value::as_str) != Some("success") {
@@ -325,7 +325,7 @@ pub fn workbuddy_usage_official(
 
     // 选号：user_id → auth 文件当前账号 → 首个有 token store 凭证的账号
     //（审查 P1：选号解析提到缓存命中判断之前——缓存按账号区分，命中须同账号）
-    let store: serde_json::Value = fs_utils::read_json(&token_store_path(&state));
+    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(&state);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let pick = |id: &str| -> Option<(String, String, String)> {
         let rec = tokens.get(id)?;
@@ -597,7 +597,7 @@ pub fn workbuddy_usage_official_all(state: State<AppState>) -> Result<serde_json
     };
 
     // 枚举有凭证账号：账号池优先，token store 补充（按 id 去重）
-    let store: Value = fs_utils::read_json(&token_store_path(&state));
+    let store: Value = crate::tasks::wb_common::load_token_store(&state);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let pick = |id: &str| -> Option<(String, String, String)> {
         let rec = tokens.get(id)?;
@@ -722,7 +722,7 @@ pub fn workbuddy_activity_info(
 
     // 选号逻辑与 workbuddy_usage_official 一致（复用同一降级链）
     //（审查 P1：选号解析提到缓存命中判断之前——缓存按账号区分，命中须同账号）
-    let store: serde_json::Value = fs_utils::read_json(&token_store_path(&state));
+    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(&state);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let pick = |id: &str| -> Option<(String, String, String)> {
         let rec = tokens.get(id)?;

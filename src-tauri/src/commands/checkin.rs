@@ -252,7 +252,7 @@ fn run_checkin_worker(
         // 积分过期感知调度：按 credits_expire_at 升序排列（最近过期的优先签到）
         // 无过期时间的账号排在最后；过期时间相同的按剩余积分降序
         let rc: crate::models::RemainingCreditsFile =
-            crate::fs_utils::read_json(&state.path("remaining_credits.json"));
+            crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
         uids.sort_by(|a, b| {
             let ea = rc.expire_times.get(a).copied();
             let eb = rc.expire_times.get(b).copied();

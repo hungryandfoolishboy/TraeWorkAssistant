@@ -5,14 +5,12 @@
 //! 启动时加载并裁剪超过保留期的历史数据（默认 90 天）。
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::fs_utils;
 
 /// 用量数据文件名（位于 data/ 目录）
-pub const USAGE_FILE: &str = "api_usage.json";
 /// 历史数据保留天数（超出部分启动时裁剪）
 pub const RETENTION_DAYS: i64 = 90;
 
@@ -332,23 +330,16 @@ pub fn today_key() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// 用量文件路径：data_dir/data/api_usage.json
-pub fn usage_path(data_dir: &Path) -> PathBuf {
-    let dir = data_dir.join("data");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join(USAGE_FILE)
-}
-
-/// 从磁盘加载用量数据（缺失/损坏回退空结构）
+/// 从磁盘加载用量数据（缺失/损坏回退空结构；SQLite 化 P3：api_usage 表）
 pub fn load(data_dir: &Path) -> UsageFile {
-    let mut f: UsageFile = fs_utils::read_json(&usage_path(data_dir));
+    let mut f = crate::store::docs::api_usage_load(&crate::store::db(data_dir));
     f.trim(RETENTION_DAYS);
     f
 }
 
-/// 原子写盘
+/// 原子写盘（事务内整表替换）
 pub fn save(data_dir: &Path, usage: &UsageFile) {
-    let _ = fs_utils::write_json(&usage_path(data_dir), usage);
+    let _ = crate::store::docs::api_usage_save(&crate::store::db(data_dir), usage);
 }
 
 // ==================== 命令返回结构 ====================

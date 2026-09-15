@@ -400,12 +400,12 @@ pub fn detect_uid(state: &AppState) -> Value {
     let ls_uid: Option<String> = best.as_ref().map(|b| b.2.clone());
     let ls_ts: f64 = best.as_ref().map(|b| b.0 as f64 / 1000.0).unwrap_or(0.0);
 
-    // 抓包文件新鲜度（代理开着时随流量秒级更新，通常更新）
-    let cap_file = state.data_dir.join("data").join("doubao_captured_credentials.json");
+    // 抓包凭证新鲜度（代理开着时随流量秒级更新，通常更新；SQLite 化 P3 走 kv）
     let mut cap_uid: Option<String> = None;
     let mut cap_ts: f64 = 0.0;
-    if cap_file.is_file() {
-        let c: Value = crate::fs_utils::read_json(&cap_file);
+    {
+        let c: Value = crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
+        if !c.is_null() {
         let u = c.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let ts = c.get("captured_at").and_then(Value::as_str).unwrap_or("").trim().to_string();
         if !u.is_empty() && u.bytes().all(|b| b.is_ascii_digit()) && !ts.is_empty() {
@@ -419,6 +419,7 @@ pub fn detect_uid(state: &AppState) -> Value {
                 },
                 Err(e) => eprintln!("[detect-uid] 抓包文件时间解析失败（忽略）: {e}"),
             }
+        }
         }
     }
 
@@ -843,8 +844,9 @@ fn message_text(m: &Value) -> String {
 }
 
 fn load_account(state: &AppState, uid: &str) -> Result<Value, String> {
-    let pool_path = state.data_dir.join("data").join("doubao_accounts.json");
-    let pool: Value = crate::fs_utils::read_json(&pool_path);
+    // SQLite 化（P3）：doubao_accounts 表
+    let pool: Value =
+        serde_json::to_value(crate::commands::doubao::load_pool(state)).unwrap_or(json!({}));
     for acc in pool.get("accounts").and_then(Value::as_array).into_iter().flatten() {
         if acc.get("user_id").and_then(Value::as_str) == Some(uid) {
             return Ok(acc.clone());

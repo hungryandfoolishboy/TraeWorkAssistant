@@ -121,42 +121,19 @@ fn session_state_of(acc: &DoubaoAccount) -> String {
     }
 }
 
-fn pool_path(state: &State<AppState>) -> PathBuf {
-    state.data_dir.join("data").join("doubao_accounts.json")
-}
-
 fn profiles_root(state: &State<AppState>) -> PathBuf {
     state.data_dir.join("data").join("profiles_doubao")
 }
 
 /// 读取账号池；文件不存在/损坏时返回空池（损坏仅记日志，避免一个坏文件锁死整页）
-fn load_pool(state: &State<AppState>) -> DoubaoAccountPool {
-    let path = pool_path(state);
-    if !path.exists() {
-        return DoubaoAccountPool::default();
-    }
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<DoubaoAccountPool>(&raw) {
-            Ok(pool) => pool,
-            Err(e) => {
-                fs_utils::app_log(&state.data_dir, &format!("doubao_accounts.json 解析失败（忽略）: {e}"));
-                DoubaoAccountPool::default()
-            }
-        },
-        Err(e) => {
-            fs_utils::app_log(&state.data_dir, &format!("doubao_accounts.json 读取失败（忽略）: {e}"));
-            DoubaoAccountPool::default()
-        }
-    }
+/// 读取账号池（SQLite 化 P3：doubao_accounts 表；tasks/* 共用统一入口）
+pub(crate) fn load_pool(state: &AppState) -> DoubaoAccountPool {
+    crate::store::docs::doubao_pool_load(&crate::store::db(&state.data_dir))
 }
 
-fn save_pool(state: &State<AppState>, pool: &DoubaoAccountPool) -> Result<(), String> {
-    let path = pool_path(state);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建账号池目录失败: {e}"))?;
-    }
-    // fs_utils::write_json：pid+纳秒 tmp 名防并发覆写冲突，内部 pretty 序列化
-    fs_utils::write_json(&path, pool)
+/// 保存账号池（SQLite 化 P3：doubao_accounts 表整表替换）
+pub(crate) fn save_pool(state: &AppState, pool: &DoubaoAccountPool) -> Result<(), String> {
+    crate::store::docs::doubao_pool_save(&crate::store::db(&state.data_dir), pool)
 }
 
 /// 读取当前账号（PS 桥 Set-CurrentAccount 写 profiles_doubao/current_account.txt，UTF8 带 BOM）
@@ -519,11 +496,10 @@ fn detect_uid_from_local_storage(state: &State<AppState>) -> Option<String> {
     (!uid.is_empty()).then_some(uid)
 }
 
-/// 从代理抓包凭证文件读 uid（代理 MITM 层解析 multi_sids 得到；None = 未抓到/旧格式无此字段）
+/// 从代理抓包凭证读 uid（代理 MITM 层解析 multi_sids 得到；None = 未抓到/旧格式无此字段）。
+/// SQLite 化（P3）：kv `doubao_captured_credentials`。
 fn read_captured_uid(state: &State<AppState>) -> Option<String> {
-    let path = state.data_dir.join("data").join("doubao_captured_credentials.json");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let v: serde_json::Value = crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
     let uid = v.get("uid")?.as_str()?.trim().to_string();
     (!uid.is_empty()).then_some(uid)
 }
@@ -732,6 +708,7 @@ pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<()
     };
     let app2 = app.clone();
     let data_dir = state.data_dir.clone();
+    let st2 = state.inner().clone();
     std::thread::spawn(move || {
         let sink = crate::switcher::TauriSink::new(&app2, "keepalive-progress", &data_dir);
         let result = crate::switcher::run_action(args, &sink);
@@ -741,14 +718,10 @@ pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<()
         };
         let _ = app2.emit("keepalive-done", serde_json::json!({ "success": success, "raw": raw }));
         if success {
-            // 记录池级保活时间戳 + 运维历史（写入失败不影响保活结果）
-            let pool_path = data_dir.join("data").join("doubao_accounts.json");
-            if let Ok(raw) = std::fs::read_to_string(&pool_path) {
-                if let Ok(mut pool) = serde_json::from_str::<DoubaoAccountPool>(&raw) {
-                    pool.last_keepalive_at = Some(fs_utils::now_ts());
-                    let _ = fs_utils::write_json(&pool_path, &pool);
-                }
-            }
+            // 记录池级保活时间戳 + 运维历史（写入失败不影响保活结果；SQLite 化 P3 经 store）
+            let mut pool = load_pool(&st2);
+            pool.last_keepalive_at = Some(fs_utils::now_ts());
+            let _ = save_pool(&st2, &pool);
             append_history_event(
                 &data_dir,
                 serde_json::json!({
@@ -851,17 +824,14 @@ const HISTORY_MAX: usize = 400;
 
 /// 追加一条运维历史事件（data_dir 为应用数据根目录；写入失败静默，不影响主流程）
 fn append_history_event(data_dir: &std::path::Path, event: serde_json::Value) {
-    let path = data_dir.join("data").join("doubao_health_history.json");
-    let mut events: Vec<serde_json::Value> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| v.get("events").and_then(|e| e.as_array()).cloned())
-        .unwrap_or_default();
+    // SQLite 化（P3）：doubao_health_events 表（HISTORY_MAX 上限裁剪保留）
+    let store = crate::store::db(data_dir);
+    let mut events = crate::store::docs::doubao_health_load(&store);
     events.push(event);
     if events.len() > HISTORY_MAX {
         events.drain(0..events.len() - HISTORY_MAX);
     }
-    let _ = fs_utils::write_json(&path, &serde_json::json!({ "events": events }));
+    let _ = crate::store::docs::doubao_health_save(&store, &events);
 }
 
 fn append_history(state: &AppState, event: serde_json::Value) {
@@ -871,16 +841,8 @@ fn append_history(state: &AppState, event: serde_json::Value) {
 /// 读取运维历史（旧→新），前端据此渲染健康度卡与额度趋势
 #[tauri::command]
 pub fn doubao_history(state: State<AppState>) -> Result<Vec<serde_json::Value>, String> {
-    let path = state.data_dir.join("data").join("doubao_health_history.json");
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    let events = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .and_then(|v| v.get("events").and_then(|e| e.as_array()).cloned())
-        .unwrap_or_default();
-    Ok(events)
+    // SQLite 化（P3）：doubao_health_events 表
+    Ok(crate::store::docs::doubao_health_load(&crate::store::db(&state.data_dir)))
 }
 
 /// 从额度解析结果提取窗口数组（A2 趋势图数据点）
@@ -919,12 +881,11 @@ pub struct DoubaoCapturedCredential {
 
 #[tauri::command]
 pub fn doubao_captured_credential(state: State<AppState>) -> Result<Option<DoubaoCapturedCredential>, String> {
-    let path = state.data_dir.join("data").join("doubao_captured_credentials.json");
-    if !path.exists() {
+    // SQLite 化（P3）：kv `doubao_captured_credentials`
+    let v: serde_json::Value = crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
+    if v.is_null() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
     let session_id = v
         .get("session_id")
         .and_then(|s| s.as_str())
@@ -1063,13 +1024,11 @@ pub fn doubao_account_get_credential(
 /// 返回 Some(说明) = 本次发生了写入（前端据此提示并刷新）；None = 无凭证/无 uid/未入池/内容未变。
 #[tauri::command]
 pub fn doubao_credential_auto_apply(state: State<AppState>) -> Result<Option<String>, String> {
-    // 读最新抓包凭证
-    let path = state.data_dir.join("data").join("doubao_captured_credentials.json");
-    if !path.exists() {
+    // 读最新抓包凭证（SQLite 化 P3：kv `doubao_captured_credentials`）
+    let v: serde_json::Value = crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
+    if v.is_null() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
     let session_id = v
         .get("session_id")
         .and_then(|s| s.as_str())

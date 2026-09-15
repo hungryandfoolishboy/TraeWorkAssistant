@@ -912,11 +912,20 @@ mod tests {
         // Trae 侧 L4 对 my-vision-model 无图片推断 → supports_image = None；
         // disabled 自定义条目声明 supports_image=true → 不得覆盖
         let f = fixture(&[("my-vision-model", None)], &[], None);
-        std::fs::write(
-            f.dir.join("data").join("custom_models.json"),
-            json!({"models": [{"id": "cm1", "name": "my-vision-model", "base_url": "https://x",
-                               "enabled": false, "supports_image": true}]})
-                .to_string(),
+        // SQLite 化（P3）：custom_models 表
+        crate::store::docs::custom_models_save(
+            &crate::store::db(&f.dir),
+            &crate::api_server::custom_models::CustomModelsFile {
+                models: vec![crate::api_server::custom_models::CustomModel {
+                    id: "cm1".into(),
+                    name: "my-vision-model".into(),
+                    base_url: "https://x".into(),
+                    enabled: false,
+                    supports_image: true,
+                    ..Default::default()
+                }],
+                updated_at: 0,
+            },
         )
         .unwrap();
         let list = unified_models(&f.dir, true, true, true);
@@ -926,11 +935,19 @@ mod tests {
             "disabled 条目不覆盖顶层 supports_image"
         );
         // enabled 条目参与覆盖 → true
-        std::fs::write(
-            f.dir.join("data").join("custom_models.json"),
-            json!({"models": [{"id": "cm1", "name": "my-vision-model", "base_url": "https://x",
-                               "enabled": true, "supports_image": true}]})
-                .to_string(),
+        crate::store::docs::custom_models_save(
+            &crate::store::db(&f.dir),
+            &crate::api_server::custom_models::CustomModelsFile {
+                models: vec![crate::api_server::custom_models::CustomModel {
+                    id: "cm1".into(),
+                    name: "my-vision-model".into(),
+                    base_url: "https://x".into(),
+                    enabled: true,
+                    supports_image: true,
+                    ..Default::default()
+                }],
+                updated_at: 0,
+            },
         )
         .unwrap();
         let list = unified_models(&f.dir, true, true, true);
@@ -942,11 +959,20 @@ mod tests {
     #[test]
     fn t14_custom_zero_rate_is_free() {
         let f = fixture(&[], &[], None);
-        std::fs::write(
-            f.dir.join("data").join("custom_models.json"),
-            json!({"models": [{"id": "cm1", "name": "my-free-model", "base_url": "https://x",
-                               "enabled": true, "rate": 0.0}]})
-                .to_string(),
+        // SQLite 化（P3）：custom_models 表
+        crate::store::docs::custom_models_save(
+            &crate::store::db(&f.dir),
+            &crate::api_server::custom_models::CustomModelsFile {
+                models: vec![crate::api_server::custom_models::CustomModel {
+                    id: "cm1".into(),
+                    name: "my-free-model".into(),
+                    base_url: "https://x".into(),
+                    enabled: true,
+                    rate: 0.0,
+                    ..Default::default()
+                }],
+                updated_at: 0,
+            },
         )
         .unwrap();
         let list = unified_models(&f.dir, true, true, true);

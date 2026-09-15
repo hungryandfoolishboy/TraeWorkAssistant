@@ -4,9 +4,8 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
-use crate::fs_utils;
 use crate::jwt;
-use crate::models::{CreditRecord, CreditsFile, DeviceMap, Settings};
+use crate::models::{CreditRecord, DeviceMap, Settings};
 use crate::state::AppState;
 
 pub const INVITE_LINK: &str =
@@ -16,9 +15,11 @@ pub const INVITE_LINK: &str =
 
 #[tauri::command]
 pub fn device_reset(state: State<AppState>, user_id: String) -> Result<(), String> {
-    let mut map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
+    // SQLite 化（P3）：device_map.json → device_map 表
+    let store = crate::store::db(&state.data_dir);
+    let mut map: DeviceMap = crate::store::docs::device_map_load(&store);
     map.remove(&user_id);
-    fs_utils::write_json(&state.path("device_map.json"), &map)?;
+    crate::store::docs::device_map_save(&store, &map)?;
     Ok(())
 }
 
@@ -468,7 +469,7 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
 
 #[tauri::command]
 pub fn credits_history(state: State<AppState>) -> Vec<CreditRecord> {
-    fs_utils::read_json::<CreditsFile>(&state.path("credits_history.json")).records
+    crate::store::docs::credits_history_load(&crate::store::db(&state.data_dir)).records
 }
 
 // ---------------- 邀请 ----------------

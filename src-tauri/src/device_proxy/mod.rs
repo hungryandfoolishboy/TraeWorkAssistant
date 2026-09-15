@@ -74,12 +74,8 @@ pub struct ProxyConfig {
     pub targets: Vec<String>,
     /// 自动捕获 JWT 写回 accounts（AUTO_CAPTURE_JWT，默认开）
     pub auto_capture_jwt: bool,
-    /// data/checkin_accounts.json
-    pub accounts_path: PathBuf,
-    /// data/account_cooldowns.json
-    pub cooldowns_path: PathBuf,
-    /// data/doubao_captured_credentials.json
-    pub doubao_cred_path: PathBuf,
+    /// 数据根目录（SQLite 化 P3：accounts/cooldowns/凭证快照均经 store 读写）
+    pub data_dir: PathBuf,
     /// data/certs（CA 目录，与 Python 版布局一致）
     pub certs_dir: PathBuf,
     /// logs/proxy.log 操作日志
@@ -119,9 +115,7 @@ impl ProxyServer {
             req_logger,
             targets,
             auto_capture_jwt: cfg.auto_capture_jwt,
-            accounts_path: cfg.accounts_path.clone(),
-            cooldowns_path: cfg.cooldowns_path.clone(),
-            doubao_cred_path: cfg.doubao_cred_path.clone(),
+            data_dir: cfg.data_dir.clone(),
         });
 
         // 升级历史假占位符设备标识（对齐 Python sync_account_devices，仅自动捕获开启时）
@@ -141,7 +135,7 @@ impl ProxyServer {
         log.log(&format!("监听 TRAE 域名: {}", list.join(", ")));
         log.log("  → 命中上述域名的请求会在面板中以 [TRAE] 标记；JWT 捕获不限 host（兼容未列出的子域）");
         log.log("  → 未在监听域名列表中的请求将透明转发（不记录日志），不影响其他 App 正常上网");
-        log.log(&format!("accounts: {}", cfg.accounts_path.display()));
+        log.log(&format!("accounts: {}", cfg.data_dir.join("accounts（SQLite accounts 表）").display()));
         log.log(&format!("代理请求日志: {} (100MB 滚动)", cfg.req_log_dir.display()));
         log.log(&format!(
             "自动捕获 JWT 写回 accounts.json: {}",
@@ -573,7 +567,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 /// device_id 全 '2' / session_id 全 '5'；仅当字段确实变化时才写盘）
 pub fn sync_account_devices(ctx: &ProxyCtx) {
     let _g = handler::accounts_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let mut cfg: serde_json::Value = crate::fs_utils::read_json(&ctx.accounts_path);
+    // SQLite 化（P3）：accounts 表 raw 读写（保留扩展字段与数字 uid 兼容语义）
+    let mut cfg: serde_json::Value = crate::store::docs::accounts_load_raw(&crate::store::db(&ctx.data_dir));
     if !cfg.get("accounts").map(|a| a.is_array()).unwrap_or(false) {
         return;
     }
@@ -614,10 +609,10 @@ pub fn sync_account_devices(ctx: &ProxyCtx) {
         changed = true;
     }
     if changed {
-        if crate::fs_utils::write_json(&ctx.accounts_path, &cfg).is_ok() {
-            ctx.log.log("  [sync] 已刷新 accounts.json 中设备标识字段(旧算法升级)");
+        if crate::store::docs::accounts_save_raw(&crate::store::db(&ctx.data_dir), &cfg).is_ok() {
+            ctx.log.log("  [sync] 已刷新账号设备标识字段(旧算法升级)");
         } else {
-            ctx.log.log("  [sync] accounts.json 写入失败（设备标识刷新未落盘）");
+            ctx.log.log("  [sync] 账号设备标识写入失败（未落库）");
         }
     }
 }
@@ -716,9 +711,7 @@ mod tests {
             req_logger: Arc::new(RequestLogger::new(dir.clone())),
             targets: DEFAULT_TARGETS.iter().map(|s| s.to_string()).collect(),
             auto_capture_jwt: true,
-            accounts_path: dir.join("checkin_accounts.json"),
-            cooldowns_path: dir.join("account_cooldowns.json"),
-            doubao_cred_path: dir.join("doubao_captured_credentials.json"),
+            data_dir: dir.clone(),
         }
     }
 
@@ -727,8 +720,8 @@ mod tests {
     fn sync_refreshes_placeholder_devices() {
         let dir = temp_dir("sync");
         let ctx = test_ctx(&dir);
-        serde_json::to_writer(
-            std::fs::File::create(&ctx.accounts_path).unwrap(),
+        crate::store::docs::accounts_save_raw(
+            &crate::store::db(&dir),
             &serde_json::json!({
                 "accounts": [
                     {"name": "a", "UserID": "4487568582777872", "device_id": "222222222222222",
@@ -739,7 +732,8 @@ mod tests {
         )
         .unwrap();
         sync_account_devices(&ctx);
-        let cfg: serde_json::Value = crate::fs_utils::read_json(&ctx.accounts_path);
+        let cfg: serde_json::Value =
+            crate::store::docs::accounts_load_raw(&crate::store::db(&dir));
         let acc = &cfg["accounts"];
         let dev = crate::commands::accounts::derive_device("4487568582777872");
         assert_eq!(acc[0]["device_id"].as_str().unwrap(), dev.device_id);
@@ -748,22 +742,19 @@ mod tests {
             acc[1]["device_id"].as_str().unwrap(),
             crate::commands::accounts::derive_device("12345").device_id
         );
-        // 二次同步应无变化（不触发写盘，文件内容逐字节一致）
-        let before = std::fs::read_to_string(&ctx.accounts_path).unwrap();
+        // 二次同步应无变化（幂等：设备字段不再变化）
         sync_account_devices(&ctx);
-        let after = std::fs::read_to_string(&ctx.accounts_path).unwrap();
-        assert_eq!(before, after);
+        let after: serde_json::Value = crate::store::docs::accounts_load_raw(&crate::store::db(&dir));
+        assert_eq!(cfg["accounts"][0]["device_id"], after["accounts"][0]["device_id"]);
     }
 
-    /// 缺 accounts 数组 / 空文件时静默返回，不报错不写盘
+    /// 缺 accounts 数组 / 空表时静默返回，不报错不写库
     #[test]
     fn sync_tolerates_missing_accounts() {
         let dir = temp_dir("sync_empty");
         let ctx = test_ctx(&dir);
-        sync_account_devices(&ctx); // 文件不存在
-        std::fs::write(&ctx.accounts_path, "{}").unwrap();
-        sync_account_devices(&ctx); // 空 accounts
-        assert!(dir.join("checkin_accounts.json").exists());
+        sync_account_devices(&ctx); // 空表
+        sync_account_devices(&ctx); // 再次（幂等）
     }
 
     /// Windows 独占绑定：同端口二次 bind 必须失败（issue #7 防孤儿进程假启动）

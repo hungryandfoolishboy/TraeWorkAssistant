@@ -13,7 +13,6 @@ use crate::workbuddy_cli;
 
 use super::common::{
     account_id_of, as_str, cli_settings_path, load_pool, load_settings, restore_cli_settings,
-    token_store_path,
 };
 
 pub(super) fn cli_rotate_state_path(state: &AppState) -> PathBuf {
@@ -55,7 +54,7 @@ fn cli_current_account_id() -> Option<String> {
 
 /// 从 token store 取账号 access_token（CLI 桥唯一凭证来源；auth 文件只读态不入桥）。
 fn cli_token_of(state: &AppState, account_id: &str) -> Option<String> {
-    let store: serde_json::Value = fs_utils::read_json(&token_store_path(state));
+    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(state);
     let rec = store.get("tokens").and_then(|t| t.get(account_id)).cloned().unwrap_or_default();
     as_str(fs_utils::dig(&rec, &["access_token"])).filter(|t| !t.is_empty())
 }

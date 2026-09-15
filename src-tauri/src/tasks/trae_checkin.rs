@@ -21,7 +21,7 @@ use crate::commands::accounts::derive_device;
 use crate::commands::oauth::random_hex;
 use crate::fs_utils;
 use crate::jwt;
-use crate::models::{AccountCooldownsFile, CooldownEntry, DeviceEntry, RawAccount};
+use crate::models::{CooldownEntry, DeviceEntry, RawAccount};
 use crate::state::AppState;
 
 use super::http_agent;
@@ -121,21 +121,17 @@ fn http_post(
 /// （代理捕获/切换流程写入，与新 JWT 的设备指纹校验匹配），缺失时按 uid 确定性派生
 ///（与 python gen=2 同算法）并落盘共享给 device_proxy。
 fn get_device_for(state: &AppState, uid: &str) -> DeviceEntry {
-    let path = state.path("device_map.json");
-    let map: Value = fs_utils::read_json(&path);
-    if let Some(rec) = map.get(uid).filter(|v| v.is_object()) {
-        if let Ok(e) = serde_json::from_value::<DeviceEntry>(rec.clone()) {
-            if !e.device_id.is_empty() {
-                return e;
-            }
+    // SQLite 化（P3）：device_map 表
+    let map = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
+    if let Some(e) = map.get(uid) {
+        if !e.device_id.is_empty() {
+            return e.clone();
         }
     }
     let dev = derive_device(uid);
-    if let Some(m) = map.as_object() {
-        let mut updated = m.clone();
-        updated.insert(uid.to_string(), serde_json::to_value(&dev).unwrap_or_default());
-        let _ = fs_utils::write_json(&path, &Value::Object(updated));
-    }
+    let mut updated = map;
+    updated.insert(uid.to_string(), dev.clone());
+    let _ = crate::store::docs::device_map_save(&crate::store::db(&state.data_dir), &updated);
     dev
 }
 
@@ -294,12 +290,13 @@ fn classify_error(http_status: i32, code: Option<i64>) -> (&'static str, i64) {
 /// 写入/更新账号冷却状态到 account_cooldowns.json（语义对齐 python save_cooldown）。
 /// Server/Client 类错误前 2 次仅计数不冷却（until=0），第 3 次起进入冷却。
 fn save_cooldown(state: &AppState, uid: &str, error_type: &str, cooldown_seconds: i64, reason: &str) {
-    let path = state.path("account_cooldowns.json");
-    let mut data: AccountCooldownsFile = fs_utils::read_json(&path);
+    // SQLite 化（P3）：account_cooldowns 表
+    let store = crate::store::db(&state.data_dir);
+    let mut data = crate::store::docs::account_cooldowns_load(&store);
     if cooldown_seconds == 0 {
         data.cooldowns.remove(uid);
         data.updated_at = Some(fs_utils::now_iso());
-        let _ = fs_utils::write_json(&path, &data);
+        let _ = crate::store::docs::account_cooldowns_save(&store, &data);
         return;
     }
     let entry = if cooldown_seconds == -1 {
@@ -326,7 +323,7 @@ fn save_cooldown(state: &AppState, uid: &str, error_type: &str, cooldown_seconds
     };
     data.cooldowns.insert(uid.to_string(), entry);
     data.updated_at = Some(fs_utils::now_iso());
-    let _ = fs_utils::write_json(&path, &data);
+    let _ = crate::store::docs::account_cooldowns_save(&store, &data);
 }
 
 /// 清除账号冷却状态（签到成功后调用）
@@ -450,37 +447,33 @@ fn resolve_claim_credits(
 /// 把账号最新积分与本次新增写入 credits_history.json（按日期追加，90 天滚动裁剪）。
 /// 前端积分看板/趋势图消费此文件。
 fn save_credits_history(state: &AppState, user_id: &str, credits: i64, delta: i64) {
-    let path = state.path("credits_history.json");
-    let mut data: Value = fs_utils::read_json(&path);
-    if !data.is_object() {
-        data = json!({"records": []});
-    }
+    // SQLite 化（P3）：credits_history 表（INSERT 追加 + 90 天滚动 DELETE）
+    let store = crate::store::db(&state.data_dir);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    {
-        let Some(recs) = data.get_mut("records").and_then(Value::as_array_mut) else {
-            data["records"] = json!([{
-                "date": today, "user_id": user_id, "credits": credits, "delta": delta,
-            }]);
-            let _ = fs_utils::write_json(&path, &data);
-            return;
-        };
-        recs.push(json!({"date": today, "user_id": user_id, "credits": credits, "delta": delta}));
-        let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(90))
-            .format("%Y-%m-%d")
-            .to_string();
-        recs.retain(|r| r.get("date").and_then(Value::as_str).unwrap_or("") >= cutoff.as_str());
+    let rec = crate::models::CreditRecord {
+        date: today.clone(),
+        user_id: user_id.to_string(),
+        credits,
+        delta,
+    };
+    if crate::store::docs::credits_history_append(&store, &[rec]).is_err() {
+        return;
     }
-    let _ = fs_utils::write_json(&path, &data);
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(90))
+        .format("%Y-%m-%d")
+        .to_string();
+    let _ = store.with_conn(|c| {
+        c.execute("DELETE FROM credits_history WHERE date < ?1", [cutoff.as_str()]).map(|_| ())
+    });
 }
 
 /// 保存签到结果摘要（同日合并，对齐 python save_summary_merged）：本轮未覆盖的账号
 ///（被桌面端跳过的已签账号）沿用当日旧记录，避免第二轮整份覆盖丢失「今日已签」状态。
 /// 去重键 user_id 优先（同名账号不互吞）；旧记录无 user_id 时回退按 name 匹配。
 fn save_summary_merged(state: &AppState, results: Vec<Value>, warnings: &[String]) {
-    let path = state.path("checkin_summary.json");
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let mut merged = results;
-    let old: Value = fs_utils::read_json(&path);
+    let old: Value = crate::store::db(&state.data_dir).kv_get("checkin_summary");
     let old_time = old.get("time").and_then(Value::as_str).unwrap_or("");
     if let Some(old_results) = old.get("results").and_then(Value::as_array) {
         if old_time.starts_with(&today) {
@@ -524,7 +517,8 @@ fn save_summary_merged(state: &AppState, results: Vec<Value>, warnings: &[String
         "failed": failed,
         "warnings": warnings,
     });
-    let _ = fs_utils::write_json(&path, &summary);
+    // SQLite 化（P3）：checkin_summary → kv `checkin_summary`
+    let _ = crate::store::db(&state.data_dir).kv_set("checkin_summary", &summary);
 }
 
 // ── 单轮主流程（对齐 python main 循环体）───────────────────────────────────
@@ -634,7 +628,7 @@ pub fn run_round(
             if error_type != "Unknown" {
                 save_cooldown(state, &uid_str, error_type, cooldown_secs, &msg);
                 emit_error_type = Some(error_type);
-                let cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+                let cd = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
                 emit_cooldown_until = cd.cooldowns.get(&uid_str).map(|e| e.until).or(Some(0));
                 outcome.error_types.insert(uid_str.clone(), error_type.to_string());
             }

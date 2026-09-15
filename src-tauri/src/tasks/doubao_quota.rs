@@ -406,8 +406,9 @@ pub fn query_account(
 /// 返回 python 单账号 summary 契约：
 /// {"ok":true,"http_status":200,"url","user_id","parsed","finished_at","logs":[]}
 pub fn fetch_single(state: &AppState, uid: &str, url: &str) -> Result<Value, String> {
-    let pool_path = state.data_dir.join("data").join("doubao_accounts.json");
-    let pool: Value = fs_utils::read_json(&pool_path);
+    // SQLite 化（P3）：doubao_accounts 表
+    let pool: Value =
+        serde_json::to_value(crate::commands::doubao::load_pool(state)).unwrap_or(json!({}));
     let acc = pool
         .get("accounts")
         .and_then(Value::as_array)
@@ -490,30 +491,24 @@ pub fn summarize_parsed(parsed: &Value) -> Option<String> {
     }
 }
 
-/// 追加滚动运维历史（data/doubao_health_history.json，HISTORY_MAX 上限裁剪）。
+/// 追加滚动运维历史（SQLite 化 P3：doubao_health_events 表，HISTORY_MAX 上限裁剪）。
 /// 与 commands/doubao.rs append_history_event 同构（CLI 独立进程路径）。
 fn append_history(state: &AppState, event: Value) {
-    let path = state.data_dir.join("data").join("doubao_health_history.json");
-    let mut events: Vec<Value> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.get("events").and_then(|e| e.as_array()).cloned())
-        .unwrap_or_default();
+    let store = crate::store::db(&state.data_dir);
+    let mut events = crate::store::docs::doubao_health_load(&store);
     events.push(event);
     if events.len() > HISTORY_MAX {
         events.drain(0..events.len() - HISTORY_MAX);
     }
-    let _ = fs_utils::write_json(&path, &json!({ "events": events }));
+    let _ = crate::store::docs::doubao_health_save(&store, &events);
 }
 
 /// 批量巡检（`--task-run doubao-quota`，对齐 python --all）：遍历池内有凭证账号 →
 /// 查额度 → 回写账号池缓存 + 追加运维历史 → 汇总。
 pub fn run_batch(state: &AppState) -> Result<Value, String> {
-    let pool_path = state.data_dir.join("data").join("doubao_accounts.json");
-    if !pool_path.exists() {
-        return Err(format!("账号池不存在: {}", pool_path.display()));
-    }
-    let mut pool: Value = fs_utils::read_json(&pool_path);
+    // SQLite 化（P3）：doubao_accounts 表
+    let mut pool: Value =
+        serde_json::to_value(crate::commands::doubao::load_pool(state)).unwrap_or(json!({}));
     let Some(accounts) = pool.get_mut("accounts").and_then(Value::as_array_mut) else {
         return Err("账号池解析失败".to_string());
     };
@@ -640,8 +635,10 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
     }
 
     if changed {
-        // 账号池含全部账号会话凭证（等同密码），fs_utils::write_json 为 tmp + rename 原子写
-        fs_utils::write_json(&pool_path, &pool).map_err(|e| e.to_string())?;
+        // 账号池含全部账号会话凭证（等同密码），事务内整表替换
+        let file = serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(pool)
+            .map_err(|e| e.to_string())?;
+        crate::commands::doubao::save_pool(state, &file)?;
     }
     Ok(json!({
         "ok": true, "mode": "all", "url": url,

@@ -41,9 +41,7 @@ fn offline_ctx(state: &AppState) -> ProxyCtx {
         req_logger: std::sync::Arc::new(super::logger::RequestLogger::new(state.logs_dir())),
         targets: Vec::new(),
         auto_capture_jwt: true,
-        accounts_path: state.path("checkin_accounts.json"),
-        cooldowns_path: state.path("account_cooldowns.json"),
-        doubao_cred_path: state.path("doubao_captured_credentials.json"),
+        data_dir: state.data_dir.clone(),
     }
 }
 
