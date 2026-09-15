@@ -64,6 +64,7 @@ import type {
   WbResetItem,
   WbResetResult,
   WbTokenStats,
+  BuddyChatApp,
   WbUsageOfficial,
   WbUsageOfficialAll,
   WbUsageFallback,
@@ -329,19 +330,23 @@ export const api = {
     cliRotateLogs: (limit?: number) =>
       invoke<WbCliRotateLog[]>('workbuddy_cli_rotate_logs', { limit: limit ?? null }),
     // 会话三件套备份/恢复 + 复制迁移（F-44/F-45，批次3）
-    chatdataBackup: (userId: string) =>
-      invoke<{ ok: boolean; files: number; path: string }>('workbuddy_chatdata_backup', { userId }),
-    chatdataRestore: (userId: string) =>
-      invoke<{ ok: boolean; files: number }>('workbuddy_chatdata_restore', { userId }),
-    chatdataInfo: (userId: string) =>
+    // F-74：app 决定会话域（~/.workbuddy / ~/.codebuddy）与备份根；省略 = WorkBuddy（旧行为）
+    chatdataBackup: (userId: string, app?: BuddyChatApp) =>
+      invoke<{ ok: boolean; files: number; path: string }>('workbuddy_chatdata_backup', {
+        userId,
+        app: app ?? 'WorkBuddy',
+      }),
+    chatdataRestore: (userId: string, app?: BuddyChatApp) =>
+      invoke<{ ok: boolean; files: number }>('workbuddy_chatdata_restore', { userId, app: app ?? 'WorkBuddy' }),
+    chatdataInfo: (userId: string, app?: BuddyChatApp) =>
       invoke<{ backed: boolean; size_bytes?: number; files?: number; backed_at?: string; has_edge_mapping?: boolean }>(
         'workbuddy_chatdata_info',
-        { userId },
+        { userId, app: app ?? 'WorkBuddy' },
       ),
-    chatdataCopy: (sourceUserId: string, targetUserId: string) =>
+    chatdataCopy: (sourceUserId: string, targetUserId: string, app?: BuddyChatApp) =>
       invoke<{ ok: boolean; copied: number; total_lines: number; sessions_cloned: number; mappings_registered: number }>(
         'workbuddy_chatdata_copy',
-        { sourceUserId, targetUserId },
+        { sourceUserId, targetUserId, app: app ?? 'WorkBuddy' },
       ),
     // 账号库导入导出扩展（F-46，批次3）
     accountsExport: (includeCredentials?: boolean) =>

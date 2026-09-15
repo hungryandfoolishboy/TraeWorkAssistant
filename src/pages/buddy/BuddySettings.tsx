@@ -407,6 +407,7 @@ function CheckinConfigCard({
 
 export default function BuddySettings() {
   const pushToast = useAppStore((s) => s.pushToast);
+  const saveSettings = useAppStore((s) => s.saveSettings);
   const [env, setEnv] = useState<WorkBuddyEnvCheck | null>(null);
   const [settings, setSettings] = useState<WorkBuddySettings | null>(null);
   const [saving, setSaving] = useState(false);
@@ -494,6 +495,24 @@ export default function BuddySettings() {
 
   const patch = (p: Partial<WorkBuddySettings>) => {
     setSettings((prev) => (prev ? { ...prev, ...p } : prev));
+  };
+
+  /** F-74：切换时自动迁移会话——勾选即存（app Settings 真 patch 语义），失败原地回滚 */
+  const toggleSwitchMigrateChats = async (v: boolean) => {
+    const prev = appSettings;
+    setAppSettings((p) => (p ? { ...p, buddy_switch_migrate_chats: v } : p));
+    try {
+      await saveSettings({ buddy_switch_migrate_chats: v });
+      pushToast(
+        'success',
+        v
+          ? '已开启：WorkBuddy/CodeBuddy 切换账号前会自动备份当前账号会话并以新 id 复制到目标账号（进度见切换进度流）'
+          : '已关闭：切换账号仅切换登录态，不再写会话',
+      );
+    } catch (err) {
+      setAppSettings(prev);
+      pushToast('error', `保存失败：${String(err)}`);
+    }
   };
 
   /** 探测来源中文标签（settings = 人工指定） */
@@ -642,6 +661,29 @@ export default function BuddySettings() {
             </label>
           </div>
         </div>
+      </div>
+
+      {/* 切换时自动迁移会话（F-74）：默认关；勾选即存，进度走切换进度流 */}
+      <div className="card mt-4 p-4">
+        <div className="mb-2 flex items-center gap-2 text-sm font-medium">
+          切换账号时自动迁移会话
+          <Badge tone={appSettings?.buddy_switch_migrate_chats ? 'green' : 'slate'}>
+            {appSettings?.buddy_switch_migrate_chats ? '已开启' : '已关闭'}
+          </Badge>
+        </div>
+        <label className="flex cursor-pointer items-start gap-2 text-xs text-slate-600 dark:text-zinc-300">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+            checked={!!appSettings?.buddy_switch_migrate_chats}
+            onChange={(e) => void toggleSwitchMigrateChats(e.target.checked)}
+          />
+          <span>
+            切换 WorkBuddy/CodeBuddy 账号前，自动备份当前账号的会话三件套（projects + workbuddy.db +
+            edge-sync-mapping-v2.db），再以新 id 复制到目标账号名下并注册云端映射，之后才执行桥的
+            Stop→Restore→Start。任何一步失败只告警不阻断登录态切换（可稍后在账号管理页手动「复制会话」）。
+          </span>
+        </label>
       </div>
 
       {/* 签到配置（F-55/F-16/F-18）：自动签到 + 定时任务 + 坐标点击兜底 */}

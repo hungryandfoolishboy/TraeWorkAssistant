@@ -171,6 +171,10 @@ pub struct Settings {
     pub api_port: u16,
     #[serde(default = "default_api_model")]
     pub api_default_model: String,
+    /// F-74：Buddy（WorkBuddy/CodeBuddy）切换账号时自动把当前账号会话迁移到目标账号
+    ///（默认关；开启后切换前自动备份当前账号三件套并复制到目标账号名下）
+    #[serde(default)]
+    pub buddy_switch_migrate_chats: bool,
 }
 
 fn default_api_port() -> u16 {

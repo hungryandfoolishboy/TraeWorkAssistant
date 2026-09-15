@@ -270,7 +270,12 @@ export interface Settings {
   proxy_log_path: string | null;
   api_port: number;
   api_default_model: string;
+  /** F-74：WorkBuddy/CodeBuddy 切换账号时自动把当前账号会话迁移到目标账号（默认关） */
+  buddy_switch_migrate_chats: boolean;
 }
+
+/** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */
+export type BuddyChatApp = 'WorkBuddy' | 'CodeBuddy';
 
 export interface CheckinOpts {
   scope: string;

@@ -281,6 +281,16 @@ fn read_current_account_marker(dir: &std::path::Path) -> Option<String> {
     if t.is_empty() { None } else { Some(t) }
 }
 
+/// F-74：读指定端的当前账号标记（桥按端写入的 `profiles_<app>/current_account.txt`）。
+/// 与 `is_current_workbuddy` / `is_current_codebuddy` 徽标同源；文件不存在 → None。
+pub fn current_account_marker(state: &AppState, app: &str) -> Option<String> {
+    let dir = match app {
+        "CodeBuddy" => "profiles_codebuddy",
+        _ => "profiles_workbuddy",
+    };
+    read_current_account_marker(&state.data_dir.join("data").join(dir))
+}
+
 /// F1-3（switch.rs 防误覆盖守卫用）：读共享 auth 文件当前 uid → 账号池中反查账号 id。
 /// 返回的 id 与桥的 current_account.txt 同命名空间，供 -ExpectedCurrentUid 比对；
 /// None = 未登录 / 池中无此账号（调用方 fail-open 传空串，不阻断切换）。

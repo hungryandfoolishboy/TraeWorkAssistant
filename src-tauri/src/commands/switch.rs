@@ -9,6 +9,45 @@ use crate::fs_utils;
 use crate::state::AppState;
 use crate::switcher::{Action, RunArgs, TauriSink, TargetApp};
 
+use super::workbuddy::{pool_account_id_by_auth_uid, BuddyApp};
+
+/// switch-progress 事件单行 NDJSON（与 switcher::step_line 字段序/语义一致）
+fn emit_switch_step(app: &AppHandle, stage: &str, status: &str, message: &str) {
+    let line = serde_json::json!({
+        "stage": stage,
+        "status": status,
+        "message": message,
+        "time": fs_utils::now_ts(),
+    })
+    .to_string();
+    let _ = app.emit("switch-progress", line);
+}
+
+/// F-74：判定 Buddy（WorkBuddy/CodeBuddy）当前的登录账号 id（会话迁移的源账号）。
+/// WorkBuddy 由共享 auth 文件驱动 → auth 信号优先；CodeBuddy 由自身 vscdb 驱动
+/// （auth 文件可能被 WorkBuddy 覆盖）→ 桥标记优先（F2-2 标记语义）。
+fn buddy_current_account_id(state: &AppState, app: BuddyApp) -> Option<String> {
+    let by_auth = crate::commands::workbuddy::pool_account_id_by_auth_uid(state);
+    let by_marker = crate::commands::workbuddy::current_account_marker(state, app.label());
+    match app {
+        BuddyApp::WorkBuddy => by_auth.or(by_marker),
+        BuddyApp::CodeBuddy => by_marker.or(by_auth),
+    }
+}
+
+/// F-74：目标账号快照槽存在性（与 switch_flow 预检同条件：主槽或 .bak 回退槽）。
+/// 迁移前置作业会先关闭客户端（backup_chats 内 graceful_kill_app），而桥的
+/// 「目标账号无快照」预检失败路径在 stop_app 之前返回、无 start_app——目标无
+/// 快照时必须跳过迁移，否则客户端被杀后不再重启。
+fn buddy_target_slot_exists(data_dir: &std::path::Path, app: BuddyApp, uid: &str) -> bool {
+    let target = match app {
+        BuddyApp::CodeBuddy => TargetApp::CodeBuddy,
+        BuddyApp::WorkBuddy => TargetApp::WorkBuddy,
+    };
+    let profiles_dir = crate::switcher::profile::profile_for(target, data_dir).profiles_dir;
+    profiles_dir.join(uid).exists() || profiles_dir.join(format!("{uid}.bak")).exists()
+}
+
 /// 构造切/存/恢复类命令的通用入参
 fn build_args(
     action: Action,
@@ -30,16 +69,21 @@ fn build_args(
     }
 }
 
-/// 后台执行 run_action 并发射终态事件；成功后可选回调（dc id 回填等，携带 data_dir）
+/// 后台执行 run_action 并发射终态事件；成功后可选回调（dc id 回填等，携带 data_dir）。
+/// `pre`：run_action 之前执行的前置作业（F-74 会话迁移；其进度自行 emit，不走 sink）
 fn run_in_background(
     app: AppHandle,
     event_progress: &'static str,
     event_done: &'static str,
     args: RunArgs,
+    pre: Option<Box<dyn FnOnce(&AppHandle) + Send>>,
     on_success: Option<Box<dyn FnOnce(&AppHandle, &std::path::Path) + Send>>,
 ) {
     std::thread::spawn(move || {
         let data_dir = args.data_dir.clone();
+        if let Some(pre) = pre {
+            pre(&app);
+        }
         let sink = TauriSink::new(&app, event_progress, &data_dir);
         let result = crate::switcher::run_action(args, &sink);
         let (success, raw) = match &result {
@@ -122,9 +166,77 @@ pub fn switch_account(
         // F1-3 authfile 布局（WorkBuddy/CodeBuddy）切换守卫：以共享 auth 文件当前 uid
         // 在账号池反查账号 id 填充（与 current_account.txt 同命名空间）；
         // 反查失败 → 空串 fail-open 不阻断
-        crate::commands::workbuddy::pool_account_id_by_auth_uid(&state).unwrap_or_default()
+        pool_account_id_by_auth_uid(&state).unwrap_or_default()
     } else {
         String::new()
+    };
+
+    // F-74：Buddy 切换前自动迁移会话（设置项 buddy_switch_migrate_chats，默认关）。
+    // 迁移必须在桥的 Stop→Restore→Start 窗口之前完成全部 db/文件动作：先备份当前账号
+    // 三件套，再以新 id 复制到目标账号名下（复制后 live 同时含 A 原件 + B 副本，桥重启
+    // 客户端后目标账号登录即可见，源副本残留由下游清理）。
+    let is_buddy = matches!(target_app.as_deref(), Some("WorkBuddy") | Some("CodeBuddy"));
+    let buddy_app = match target_app.as_deref() {
+        Some("CodeBuddy") => BuddyApp::CodeBuddy,
+        _ => BuddyApp::WorkBuddy,
+    };
+    let migrate_job: Option<Box<dyn FnOnce(&AppHandle) + Send>> = if is_buddy
+        && state.settings().buddy_switch_migrate_chats
+        && buddy_target_slot_exists(&state.data_dir, buddy_app, user_id.trim())
+    {
+        match buddy_current_account_id(&state, buddy_app) {
+            Some(src) if src != user_id && !src.is_empty() => {
+                let data_dir = state.data_dir.clone();
+                let uid = user_id.clone();
+                let label = buddy_app.label();
+                fs_utils::app_log(
+                    &data_dir,
+                    &format!("切换前会话迁移: {label} {src} → {uid}（自动备份 + 复制）"),
+                );
+                Some(Box::new(move |app: &AppHandle| {
+                    emit_switch_step(
+                        app,
+                        "migrate",
+                        "running",
+                        &format!("正在迁移 {label} 会话到目标账号（自动备份 + 新 id 复制）"),
+                    );
+                    match crate::commands::workbuddy::backup_chats(&data_dir, buddy_app, &src).map(|(n, _)| n) {
+                        Ok(n) => emit_switch_step(app, "migrate", "ok", &format!("当前账号会话已备份（{n} 个文件）")),
+                        Err(e) => {
+                            emit_switch_step(
+                                app,
+                                "migrate",
+                                "warn",
+                                &format!("会话备份失败（已跳过迁移，切换继续）: {e}"),
+                            );
+                            return;
+                        }
+                    }
+                    match crate::commands::workbuddy::copy_chats(&data_dir, buddy_app, &src, &uid) {
+                        Ok(v) => emit_switch_step(
+                            app,
+                            "migrate",
+                            "ok",
+                            &format!(
+                                "会话已迁移到目标账号（会话 {}、sessions 克隆 {}、云端映射 {}）",
+                                v.get("copied").and_then(|x| x.as_i64()).unwrap_or(0),
+                                v.get("sessions_cloned").and_then(|x| x.as_i64()).unwrap_or(0),
+                                v.get("mappings_registered").and_then(|x| x.as_i64()).unwrap_or(0),
+                            ),
+                        ),
+                        Err(e) => emit_switch_step(
+                            app,
+                            "migrate",
+                            "warn",
+                            &format!("会话迁移失败（不影响登录态切换，可稍后手动「复制会话」）: {e}"),
+                        ),
+                    }
+                }))
+            }
+            _ => None,
+        }
+    } else {
+        None
     };
 
     let args = build_args(
@@ -141,7 +253,7 @@ pub fn switch_account(
     let app2 = app.clone();
     let uid_for_dc = user_id.clone();
     let is_doubao2 = is_doubao;
-    run_in_background(app2, "switch-progress", "switch-done", args, Some(Box::new(move |_app, dc_dir| {
+    run_in_background(app2, "switch-progress", "switch-done", args, migrate_job, Some(Box::new(move |_app, dc_dir| {
         // 切换成功后补充该账号的账户中心（icube-dc）id 预留记录（只记录不展示）
         // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过
         if !is_doubao2 {
@@ -194,7 +306,7 @@ pub fn save_current_login(
     let is_doubao = target_app.as_deref() == Some("Doubao");
     let app2 = app.clone();
     let uid_for_dc = user_id.clone();
-    run_in_background(app2, "save-login-progress", "save-login-done", args, Some(Box::new(move |_app, dc_dir| {
+    run_in_background(app2, "save-login-progress", "save-login-done", args, None, Some(Box::new(move |_app, dc_dir| {
         // 保存登录态成功后同样补充 dc id 预留记录（快照刚生成，来源最可靠）
         // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过
         if !is_doubao {
@@ -228,6 +340,6 @@ pub fn reset_device_ids(
         String::new(),
         state.data_dir.clone(),
     );
-    run_in_background(app, "device-reset-progress", "device-reset-done", args, None);
+    run_in_background(app, "device-reset-progress", "device-reset-done", args, None, None);
     Ok(())
 }

@@ -29,6 +29,7 @@ import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
 import type {
+  BuddyChatApp,
   ProfileInfo,
   WbCheckinRecord,
   WorkBuddyAccountView,
@@ -151,23 +152,41 @@ export default function BuddyAccounts() {
   const [snapOp, setSnapOp] = useState<{ slot: string; kind: 'restore' | 'delete' } | null>(null);
   // 二次确认弹框内容（恢复并启动 / 删除）
   const [snapConfirm, setSnapConfirm] = useState<{ slot: string; kind: 'restore' | 'delete' } | null>(null);
+  // F-74：会话域（会话三件套作用目标：WorkBuddy = ~/.workbuddy / CodeBuddy = ~/.codebuddy）
+  const [chatApp, setChatApp] = useState<BuddyChatApp>('WorkBuddy');
+  // refresh 为 useCallback([]) 固定身份（域切换不触发整表刷新），经 ref 读取最新会话域
+  // ——直接闭包引用 chatApp 会恒为首次渲染的 'WorkBuddy'，切换域后徽标按过期域重拉
+  const chatAppRef = useRef(chatApp);
+  chatAppRef.current = chatApp;
+
+  /** 拉取各账号会话备份徽标（按会话域隔离备份根；单账号失败仅该账号降级） */
+  const loadChatMeta = useCallback(async (accs: WorkBuddyAccountView[], app: BuddyChatApp) => {
+    void Promise.all(
+      accs.map(async (a): Promise<ChatMetaEntry> => {
+        try {
+          const m = await api.workbuddy.chatdataInfo(a.id, app);
+          return [a.id, { backed: m.backed, files: m.files, backed_at: m.backed_at }];
+        } catch {
+          return [a.id, null];
+        }
+      }),
+    ).then((entries) => setChatMeta(new Map(entries)));
+  }, []);
+
+  /** 切换会话域：立即按新域重取徽标（不整表刷新，账号列表不受影响） */
+  const changeChatApp = (next: BuddyChatApp) => {
+    setChatApp(next);
+    if (accounts.length) void loadChatMeta(accounts, next);
+  };
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
       const accs = await api.workbuddy.accountsList();
       setAccounts(accs);
-      // 会话备份状态徽标：逐账号轻量查询 chatdata_info；任一失败仅该账号不显示徽标（纯状态降级，不阻断列表）
-      void Promise.all(
-        accs.map(async (a): Promise<ChatMetaEntry> => {
-          try {
-            const m = await api.workbuddy.chatdataInfo(a.id);
-            return [a.id, { backed: m.backed, files: m.files, backed_at: m.backed_at }];
-          } catch {
-            return [a.id, null];
-          }
-        }),
-      ).then((entries) => setChatMeta(new Map(entries)));
+      // 会话备份状态徽标：逐账号轻量查询 chatdata_info（按当前会话域，经 ref 取最新值）；
+      // 任一失败仅该账号不显示徽标（纯状态降级，不阻断列表）
+      void loadChatMeta(accs, chatAppRef.current);
       // CLI 当前号查询（失败仅置空徽标：纯状态复位，不阻断列表展示；切号/删号后 refresh 会自动重取）
       api.workbuddy
         .cliStatus()
@@ -422,12 +441,12 @@ export default function BuddyAccounts() {
     }
   };
 
-  // 会话三件套备份（F-44）：projects + 双 db 快照；执行前自动关闭 WorkBuddy
+  // 会话三件套备份（F-44/F-74）：projects + 双 db 快照；执行前自动关闭对应客户端
   const handleBackupChats = async (a: WorkBuddyAccountView) => {
     setRowOp({ id: a.id, kind: 'backup' });
     try {
-      const r = await withMinDelay(api.workbuddy.chatdataBackup(a.id), 1200);
-      pushToast('success', `「${a.nickname || a.id}」会话已备份（${r.files} 个文件）`);
+      const r = await withMinDelay(api.workbuddy.chatdataBackup(a.id, chatApp), 1200);
+      pushToast('success', `「${a.nickname || a.id}」${chatApp} 会话已备份（${r.files} 个文件）`);
     } catch (err) {
       pushToast('error', `会话备份失败：${String(err)}`);
     } finally {
@@ -440,8 +459,11 @@ export default function BuddyAccounts() {
     if (!restoreFor) return;
     setRestoreBusy(true);
     try {
-      const r = await withMinDelay(api.workbuddy.chatdataRestore(restoreFor.id), 1200);
-      pushToast('success', `会话已恢复（${r.files} 个文件）；原有数据保留于 ~/.workbuddy/*.bak`);
+      const r = await withMinDelay(api.workbuddy.chatdataRestore(restoreFor.id, chatApp), 1200);
+      pushToast(
+        'success',
+        `会话已恢复（${r.files} 个文件）；原有数据保留于 ${chatApp === 'CodeBuddy' ? '~/.codebuddy' : '~/.workbuddy'}/*.bak`,
+      );
     } catch (err) {
       pushToast('error', `会话恢复失败：${String(err)}`);
     } finally {
@@ -455,7 +477,7 @@ export default function BuddyAccounts() {
     if (!copyFor || !copyTarget) return;
     setCopyBusy(true);
     try {
-      const r = await withMinDelay(api.workbuddy.chatdataCopy(copyFor.id, copyTarget), 1500);
+      const r = await withMinDelay(api.workbuddy.chatdataCopy(copyFor.id, copyTarget, chatApp), 1500);
       pushToast(
         'success',
         `已复制 ${r.copied} 个会话（sessions 克隆 ${r.sessions_cloned}，云端映射 ${r.mappings_registered}）到目标账号`,
@@ -668,6 +690,25 @@ export default function BuddyAccounts() {
             >
               {resetLoading ? <Spinner /> : <ShieldAlert size={15} />} 环境重置
             </button>
+            {/* F-74：会话域选择——决定会话三件套的备份/恢复/复制作用于哪个客户端数据目录 */}
+            <div
+              className="flex overflow-hidden rounded-lg border border-slate-200 dark:border-zinc-700"
+              title="会话域：会话备份/恢复/复制作用于哪个客户端（~/.workbuddy 或 ~/.codebuddy）"
+            >
+              {(['WorkBuddy', 'CodeBuddy'] as BuddyChatApp[]).map((ap) => (
+                <button
+                  key={ap}
+                  onClick={() => changeChatApp(ap)}
+                  className={`px-3 py-1.5 text-xs transition ${
+                    chatApp === ap
+                      ? 'bg-brand-600 text-white'
+                      : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-zinc-800'
+                  }`}
+                >
+                  {ap === 'WorkBuddy' ? 'WB 会话' : 'CB 会话'}
+                </button>
+              ))}
+            </div>
           </>
         }
       />
