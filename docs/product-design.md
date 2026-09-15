@@ -1,10 +1,11 @@
 # AI Work 助手 · 产品设计文档
 
-> 版本：v2.0（基线）· 2026-09-10 校订
-> 产品名称：**AI Work 助手**（当前产品版本 v3.2.7）
+> 版本：v2.0（基线）· 2026-09-15 校订
+> 产品名称：**AI Work 助手**（当前产品版本 v3.4.5）
 > 定位：整合「多账号签到」「登录态切换」「设备隔离」「账号分组」的 Windows 桌面端一体化工具。
 > 范围声明：v1.0 聚焦桌面端管理工具；v2.0 已实现本地 API 网关（OpenAI 兼容协议）、账号池智能调度、SSE 协议转换，全部为本项目自主设计与实现。
-> 文档定位：本文是**需求产品设计**主文档（v1.0/v2.0 设计基线）；3.x 增量功能见 `CHANGELOG.md` 与根目录 `AGENT.md`，WorkBuddy 接入设计见 [workbuddy-product-design.md](workbuddy-product-design.md)，未排期优化项见 [product-optimization-backlog.md](product-optimization-backlog.md)。
+> 文档定位：本文是**需求产品设计**主文档（v1.0/v2.0 设计基线）；3.x 增量功能见 `CHANGELOG.md` 与根目录 `AGENT.md`，未排期优化项见 [backlog.md](backlog.md)（WorkBuddy 接入蓝本的协议事实已归并至 [tech-framework.md](tech-framework.md) 附录 B）。
+> **架构演进说明（2026-09-15）**：文中 §1.2/§1.3/§九等处的 Python/PowerShell 表述为**设计当时的历史现状**——现核心逻辑已全量 Rust 化（`src-tauri/src/tasks/`、`switcher/`、`device_proxy/`），Python/PS 运行时与脚本均已移除；状态数据已由 JSON 文件迁入 SQLite（`data/aiwork.sqlite`）。历史表述保留以存档设计决策脉络。
 
 ---
 
@@ -966,13 +967,11 @@ Anthropic Request─┘                    └─→ Anthropic SSE
 
 | 用途 | 路径 |
 |---|---|
-| 批量签到核心 | `src-python/auto_checkin.py` |
-| MITM 代理核心 | `src-python/device_proxy.py` |
-| 账号配置模板 | `src-python/tests/（测试数据）` |
-| 设备限制根因分析 | `docs/技术框架（本项目设计）` |
-| 设备 ID 代理方案 | `docs/技术框架（本项目设计）` |
-| JWT 重抓指南 | `docs/tech-framework.md`（开发与运维） |
+| 批量签到核心 | `src-tauri/src/tasks/trae_checkin.rs`（原 `src-python/auto_checkin.py` 已 Rust 化） |
+| MITM 代理核心 | `src-tauri/src/device_proxy/`（原 `src-python/device_proxy.py` 已 Rust 化） |
 | 账号切换器 | `src-tauri/src/switcher/`（原 `src-ps/trae-switch-bridge.ps1` 已 Rust 化删除） |
+| 状态存储层 | `src-tauri/src/store/`（SQLite，v3.4.5 起替代 data 目录 JSON） |
+| JWT 重抓指南 | `docs/tech-framework.md`（开发与运维） |
 | 功能参考界面 | `docs/product-design.md（界面参考）` |
 
 ### 11.2 上游接口清单（v1.0 涉及）

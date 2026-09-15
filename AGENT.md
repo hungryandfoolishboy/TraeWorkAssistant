@@ -40,7 +40,7 @@ ai-work-assistant/
 ├── AGENT.md                      # 本文件（项目速查）
 ├── README.md                     # 用户文档
 ├── package.json / vite.config.ts / tsconfig.json / tailwind.config.js / postcss.config.js / index.html
-├── docs/                         # user-manual / tech-framework / product-design / product-optimization-backlog（唯一待办；原五份分析文档 2026-09-13 归并删除，原文在 git 历史）
+├── docs/                         # user-manual / tech-framework / product-design / backlog（唯一待办；原五份分析文档 2026-09-13 归并删除，原文在 git 历史）
 ├── src/                          # 前端
 │   ├── App.tsx                   # 外壳（TitleBar + Sidebar + TopBar + 页面切换 + Toaster）
 │   ├── store.ts                  # Zustand 单一真相（init / 刷新 / checkin/switch/saveLogin 事件归约）
@@ -52,10 +52,16 @@ ai-work-assistant/
 ├── src-tauri/
 │   ├── tauri.conf.json           # 无装饰窗 / 无外部资源（Python 与 PS 桥均已移除，全 Rust）
 │   └── src/
-│       ├── main.rs               # 注册全部命令
+│       ├── main.rs               # 注册全部命令 + --task-run CLI 任务模式
 │       ├── state.rs              # AppState（%APPDATA%\AIWorkAssistant + 旧目录迁移）
 │       ├── models.rs             # DTO（含 CheckinSummary.time 字段）
-│       ├── fs_utils.rs           # 原子 read_json / write_json / mask / 时间辅助
+│       ├── store/                # SQLite 存储层（v3.4.5 起全量承载 data 目录状态，替代 JSON 文件读写）
+│       │   ├── mod.rs / schema.rs / migrate.rs  # 连接注册表(WAL) / 建表 / 启动迁移(旧 JSON 导 backup/)
+│       │   └── *.rs              # kv 键值文档表 + 行文档实体表 + 列化流水表类型化读写
+│       ├── device_proxy/         # MITM 代理模块（hyper+rustls 自建，原 Python 迁移）：CA/头改写/凭据捕获/WS 帧记录/SSE 摘要/上游透传
+│       ├── fs_utils.rs           # 原子 read_json / write_json（vault/日志/导出仍用）/ mask / 时间辅助
+│       ├── vault.rs              # Stronghold 凭证保险库（DPAPI 主密码；JSON 落盘占位化）
+│       ├── workbuddy_cli.rs      # CLI 切号桥决策（decide_target 纯函数 + 轮换线程）
 │       ├── jwt.rs                # parse() + status_of() + refresh() + oauth_parse()
 │       ├── api_server/           # API 网关模块
 │       │   ├── mod.rs            # 常量 + 路由注册
@@ -85,6 +91,7 @@ ai-work-assistant/
 ## 5. Tauri 命令契约
 
 > **调用约定**：invoke 的**顶层参数名**跟随 Rust 函数签名（驼峰不替换，参数名直接匹配）。**嵌套对象**（`opts` / `patch`）的字段名保持 **snake_case**（Tauri 默认 serde 字段名，不做 camelCase 转换）。
+> **存储说明（v3.4.5 起）**：data 目录 JSON 已**全量迁入 SQLite**（`data/aiwork.sqlite`，kv 键值文档表 + 行文档实体表 + 列化流水表，旧 JSON 首启迁入 `data/backup/`）。下文提及的 `data/*.json` 均为**逻辑名**（对应库中 kv 键/表），不再产生运行期 JSON 文件读写。
 
 | 模块 | 命令 | 说明 |
 |---|---|---|
@@ -121,16 +128,16 @@ ai-work-assistant/
 | 豆包 | `doubao_account_get_credential(userId)` | 编辑弹框按需回填完整会话凭证——列表接口 `DoubaoAccountView` 的 session_id/sid_guard/ttwid 已掩码下发，完整值仅此命令按需获取 |
 | 豆包 | `doubao_captured_credential()` / `doubao_credential_auto_apply()` | 读 `device_proxy/` 抓包落盘的 data/doubao_captured_credentials.json（doubao.com Cookie 中的 sessionid/sid_guard/ttwid）；auto_apply 目标 = **抓包文件自带 uid**（multi_sids 按同一条 sessionid 匹配的主人，凭证与归属同源自洽），且**只回写已入池账号、绝不自动建号**（网页版/其他字节系应用抓到的陌生会话跳过并记 app_log；新账号一律走「保存当前登录态」），前端账号页每 20s 轮询；另有 `doubao_captured_credential` 供编辑弹框手动填充 |
 | 豆包 | `doubao_detect_uid()` | **主来源**：Local Storage leveldb 的 `client_device_info.userId`（客户端每次启动自写、**不依赖代理**；Rust `tasks/doubao_chats.rs` 解析并按时间戳与抓包文件比新鲜度取新者——无代理重登新账号也能识别，实测 2026-09-09）；**兜底①**：抓包文件 uid（multi_sids）→ `%LOCALAPPDATA%\Doubao\User Data\Local State` 的 saman.user_id（**同 profile 重登不更新**，只作兜底）；**兜底②**：`%APPDATA%\Doubao\public_config.json` 全树递归搜（text_picker 是输入法选择器缓存，**不随登录切换更新**，勿当主来源——bug1 根因）；**兜底③**：profiles_doubao/current_account.txt；含单元测试。局限：客户端**会话内**换登录不重启时 client_device_info 不刷新，重启豆包后即正确 |
-| 豆包 | `doubao_keepalive_run()` | 续期主路径：调 PS 桥 `-Action KeepAlive`（启动豆包 8s 联网滑动续期 → 优雅关闭，运行中跳过），NDJSON → keepalive-progress/done 事件，成功后记池级 last_keepalive_at + 运维历史 |
+| 豆包 | `doubao_keepalive_run()` | 续期主路径：调 `switcher::run_action(KeepAlive)`（启动豆包 8s 联网滑动续期 → 优雅关闭，运行中跳过），NDJSON → keepalive-progress/done 事件，成功后记池级 last_keepalive_at + 运维历史 |
 | 豆包 | `doubao_renew_run(syncOnly?)` | Rust 直调 `tasks/doubao_session.rs`（原 python doubao_renew.py）：探活巡检（仅手动录入凭证的账号，200=有效/302→passport=过期）或 cookie 诊断（sync_only，实测客户端 cookie 为二次加密密文，不能当凭证）；结果记运维历史 |
-| 豆包 | `doubao_renew_task_register(time)` / `..._status()` / `..._unregister()` | schtasks 每日保活任务 AIWorkAssistant_DoubaoRenew（/TR 调 PS 桥 KeepAlive） |
+| 豆包 | `doubao_renew_task_register(time)` / `..._status()` / `..._unregister()` | schtasks 每日保活任务 AIWorkAssistant_DoubaoRenew（/TR 调主 exe `--task-run doubao-keepalive`，启动器 `task_doubao_renew.cmd` 启动期原地迁移） |
 | 豆包 | `doubao_quota_fetch(userId)` | Rust 直调 `tasks/doubao_quota.rs` 查会员额度：POST 默认接口 `/alice/commerce/sale/subscription/quota/summary/`（body `{"product_line":"membership"}`，settings.doubao_quota_url 可改）+ 账号凭证；精确解析（套餐/到期/活动赠送/订阅记录/当前时段+近7天窗口含重置时间）+ 宽容兜底，成功后回写账号池额度缓存与运维历史；保活端点默认 `/info/v2/`（settings.doubao_renew_url 可改；state.rs 启动迁移回填默认值） |
 | 豆包 | `doubao_quota_task_register(time)` / `..._status()` / `..._unregister()` | schtasks 每日额度巡检任务 AIWorkAssistant_DoubaoQuotaCheck（/TR 调主 exe `--task-run doubao-quota`：批量查池内有凭证账号 → 回写缓存 + 运维历史 + 用完记录） |
 | 豆包 | `doubao_history()` | 读 data/doubao_health_history.json 运维事件（keepalive/renew/quota，滚动 400 条；quota 事件含 windows 额度窗口），概述页额度趋势图与健康度卡数据源；写入方：keepalive_run/renew_run/quota_fetch（source=app）+ 定时任务（source=task） |
 | 豆包 | `open_doubao_app(proxyPort?)` | 打开豆包桌面版；proxy_port 存在时注入 `--proxy-server`（启动前三级关闭现有进程确保参数生效，对齐 Trae 打开逻辑），凭证/额度抓取不依赖系统代理 |
-| 豆包 | `doubao_open_as_account(userId, proxyPort?)` | **C1 一键以账号打开**：调 PS 桥 `-Action Switch -TargetApp Doubao -ProxyPort <port>`（恢复该账号快照后直接拉起客户端，把「切换 → 等待 → 打开」两步合并为一步）；proxyPort>0 时桥层注入 `--proxy-server`；NDJSON 进度复用 switch-progress / switch-done 事件管线（前端走 store.openDoubaoAs，与 switchTo 互斥共用 switchingTo 状态） |
+| 豆包 | `doubao_open_as_account(userId, proxyPort?)` | **C1 一键以账号打开**：调 `switcher::run_action(Switch, Doubao)`（恢复该账号快照后直接拉起客户端，把「切换 → 等待 → 打开」两步合并为一步）；proxyPort>0 时注入 `--proxy-server`；NDJSON 进度复用 switch-progress / switch-done 事件管线（前端走 store.openDoubaoAs，与 switchTo 互斥共用 switchingTo 状态） |
 | 豆包 | `doubao_snapshot_meta(userId)` → `DoubaoSnapshotMeta?` | **C3 快照版本校验**：读 `profiles_doubao/<uid>/snapshot_meta.json`（schemaVersion / createdAt / chromiumVersion / includeIndexedDB），无元数据文件时回退读快照内 `Last Version`（返回 schema_version=0 标记为旧版快照）；账号页快照列「已保存」处悬停展示版本信息 |
-| 豆包 | `settings.doubao_snapshot_include_idb` | **C4 IndexedDB 可选纳入快照**：默认 false（体积大，默认排除）；开启后 profile_backup / profile_restore / switch_account / save_current_login 透传 `-IncludeIndexedDB` 给 PS 桥；桥层备份时纳入 `Default/IndexedDB`，恢复时**只要快照内含就回写**（不看当前开关，保证快照完整回写） |
+| 豆包 | `settings.doubao_snapshot_include_idb` | **C4 IndexedDB 可选纳入快照**：默认 false（体积大，默认排除）；开启后 profile_backup / profile_restore / switch_account / save_current_login 透传 `include_indexeddb` 给 switcher；备份时纳入 `Default/IndexedDB`，恢复时**只要快照内含就回写**（不看当前开关，保证快照完整回写） |
 | 豆包 | `doubao_chatdata_backup(userId)` / `doubao_chatdata_restore(userId)` / `doubao_chatdata_info(userId)` | **D1 对话数据独立备份/恢复**：源=豆包 User Data 各 Profile 下 IndexedDB（chrome_doubao-* / https_www.doubao.com*）+ DoubaoStorage → `data/doubao_chats/<uid>/`（按 profile 名分层 + chat_backup_meta.json，覆盖式）；备份/恢复均先 graceful_kill_app("Doubao")；恢复按 profile 名回写；与快照解耦（对话正文在云端跟账号走，本地备份的是客户端状态，换机/重装后恢复备份+登录即可同步对话）；info 供账号行「对话已备份」徽标 |
 | 豆包 | `doubao_export_chats(userId)` | **D2 对话记录导出**：Rust 直调 `tasks/doubao_chats.rs`（原 python `--export --uid X` 语义，stdout 末行 JSON 契约不变）；走官方 IM 接口 `POST www.doubao.com/im/chain/recent_conv`（cmd 3200 会话列表，conv_version=0 首跳 limit≤50）+ `im/chain/single`（cmd 3100 单会话消息，anchor_index=2^53-1 起翻页，index_in_conv 为字符串需 int 转换）；必需 Cookie：sessionid/sessionid_ss/sid_tt + sid_guard + **ttwid**（登录校验），sid_guard/ttwid 必须以 Set-Cookie 下发的 **URL 编码原样**发送（原始 | 形式报 712010702，_cookie_enc 兼容两种存储形式），query 必须含设备指纹 web_id/tea_uuid/fp（缺失报 712010702）+ 头 agw-js-conv:str + UA SamanthaDoubao；输出 markdown+json 到 data/exports/doubao_chats_<uid>_<ts>.*；正文提取 content_block text_block → tts_content/brief 兜底；池内凭证过期（客户端重新登录后 sessionid 轮换）时需重开代理自动回写 |
 | 日志 | `proxy_logs_list(...)` / `proxy_log_detail(...)` | 代理请求日志列表 / 详情 |
@@ -224,41 +231,40 @@ ai-work-assistant/
 
 ## 7. 数据文件
 
+> **v3.4.5 起存储层 SQLite 化**：下述 JSON 状态全部迁入 `data/aiwork.sqlite`（WAL 模式），运行期不再产生 JSON 文件读写。首启迁移器按注册表把旧 JSON 导入后移入 `data/backup/`（保留相对结构 + `migration_manifest.json` 清单）；幂等（`PRAGMA user_version` 闸门）。本文及 §5 提及的 JSON 文件名均为**逻辑名**（kv 键 = 文件名去 .json）。
+
 ```
 %APPDATA%\AIWorkAssistant\
 ├── conf/
-│   └── app_settings.json         # Settings 全字段（snake_case）
+│   ├── app_settings.json         # Settings 全字段（snake_case）——UI 可编辑配置保留文件形态
+│   ├── vault.stronghold          # jwt/refresh_token 权威加密存储（Stronghold）
+│   └── vault_key.bin             # vault 主密码（DPAPI 加密）
 ├── data/
-│   ├── checkin_accounts.json     # { accounts: [{name, UserID, jwt, refresh_token?, added_at}] }
-│   ├── workbuddy_accounts.json   # WorkBuddy 账号池（id=wb-<sha256(token)前12位>，凭证仅存 token store）
-│   ├── workbuddy_token_store.json# WorkBuddy 工具侧凭证副本（version=1 + expiresAtMs；与桌面 auth 文件谁新用谁）
-│   ├── workbuddy_settings.json   # WorkBuddy 配置（auto_checkin / keepalive_days / lazy_refresh_hours / growth_*）
-│   ├── workbuddy_credits_cache.json # 积分查询缓存（≥5min）
-│   ├── workbuddy_checkin_results.json # WorkBuddy 签到结果（90 天滚动）
+│   ├── aiwork.sqlite             # 全量状态库（WAL；-wal/-shm 常驻属正常）
+│   │   ├── kv                    # 键值文档表：app_settings / api_pool / dispatch_policy / api_models /
+│   │   │                         #   wb_model_catalog / wb_model_route / wb_template_map / wb_sticky(逻辑) /
+│   │   │                         #   workbuddy_settings / credits 三缓存 / wb_cli_rotate_state / doubao_* 等 29 键
+│   │   ├── 行文档实体表           # accounts / device_map / groups(+group_members) / remaining_credits /
+│   │   │                         #   account_cooldowns / pay_status / api_keys / custom_models /
+│   │   │                         #   doubao_accounts / wb_accounts / wb_tokens / api_usage —— (pk, data JSON)
+│   │   └── 列化流水表             # credits_history / credits_daily / checkin_results(90天) / wb_checkin_results /
+│   │                             #   doubao_health_events / wb_credits_history(365天) / usage_history_*(365天) / sticky_bindings
+│   ├── backup/                   # 首启迁移时移入的旧 JSON（含 migration_manifest.json / corrupt/）
 │   ├── workbuddy_chats/          # WorkBuddy 会话三件套备份（<uid>/projects/ + 双 db + chat_backup_meta.json）
-│   ├── workbuddy_cli_rotate_state.json # CLI 轮换状态（last_switch_at_ms + logs cap 50）
-│   ├── workbuddy_usage_official_cache.json # 官方请求用量缓存（10min）
-│   ├── workbuddy_credits_history.json # 每日积分余额快照（F-27 回退数据源，按日去重 cap 365）
-│   ├── workbuddy_activity_cache.json # 活动信息缓存（F-51，10min）
-│   ├── wb_model_catalog.json     # WB 上游模型目录（15 模型静态兜底 + supported_efforts/effort_override）
-│   ├── wb_template_map.json      # 审核模板黑名单映射表（mtime 热更新；缺失用内置兜底）
-│   ├── wb_sticky_sessions.json   # WB 会话粘性绑定（显式 30m TTL / 指纹 60s 窗）
-│   ├── profiles_workbuddy/       # WorkBuddy 快照槽（auth/ + storage/ + meta.json + current_account.txt）
-│   ├── device_map.json           # { <userId>: { device_id, market_user_id, session_id } }
-│   ├── groups.json               # { groups: [...], membership: {<uid>:<gid>} }
-│   ├── credits_history.json      # { records: [{date,user_id,credits,delta}] }
-│   ├── credits_daily.json        # 每日积分快照
-│   ├── remaining_credits.json    # 各账号剩余积分缓存
-│   ├── account_cooldowns.json    # 签到错误冷却状态（error_type + cooldown_until）
-│   ├── api_pool.json             # API 账号池配置 + 状态（strategy 含 weighted/p2c；wb_enabled 开关）
-│   ├── api_models.json           # 模型下拉列表（id=config_name 原样透传，label=官方展示名；3.2.6 起位于 data/ 子目录，旧位置自动兼容迁移）
-│   └── profiles/                 # 登录态快照
-│       ├── current_account.txt   # 当前活跃账号 ID
-│       └── <user_id>/            # 精准备份的 9 类核心文件
-└── logs/                        # proxy / checkin / switcher / api / proxy-requests 日志
+│   ├── doubao_chats/             # 豆包对话数据备份（<uid>/，按 profile 分层）
+│   ├── exports/                  # 导出产物（doubao_chats_<uid>_<ts>.md/.json 等）
+│   ├── certs/                    # 自签 CA（ca.cer / ca.crt / ca.key）
+│   ├── profiles/                 # 登录态快照（Trae Work）
+│   │   ├── current_account.txt   # 当前活跃账号 ID
+│   │   └── <user_id>/            # 精准备份的 9 类核心文件
+│   ├── profiles_trae/            # Trae CN 快照槽
+│   ├── profiles_doubao/          # 豆包快照槽（chromium 布局 + snapshot_meta.json + .bak 单代回滚）
+│   ├── profiles_workbuddy/       # WorkBuddy 快照槽（auth/ + storage/ + meta.json）
+│   └── profiles_codebuddy/       # CodeBuddy 快照槽（authfile 布局 + L3 vscdb 登录真源）
+└── logs/                         # proxy / checkin / switcher / api / proxy-requests / app.log 日志
 ```
 
-**写入约定**：`fs_utils::write_json` 用 `tmp + rename` 原子替换，避免断电损坏。
+**写入约定**：SQLite 经 `store::db(data_dir)` 单连接串行访问（WAL + busy_timeout 5000）；UI 配置与 vault/日志/导出仍走 `fs_utils::write_json`（tmp + rename 原子替换）。
 
 ## 8. 登录态切换器（switcher 模块，原 PS 桥）约定
 

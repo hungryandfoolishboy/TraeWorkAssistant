@@ -1,7 +1,7 @@
-# 技术架构设计 — AI Work 助手 v3.2.7
+# 技术架构设计 — AI Work 助手 v3.4.5
 
 > 本文是技术侧唯一总纲：技术选型、架构分层、数据模型、进程契约、API 协议参考、开发运维与排错。
-> 产品侧（需求/交互/界面）见 [product-design.md](product-design.md)；WorkBuddy 接入设计见 [workbuddy-product-design.md](workbuddy-product-design.md)。
+> 产品侧（需求/交互/界面）见 [product-design.md](product-design.md)；未排期优化项见 [backlog.md](backlog.md)（WorkBuddy 接入蓝本协议事实已归并至本文附录 B）。
 > **完整 Tauri 命令契约表以根目录 `AGENT.md` §5 为权威**，本文只保留契约概览与协议细节，避免双维护漂移。
 
 ## 1. 技术选型
@@ -16,7 +16,7 @@
 | HTTP 客户端 | ureq（同步）+ `spawn_blocking` 包装 | 双 Client 设计：短请求 120s 超时 / 流式仅 ResponseHeaderTimeout 120s，共享连接池 |
 | 加密 | tauri-plugin-stronghold + windows-sys(DPAPI) | jwt/refresh_token 入 vault，主密码经 DPAPI 仅本机当前用户可解 |
 | 测试 | cargo test + vitest | Rust 310 用例（tasks/device_proxy 纯函数） / 前端 `src/lib/format.test.ts` |
-| 打包 | Tauri Bundler → MSI / NSIS（自定义模板） | 含 PS 脚本（Python 运行时已移除，全 Rust）；产物经 `scripts/rename_release.mjs` 输出中文命名到 release/ |
+| 打包 | Tauri Bundler → MSI / NSIS（自定义模板） | 全 Rust 零外部运行时（Python 与 PowerShell 均已移除）；产物经 `scripts/rename_release.mjs` 输出中文命名到 release/ |
 
 **不采用**：Electron（体积过大）、WPF/WinUI（样式成本高）、PyQt（视觉不达要求）、React Router/Redux（依赖最小原则）。
 
@@ -38,9 +38,12 @@ Bridge        Tauri Commands（src-tauri/src/commands/）
  └─ api_server                axum 网关：Trae 池（routes/pool/payload/sse/auth/models_sync/usage/api_logger）
                               + WB 池（wb_route/wb_payload/wb_sse/wb_upstream/wb_responses/wb_images/wb_sticky/wb_toolexec/wb_catalog/wb_model_route）
                               + 三池调度（dispatch/unified_catalog/custom_models/custom_route/retry/api_keys/gateway_settings）
-Rust Tasks    tasks/（trae_checkin / wb_checkin / wb_common / wb_credits / ui_click / doubao_session / doubao_quota / doubao_chats）+ device_proxy/（MITM 代理模块）
+Rust Tasks    tasks/（trae_checkin / wb_checkin / wb_common / wb_credits / ui_click / doubao_session / doubao_quota / doubao_chats
+              / scheduler——应用内定时调度器，schtasks 的跨平台补充）+ device_proxy/（MITM 代理模块，hyper+rustls 自建）
 Switcher      tasks 外的独立域：switcher/（原 PS 切换桥——profile 档案表 / locate 六级 exe 发现 /
               proc 三级关闭 / machine 6 层重置 / copy+icube+chromium+authfile 三布局快照管线）
+Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 键值文档表 / 行文档实体表 / 列化流水表；
+              WAL + busy_timeout，首启迁移器把旧 JSON 导 backup/，v3.4.5 起替代 data 目录 JSON 读写）
 ```
 
 关键机制：
@@ -64,21 +67,22 @@ Switcher      tasks 外的独立域：switcher/（原 PS 切换桥——profile 
 
 统一存于 `%APPDATA%\AIWorkAssistant\`（旧 TraeWorkAssistant 目录由 `state.rs::migrate_legacy_dirs` 启动自动复制迁移）：
 
-| 文件 | 说明 |
+> **v3.4.5 起 data 目录 JSON 全量迁入 `data/aiwork.sqlite`**（WAL；kv 键值文档表 29 键 + 行文档实体表 12 + 列化流水表 8；首启迁移器导旧 JSON 入 `backup/`，`user_version` 幂等闸门）。下表 JSON 文件名为**逻辑名**（kv 键 = 文件名去 .json），运行期不产生 JSON 读写。
+
+| 逻辑名（库中位置） | 说明 |
 |---|---|
-| `conf/app_settings.json` | Settings 全字段（snake_case） |
+| `conf/app_settings.json` | Settings 全字段（snake_case，UI 配置保留文件形态） |
 | `conf/vault.stronghold` + `conf/vault_key.bin` | jwt/refresh_token 权威存储（按 uid 键）+ DPAPI 加密的 vault 主密码；JSON 落盘占位化，签到/网关在 Rust 内存中临时解密（无落盘子进程） |
-| `data/checkin_accounts.json` | 账号 + JWT（敏感字段 vault 化后为占位） |
-| `data/device_map.json` | user_id → 虚拟设备身份（`rand_digits(n, seed=user_id)` 稳定派生） |
-| `data/groups.json` | 分组 + membership |
-| `data/credits_history.json` / `credits_daily.json` / `remaining_credits.json` | 积分明细 / 每日三线快照 / 剩余积分缓存（均裁剪 90 天） |
-| `data/checkin_results.json` | 签到最终态按日落库（T8，保留 90 天） |
-| `data/account_cooldowns.json` | 签到错误冷却状态 |
-| `data/api_pool.json` | 账号池：enabled_uids + `strategy`(expire_first/credit_first/random) + `group_ids`（T10） |
-| `data/api_keys.json` / `api_usage.json` / `api_models.json` | 多 API Key+每日配额 / 用量按日统计 / 模型目录 |
-| `data/profiles/`、`profiles_trae/`、`profiles_doubao/` | 三应用登录态快照（current_account.txt + <uid> 槽位 + .bak 单代回滚） |
-| `data/doubao_accounts.json` / `doubao_captured_credentials.json` / `doubao_health_history.json` / `doubao_chats/` | 豆包账号池 / 抓包凭证回写 / 运维健康史 / 对话备份 |
-| `data/certs/` | 自签 CA |
+| `checkin_accounts`（accounts 表） | 账号 + JWT（敏感字段 vault 化后为占位） |
+| `device_map`（表） | user_id → 虚拟设备身份（`rand_digits(n, seed=user_id)` 稳定派生） |
+| `groups`（表） | 分组 + membership |
+| `credits_history` / `credits_daily` / `remaining_credits`（表） | 积分明细 / 每日三线快照 / 剩余积分缓存（裁剪 90~365 天） |
+| `checkin_results`（表） | 签到最终态按日落库（T8，保留 90 天） |
+| `account_cooldowns`（表） | 签到错误冷却状态 |
+| `api_pool`（kv） | 账号池：enabled_uids + `strategy`(expire_first/credit_first/random/weighted/p2c) + `group_ids` + 调度开关 |
+| `api_keys`（表）/ `api_usage`（表）/ `api_models`（kv） | 多 API Key+每日配额 / 用量按日统计 / 模型目录 |
+| `data/profiles*/`、`doubao_chats/`、`exports/`、`certs/` | 快照槽（current_account.txt + <uid> 槽位 + .bak 单代回滚）/ 对话备份 / 导出产物 / 自签 CA——保留文件形态不入库 |
+| `doubao_accounts`（表）/ `doubao_captured_credentials`（kv）/ `doubao_health_events`（表） | 豆包账号池 / 抓包凭证回写 / 运维健康史 |
 | `logs/` | proxy / checkin / switcher / api / proxy-requests / app.log |
 
 账号唯一主键 `UserID`（JWT payload `data.id`）。**红线**：账户中心 dc id与 Cloud-IDE id 两套 id 空间不通用，混用会产生重复账号。
@@ -140,9 +144,11 @@ Switcher      tasks 外的独立域：switcher/（原 PS 切换桥——profile 
 | 端点 | 说明 |
 |---|---|
 | `GET /health`（免鉴权）/ `GET /status` | 健康检查 / 账号池状态 |
-| `GET /v1/models` | 与 `data/api_models.json` 同源，官网同步后无需重启 |
+| `GET /v1/models` | 统一模型目录（Trae 官网同步 + WB 目录 + 自定义三源合并），官网同步后无需重启 |
 | `POST /v1/chat/completions` | OpenAI 协议（流式 + 非流式） |
 | `POST /v1/messages` | Anthropic Messages 协议（message_start → content_block_* → message_delta → message_stop） |
+| `POST /v1/responses` | Codex Responses API 投影（WB 上游模型） |
+| `POST /v1/images/generations` / `/v1/images/edits` | 生图双端点（WB 上游，模型需 `supports_image=true`） |
 | `POST /v1/completions` | legacy text completion（prompt 转 user message 复用链路） |
 | `/v1/embeddings` | 明确 501（上游无对应能力，不做假实现） |
 
@@ -181,7 +187,7 @@ Switcher      tasks 外的独立域：switcher/（原 PS 切换桥——profile 
 ### 6.3 请求体加密结论（重要）
 
 - TTNet/aha 传输层存在 `@aha-kit` 加密（`x-bridge-transport: aha` 下 body 加密，走 TTNet 隧道）；真实客户端对话为**直连 HTTPS POST + aha 加密体**。
-- `llm_utils_chat` 端点**明文 JSON 可行**（已验证），`create_agent_task`（Work 积分 209）为 ~123KB 富上下文加密体，**外部无法复刻**（真实身份复刻仍 4001）——Work 积分接入只能走多活会话编排，见 [product-optimization-backlog.md](product-optimization-backlog.md) W-01。
+- `llm_utils_chat` 端点**明文 JSON 可行**（已验证），`create_agent_task`（Work 积分 209）为 ~123KB 富上下文加密体，**外部无法复刻**（真实身份复刻仍 4001）——Work 积分接入只能走多活会话编排，见 [backlog.md](backlog.md) W-01。
 
 ### 6.4 SOLO SSE 自定义事件
 
@@ -298,7 +304,7 @@ node scripts/package_portable.mjs  # 便携版 zip
 
 ## 10. 附录 C：豆包对话协议情报（原 doubao-api-feasibility.md 精华归并）
 
-> E-01/E-02/E-03 的需求与实现路径见 [product-optimization-backlog.md](product-optimization-backlog.md)；本节保留协议层事实。
+> E-01/E-02/E-03 的需求与实现路径见 [backlog.md](backlog.md)；本节保留协议层事实。
 
 - **对话端点**：`POST www.doubao.com/samantha/chat/completion`（SSE）；三模式 `doubao` / `doubao-think` / `doubao-expert` → `completion_option` 参数组。
 - **风控形态**：验证码墙而非拒绝服务——错误码 `710012001`（sessionid 吊销）/ `710022004`（需验证码，人工过后恢复）/ `712010702`（Cookie/设备指纹缺失或编码错误）；HTTP 200 无数据流 = 连续失败退避信号。
