@@ -4,6 +4,8 @@
 //! 本文件：代理生命周期（ProxyServer）+ 主循环（accept → CONNECT 分流 / 明文转发）。
 
 pub mod ca;
+#[cfg(test)]
+mod e2e;
 pub mod handler;
 pub mod local_capture;
 pub mod logger;
@@ -58,8 +60,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 默认解密域名白名单（语义对齐 Charles SSL Proxying Locations：列表内域解密，
 /// 其余 CONNECT 透明直通；桌面端设置页 PROXY_DOMAINS 可覆盖）。
-/// 证书锁定的客户端域（豆包 ttnet 原生栈等）由自适应降级兜底：连续 3 次握手被
-/// 客户端中止即自动转透明直通（见 ProxyCtx::pin_state，重启代理复位）。
+/// 证书锁定的客户端域（豆包 ttnet 原生栈等）由自适应降级兜底：握手失败样本
+/// ≥ PIN_MIN_FAILS 且失败率 >75% 即自动转透明直通（见 ProxyCtx::pin_state，重启代理复位）。
 pub const DEFAULT_TARGETS: &[&str] = &[
     "trae.cn",
     "trae.com.cn",
@@ -125,6 +127,7 @@ impl ProxyServer {
             targets,
             auto_capture_jwt: cfg.auto_capture_jwt,
             data_dir: cfg.data_dir.clone(),
+            upstream: cfg.upstream.clone(),
             pin_state: Mutex::new(std::collections::HashMap::new()),
         });
 
@@ -198,20 +201,20 @@ async fn accept_loop(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let permits = Arc::new(Semaphore::new(MAX_CONNS));
-    // 明文转发双 Client（路由对齐 Python handle_plain）：
-    // - plain_client：非目标域名 http 请求经用户 VPN 上游（http 代理绝对形式 / SOCKS5 隧道，
-    //   失败回退直连），无上游配置时即直连
-    // - direct_client：目标域名 / https 明文请求一律直连（Trae 域国内可达，
-    //   Python 版上游仅服务非目标域名 http，不把 TRAE 流量绕行用户梯子）
+    // 明文转发与 MITM 转发共享同一路由策略（2026-09-15 重构，见 upstream.rs 模块注释）：
+    // 配置了上游代理（用户 VPN）时一律**上游优先**、失败回退直连——不开启本代理时
+    // 客户端流量本就走系统代理（用户 VPN），MITM 只是解密层，出口必须与其一致。
+    // 实测教训（proxy.log 22:21）：VPN 接管路由/DNS 的环境下本进程直连目标域
+    // 47 请求 0 响应（白屏根因），此前「目标域直连」策略在该环境下全线失效。
+    // 语义对齐 mitmproxy `--mode upstream:` / Charles 上游代理。
+    // 两个 Client 仅连接池隔离（明文/解密流量互不挤占 keep-alive 连接）。
     let plain_client: Client<UpstreamConnector, Full<Bytes>> =
         Client::builder(TokioExecutor::new()).build(UpstreamConnector::new(upstream.clone(), ctx.log.clone()));
-    let direct_client: Client<UpstreamConnector, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(UpstreamConnector::new(None, ctx.log.clone()));
     // MITM 解密后的上游转发 Client（进程级共享）：跨连接复用 hyper 连接池
     // （TCP/TLS keep-alive）。原实现在 serve_mitm 内每连接新建 Client，连接池
     // 无法跨连接复用——桌面客户端高频请求下每请求都重新建连，显著拖慢转发。
     let mitm_client: Client<UpstreamConnector, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(UpstreamConnector::new(None, ctx.log.clone()));
+        Client::builder(TokioExecutor::new()).build(UpstreamConnector::new(upstream.clone(), ctx.log.clone()));
     let mut conns: Vec<JoinHandle<()>> = Vec::new();
     // [overload] 日志节流锚点（Unix 秒）
     let mut last_overload_log: u64 = 0;
@@ -252,15 +255,11 @@ async fn accept_loop(
                     let task_ca = Arc::clone(&ca);
                     let task_up = upstream.clone();
                     let task_client = plain_client.clone();
-                    let task_direct = direct_client.clone();
                     let task_mitm = mitm_client.clone();
                     conns.push(tokio::spawn(async move {
                         let _guard = permit; // 释放即归还信号量
-                        handle_conn(
-                            stream, peer, task_ctx, task_ca, task_up, task_client, task_direct,
-                            task_mitm,
-                        )
-                        .await;
+                        handle_conn(stream, peer, task_ctx, task_ca, task_up, task_client, task_mitm)
+                            .await;
                     }));
                 }
                 Err(e) => {
@@ -290,7 +289,6 @@ async fn handle_conn(
     ca: Arc<CaAuthority>,
     upstream: Option<UpstreamProxy>,
     plain_client: Client<UpstreamConnector, Full<Bytes>>,
-    direct_client: Client<UpstreamConnector, Full<Bytes>>,
     mitm_client: Client<UpstreamConnector, Full<Bytes>>,
 ) {
     let head = match timeout(CONN_TIMEOUT, read_head(&mut stream)).await {
@@ -323,6 +321,7 @@ async fn handle_conn(
         if !ctx.host_in_targets(&host) || ctx.is_pinned(&host) {
             // 未配置解密的域名 / 已判定证书锁定的域：透明直通隧道（不解密不记请求日志）。
             // Charles「SSL Proxying Locations」/ mitmproxy「--ignore-hosts」同款语义。
+            // 隧道路由与其他路径一致：上游优先、失败回退直连（见 tunnel_raw 注释）。
             tunnel_raw(client, &host, port, &upstream, &ctx.log).await;
             return;
         }
@@ -369,7 +368,7 @@ async fn handle_conn(
         }
     } else {
         // 明文 HTTP 请求：全部转发（日志由 handle_plain 内部按目标域名控制）
-        handle_plain(stream, head, &plain_client, &direct_client, &ctx).await;
+        handle_plain(stream, head, &plain_client, &ctx).await;
     }
 }
 
@@ -392,8 +391,11 @@ async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> Result<Vec<u8>, String> {
     }
 }
 
-/// 非目标域名 CONNECT 的透明隧道（对齐 Python `tunnel_raw`）：
-/// 上游代理（用户 VPN）优先，失败回退直连；全程不解密，仅记隧道级日志。
+/// CONNECT 透明隧道（对齐 Python `tunnel_raw`）：不解密，仅记隧道级日志。
+/// 路由与其他路径一致（见 upstream.rs 模块注释）：上游代理（用户 VPN）优先，
+/// 失败回退直连——Python 版此路径只服务非目标域，本版还承接被降级为直通的
+/// 目标域，路由同样必须镜像客户端正常出口（2026-09-15 实测：直连在此环境
+/// 数据黑洞，上游 7890 是唯一活路）。
 /// client 为 [`PrefixedStream`]（分发阶段超读字节的回放见 handle_conn 注释）。
 async fn tunnel_raw<S>(
     mut client: S,
@@ -418,8 +420,9 @@ async fn tunnel_raw<S>(
         Some(r) => r,
         None => match connect_direct(host, port).await {
             Ok(s) => s,
-            Err(_) => {
-                // 上游不可达：明确告知客户端，避免浏览器无限等待
+            Err(e) => {
+                // 建连不可达：明确告知客户端，避免浏览器无限等待
+                log.log(&format!("  [raw-tunnel] 隧道建立失败 {host}:{port}: {e}"));
                 let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 return;
             }
@@ -434,14 +437,12 @@ async fn tunnel_raw<S>(
 }
 
 /// 明文 HTTP 转发（对齐 Python `handle_plain`）：
-/// 请求行为代理形式绝对 URL；仅「非目标域名 + http」经上游 VPN 转发（hyper 绝对形式），
-/// 目标域名 / https 明文请求一律直连（Python 版同款路由，不把 TRAE 流量绕行用户梯子）。
+/// 请求行为代理形式绝对 URL；路由与其他路径一致（上游优先、失败回退直连）。
 /// 仅目标域名记操作日志与抓包日志；单请求后关闭连接（对齐 Python 语义）。
 async fn handle_plain(
     mut stream: TcpStream,
     head: Vec<u8>,
     plain_client: &Client<UpstreamConnector, Full<Bytes>>,
-    direct_client: &Client<UpstreamConnector, Full<Bytes>>,
     ctx: &ProxyCtx,
 ) {
     // 分发阶段已读取的字节作为初始缓冲注入（可能含 body 前缀）
@@ -472,9 +473,9 @@ async fn handle_plain(
     if is_target {
         ctx.log.log(&format!("  [plain] {} {scheme}://{host}:{port}{path}", req.method));
     }
-    // 上游路由对齐 Python：仅「非目标域名 + http」经用户 VPN（失败回退直连）；
-    // 目标域名 / https 明文请求直连
-    let client = if !is_target && scheme == "http" { plain_client } else { direct_client };
+    // 上游路由（2026-09-15 重构）：与其他路径一致，上游优先、失败回退直连
+    //（连接器内置；连接器按 scheme 自动选择绝对形式/CONNECT 隧道，见 upstream.rs）
+    let client = plain_client;
 
     // 组装上游请求：过滤跳过头（host/content-length 由 hyper 依 URI/body 重写）
     let mut builder = Request::builder().method(req.method.as_str()).uri(uri.clone());
@@ -494,7 +495,8 @@ async fn handle_plain(
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             if is_target {
-                ctx.log.log(&format!("  [plain] 错误: {e} (host={host}, path={path})"));
+                ctx.log
+                    .log(&format!("  [plain] 错误: {} (host={host}, path={path})", handler::error_chain(&e)));
             }
             let _ = handler::send_response(&mut stream, 502, "Bad Gateway", &[], b"Bad Gateway").await;
             return;
@@ -748,6 +750,14 @@ fn bind_exclusive(port: u16) -> Result<std::net::TcpListener, String> {
 
 async fn bind_listener(port: u16) -> Result<TcpListener, String> {
     let std_listener = bind_exclusive(port)?;
+    // tokio from_std 契约要求非阻塞模式；Windows 上 tokio 无法检测阻塞 socket 而
+    // 静默放行（util/blocking_check.rs 对非 unix 直接 Ok）。阻塞式 listener 会让
+    // mio 的 accept/read 在无数据时直接阻塞 worker 线程（accepted socket 继承本
+    // 模式），空闲预连接打满运行时后 IO driver 停摆、代理整体冻结——e2e 测试挂起
+    // 根因，生产环境豆包 preconnect 空闲连接同样会让 worker 逐个阻塞。
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("设置监听器非阻塞模式失败: {e}"))?;
     TcpListener::from_std(std_listener).map_err(|e| format!("监听器初始化失败: {e}"))
 }
 
@@ -769,6 +779,7 @@ mod tests {
             targets: DEFAULT_TARGETS.iter().map(|s| s.to_string()).collect(),
             auto_capture_jwt: true,
             data_dir: dir.clone(),
+            upstream: None,
             pin_state: Mutex::new(std::collections::HashMap::new()),
         }
     }

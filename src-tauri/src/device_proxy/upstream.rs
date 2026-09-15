@@ -1,12 +1,16 @@
 //! 上游连接（device_proxy.py 迁移，P4-4）。
 //!
-//! 对齐 Python 版路由策略：
-//! - 目标域名（MITM 解密/WS）：**直连**目标（Trae 域国内可达，无需 VPN）
-//! - 非目标流量（透明隧道/明文转发）：经用户 VPN 上游（HTTP CONNECT / SOCKS5），
-//!   失败回退直连 —— 这是「开代理后外网打不开」的根因修复
+//! 路由策略（2026-09-15 重构：上游优先，镜像客户端无代理时的正常路径）：
+//! - 配置了上游代理（用户 VPN）时，**所有转发流量一律先经上游**（CONNECT 隧道 /
+//!   SOCKS5 / http 绝对形式），失败回退直连 —— 不开启本代理时客户端流量本就
+//!   走系统代理（用户 VPN），MITM 只是解密层，出口路径必须与其一致。
+//!   实测教训（proxy.log 22:21）：VPN 客户端接管路由/DNS 的环境下本进程直连
+//!   目标域 47 个请求 0 响应（TCP 可连但数据黑洞），而经 127.0.0.1:7890 全程正常；
+//!   语义对齐 mitmproxy `--mode upstream:` / Charles 上游代理。
+//! - 未配置上游：全部直连（无 VPN 用户，行为不变）。
 //!
 //! `UpstreamConnector` 实现 `tower::Service<Uri>`（hyper legacy Client 的连接器接口）：
-//! - https 目标：TCP（直连或经隧道）→ rustls（webpki roots，ALPN 仅 http/1.1，对齐 Python 无 h2）
+//! - https 目标：TCP（经隧道或直连）→ rustls（webpki roots，ALPN 仅 http/1.1，对齐 Python 无 h2）
 //! - http 目标经 HTTP 代理：直连代理并标记 is_proxied → hyper 自动改发绝对 URL 形式（对齐 Python）
 //! - http 目标经 SOCKS5/直连：普通连接，origin-form
 
@@ -227,22 +231,47 @@ pub async fn connect_direct(host: &str, port: u16) -> Result<TcpStream, String> 
         .map_err(|e| format!("连接 {host}:{port} 失败: {e}"))
 }
 
-/// 直连目标并完成 TLS 握手（WS 升级专用；webpki roots + ALPN http/1.1，
-/// 与 MITM 转发路径同款客户端配置）
+/// 在既有 TCP 流上完成 TLS 握手（webpki roots + ALPN http/1.1，与 MITM 转发路径
+/// 同款客户端配置），限时 30s（对齐 Python wrap_socket 共享 socket timeout）
+async fn tls_wrap(
+    host: &str,
+    port: u16,
+    tcp: TcpStream,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| format!("目标主机名非法 {host}: {e}"))?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(build_client_tls_config()));
+    timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp))
+        .await
+        .map_err(|_| format!("与 {host}:{port} 的 TLS 握手超时"))?
+        .map_err(|e| format!("与 {host}:{port} 的 TLS 握手失败: {e}"))
+}
+
+/// 直连目标并完成 TLS 握手（无上游配置时的 WS 升级路径）
 pub async fn connect_tls_direct(
     host: &str,
     port: u16,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
     let tcp = connect_direct(host, port).await?;
-    let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|e| format!("目标主机名非法 {host}: {e}"))?;
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(build_client_tls_config()));
-    // TLS 握手限时（差异修复：对齐 Python wrap_socket 共享 30s socket timeout；
-    // 原裸 connect 无超时，上游 TCP 通但 TLS 僵死时 WS 任务永久挂起）
-    timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp))
-        .await
-        .map_err(|_| format!("与 {host}:{port} 的 TLS 握手超时"))?
-        .map_err(|e| format!("与 {host}:{port} 的 TLS 握手失败: {e}"))
+    tls_wrap(host, port, tcp).await
+}
+
+/// 上游优先建立 TLS 连接（WS 升级路径，路由对齐 MITM 转发：见模块注释）。
+/// 有上游 → CONNECT/SOCKS5 隧道后包 TLS，失败回退直连；无上游 → 直连。
+pub async fn connect_tls_upstream_first(
+    host: &str,
+    port: u16,
+    upstream: Option<&UpstreamProxy>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    match upstream {
+        None => connect_tls_direct(host, port).await,
+        Some(up) => match connect_via_upstream(host, port, up).await {
+            Ok(tcp) => tls_wrap(host, port, tcp).await,
+            // 上游不可达回退直连（对齐其余路径回退语义）；直连也失败时报直连
+            // 错误（此时网络本身不可达，直连错误信息对用户更有诊断价值）
+            Err(_) => connect_tls_direct(host, port).await,
+        },
+    }
 }
 
 // ---------------- hyper legacy Client 连接器 ----------------
@@ -339,8 +368,10 @@ impl std::fmt::Debug for UpstreamStream {
 }
 
 /// hyper legacy Client 连接器：按 dst 的 scheme 决定是否包 TLS（webpki roots，ALPN 仅 http/1.1）。
-/// - https：直连或经上游隧道（socks/http CONNECT）后包 TLS
-/// - http：无上游/socks5 上游 -> 直连目标；http 上游 -> 直连代理并标记 is_proxied
+/// 路由（见模块注释）：有上游 → 经上游隧道/绝对形式，失败回退直连；无上游 → 直连。
+/// - https：经上游 CONNECT/SOCKS5 隧道（或直连）后包 TLS
+/// - http：HTTP 上游 -> 直连代理并标记 is_proxied（hyper 发绝对 URL）；
+///   SOCKS5 上游/无上游 -> 直连目标普通连接
 #[derive(Clone)]
 pub struct UpstreamConnector {
     upstream: Option<UpstreamProxy>,
@@ -350,11 +381,7 @@ pub struct UpstreamConnector {
 
 impl UpstreamConnector {
     pub fn new(upstream: Option<UpstreamProxy>, log: crate::device_proxy::logger::ProxyLog) -> Self {
-        Self {
-            upstream,
-            tls: Arc::new(build_client_tls_config()),
-            log,
-        }
+        Self { upstream, tls: Arc::new(build_client_tls_config()), log }
     }
 }
 
@@ -430,9 +457,11 @@ impl UpstreamConnector {
         let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.clone())
             .map_err(|e| format!("目标主机名非法 {host}: {e}"))?;
         let connector = tokio_rustls::TlsConnector::from(self.tls);
-        let tls = connector
-            .connect(server_name, tcp)
+        // TLS 握手限时（对齐 connect_tls_direct / Python socket timeout；裸 connect
+        // 无超时时 TCP 通但 TLS 僵死会占住请求直至上层 300s 流式超时）
+        let tls = timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp))
             .await
+            .map_err(|_| format!("与 {host}:{port} 的 TLS 握手超时"))?
             .map_err(|e| format!("与 {host}:{port} 的 TLS 握手失败: {e}"))?;
         Ok(UpstreamStream::Tls(TokioIo::new(tls)))
     }

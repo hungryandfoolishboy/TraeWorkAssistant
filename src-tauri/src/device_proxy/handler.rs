@@ -91,6 +91,9 @@ pub struct ProxyCtx {
     pub auto_capture_jwt: bool,
     /// 数据根目录（SQLite 化 P3：accounts/cooldowns/凭证快照均经 store 读写）
     pub data_dir: PathBuf,
+    /// 上游代理（用户 VPN）：配置后所有转发流量（MITM/WS/隧道）一律先经上游，
+    /// 失败回退直连 —— 镜像客户端无本代理时的正常出口路径（见 upstream.rs 模块注释）
+    pub upstream: Option<crate::device_proxy::upstream::UpstreamProxy>,
     /// 自适应证书锁定降级：host → (握手成功数, 握手被中止数, 已判定锁定)。
     /// 失败率判定（非连续计数）：投机性预连接风暴（客户端并发开连接再裁撤，
     /// 握手 RST）会造成「连续 3 次失败」的假阳性，把正常域误降级为直通（实测
@@ -727,6 +730,22 @@ fn try_capture_doubao_credentials(ctx: &ProxyCtx, host: &str, req_headers: &[(St
 
 // ---------------- 上游转发 ----------------
 
+/// 提取 hyper 错误的完整 source 链（诊断修复）：legacy Client 的 Display 只有
+/// "client error (Connect)" 一层，根因（DNS 失败/连接超时/拒绝）藏在 source 链里，
+/// 不展开时 proxy.log 无法定位白屏类问题（实测 47~97s 停滞只见 Connect 字样）
+pub(crate) fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut msgs = vec![e.to_string()];
+    let mut src = e.source();
+    while let Some(s) = src {
+        let m = s.to_string();
+        if msgs.last() != Some(&m) {
+            msgs.push(m);
+        }
+        src = s.source();
+    }
+    msgs.join(" <- ")
+}
+
 /// 一次转发结果：false 表示上游要求关闭连接或出错（对齐 Python keep-alive 语义）
 async fn forward_upstream<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut tokio_rustls::server::TlsStream<S>,
@@ -782,7 +801,7 @@ async fn forward_upstream<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             ctx.log
-                .log(&format!("  [forward] 错误: {e} (host={host}, path={})", req.path));
+                .log(&format!("  [forward] 错误: {} (host={host}, path={})", error_chain(&e), req.path));
             let _ = send_response(io, 502, "Bad Gateway", &[], b"Bad Gateway").await;
             return false;
         }
@@ -980,7 +999,19 @@ pub async fn serve_mitm<S: AsyncRead + AsyncWrite + Unpin>(
                 break;
             }
             Ok(Err(e)) => {
-                ctx.log.log(&format!("  [MITM] 读取 TLS 请求错误: {e}"));
+                // 客户端正常断开 keep-alive 的常见形式（高频，非错误）：直接 FIN
+                // 不发 TLS close_notify（rustls 报 unexpected-eof）、RST(10054)、
+                // 握手中止(10053)——Chromium/cronet 裁撤连接池为此常态，对齐
+                // Python 版与 mitmproxy：静默结束连接，不记错误日志防刷屏
+                //（实测 06:17 会话 250 条 MITM 连接中 ~180 条以此方式收尾）
+                let client_closed = e.contains("unexpected-eof")
+                    || e.contains("close_notify")
+                    || e.contains("10053")
+                    || e.contains("10054")
+                    || e.to_lowercase().contains("connection reset");
+                if !client_closed {
+                    ctx.log.log(&format!("  [MITM] 读取 TLS 请求错误: {e}"));
+                }
                 break;
             }
             Ok(Ok(Some(r))) => r,
@@ -1170,6 +1201,7 @@ mod tests {
             targets: vec![],
             auto_capture_jwt: true,
             data_dir: dir.clone(),
+            upstream: None,
             pin_state: Mutex::new(HashMap::new()),
         }
     }

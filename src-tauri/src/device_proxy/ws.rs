@@ -295,9 +295,16 @@ pub async fn forward_websocket<S: AsyncRead + AsyncWrite + Unpin>(
     req: &RawRequest,
 ) {
     let ws_tag = format!("[WebSocket] {host}:{port}{}", req.path);
-    ctx.log.log(&format!("  {ws_tag} 正在连接上游 {host}:{port}..."));
+    // 路由对齐 MITM 转发（见 upstream.rs 模块注释）：上游优先、失败回退直连
+    let via_up = ctx.upstream.is_some();
+    ctx.log.log(&format!(
+        "  {ws_tag} 正在连接上游 {host}:{port}（{}）...",
+        if via_up { "经上游代理" } else { "直连" }
+    ));
     let mut upstream: ClientTlsStream<TcpStream> =
-        match crate::device_proxy::upstream::connect_tls_direct(host, port).await {
+        match crate::device_proxy::upstream::connect_tls_upstream_first(host, port, ctx.upstream.as_ref())
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 ctx.log.log(&format!("  {ws_tag} 连接上游失败: {e}"));
@@ -548,14 +555,17 @@ mod tests {
         );
         let mut f = frame_logger("client_to_up", "h.com".into(), "/ws".into(), log);
         f(0x1, br#"{"token":"secret-jwt-value"}"#, None);
-        // 日志经专用落盘线程异步写盘（非阻塞投递）：轮询等待内容落盘后再断言
+        // 日志经专用落盘线程异步写盘（非阻塞投递）：轮询等待掩码行落盘后再断言。
+        // 预算须留足：全量并发跑测试时 drainer 线程调度可被推迟到秒级（实测 1s
+        // 预算在 400+ 并发用例下稳定超时）；且必须等到本行的掩码出现而非任意
+        // 非空内容，否则空文件提前退出会跳过脱敏断言形成假阴性
         let path = dir.join("proxy.log");
         let content = {
             let mut s = String::new();
-            for _ in 0..50 {
+            for _ in 0..500 {
                 if let Ok(read) = std::fs::read_to_string(&path) {
                     s = read;
-                    if !s.is_empty() {
+                    if s.contains("***") {
                         break;
                     }
                 }
@@ -564,7 +574,7 @@ mod tests {
             s
         };
         assert!(!content.contains("secret-jwt-value"), "WS 帧凭证必须脱敏:\n{content}");
-        assert!(content.contains("***"));
+        assert!(content.contains("***"), "掩码行应在轮询预算内落盘:\n{content}");
     }
 
     #[test]

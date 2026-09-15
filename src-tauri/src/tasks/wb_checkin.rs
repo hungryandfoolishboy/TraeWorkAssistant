@@ -141,6 +141,71 @@ fn scalar_of(v: &Value) -> Option<f64> {
     num_or_none(Some(v))
 }
 
+/// 递归深挖奖励数额：键名含奖励语义子串的数值字段（宽容解析，对齐 doubao_quota
+/// deep dig 模式）。刻意不含 balance/total/remaining 语义——避免把账户余额误当本次奖励。
+fn deep_reward_dig(v: &Value, depth: usize) -> Option<f64> {
+    if depth > 8 {
+        return None;
+    }
+    match v {
+        Value::Object(m) => {
+            for (k, val) in m {
+                let kl = k.to_ascii_lowercase();
+                let looks_reward = ["reward", "bonus", "earned", "add_integral", "add_credits", "addcredit", "integral_add", "gain", "obtain", "prize"]
+                    .iter()
+                    .any(|s| kl.contains(s));
+                if looks_reward {
+                    if let Some(n) = num_or_none(Some(val)) {
+                        return Some(n);
+                    }
+                }
+            }
+            for val in m.values() {
+                if val.is_object() || val.is_array() {
+                    if let Some(n) = deep_reward_dig(val, depth + 1) {
+                        return Some(n);
+                    }
+                }
+            }
+            None
+        }
+        Value::Array(a) => a.iter().find_map(|x| deep_reward_dig(x, depth + 1)),
+        _ => None,
+    }
+}
+
+/// 递归找余额数值字段：键名含 remaining/balance/capacity（大小写不敏感，排除 total）。
+/// 用于 billing summary 结构未知时的余额差值兜底（pre/post 同结构，首命中稳定）。
+fn deep_balance_dig(v: &Value, depth: usize) -> Option<f64> {
+    if depth > 8 {
+        return None;
+    }
+    match v {
+        Value::Object(m) => {
+            for (k, val) in m {
+                let kl = k.to_ascii_lowercase();
+                if (kl.contains("remaining") || kl.contains("balance") || kl.contains("capacity"))
+                    && !kl.contains("total")
+                {
+                    if let Some(n) = num_or_none(Some(val)) {
+                        return Some(n);
+                    }
+                }
+            }
+            for val in m.values() {
+                if val.is_object() || val.is_array() {
+                    if let Some(n) = deep_balance_dig(val, depth + 1) {
+                        return Some(n);
+                    }
+                }
+            }
+            None
+        }
+        Value::Array(a) => a.iter().find_map(|x| deep_balance_dig(x, depth + 1)),
+        _ => None,
+    }
+}
+
 /// 奖励数额一律以接口返回为准，不硬编码（F-17 红线）；无奖励回退 raw 摘要
 fn reward_text(body: Option<&Value>, raw: &str) -> String {
     let r = body.and_then(|b| fs_utils::dig(b, &["reward", "credits", "points", "amount", "value"]));
@@ -233,7 +298,8 @@ fn checkin_do(
         return ("fail".into(), format!("网络不可达: {head}"), None);
     }
     if (200..=201).contains(&status) || code.is_some_and(|c| c == 0 || c == 200) {
-        // 奖励数额以接口返回为准，不硬编码（F-17）；兜底走签到前后余额差值（process_account）
+        // 奖励数额以接口返回为准，不硬编码（F-17）；精确键未命中走递归深挖，
+        // 仍无则兜底走签到前后余额差值（process_account）
         let reward = body.as_ref().and_then(|b| {
             num_or_none(fs_utils::dig(
                 b,
@@ -242,6 +308,7 @@ fn checkin_do(
                     "reward_amount", "add_integral", "addCredits", "earned",
                 ],
             ))
+            .or_else(|| deep_reward_dig(b, 0))
         });
         return ("success".into(), "签到成功".into(), reward);
     }
@@ -288,6 +355,20 @@ fn fetch_balance(agent: &ureq::Agent, headers: &[(String, String)], base: &str) 
         &b,
         &["RemainingCapacity", "remaining", "TotalRemaining", "Balance", "balance"],
     ))
+    .or_else(|| deep_balance_dig(&b, 0))
+}
+
+/// WB credits 域余额（WorkBuddy 积分账本）：billing meter 是通用积分账本，
+/// 签到奖励入 WB 积分——billing 差值恒 0 时用 credits 差值兜底
+fn fetch_wb_credits_balance(state: &AppState, aid: &str) -> Option<f64> {
+    let parsed = crate::tasks::wb_credits::fetch_credits(state, Some(aid), true).ok()?;
+    parsed
+        .get("accounts")?
+        .as_array()?
+        .iter()
+        .find(|a| a.get("user_id").and_then(Value::as_str) == Some(aid))
+        .and_then(|a| a.get("balance"))
+        .and_then(Value::as_f64)
 }
 
 // ── 账号池回写 / 结果存储 ──────────────────────────────────────────────────
@@ -380,8 +461,14 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     if ok && checked == Some(true) {
         return json!({ "user_id": aid, "name": base_ev["name"], "status": "already", "message": "今日已签到" });
     }
-    // 签到前余额（获得积分差值兜底数据源；查询失败不阻塞签到）
+    // 签到前余额（获得积分差值兜底数据源；两级：①billing meter 通用积分
+    // ②WB credits 域 WorkBuddy 积分——查询失败不阻塞签到）
     let pre_balance = fetch_balance(agent, &headers, base);
+    let pre_wb_credits = if pre_balance.is_none() {
+        fetch_wb_credits_balance(state, &aid)
+    } else {
+        None
+    };
     let (mut kind, mut message, mut reward) = checkin_do(agent, &headers, &urls);
     if kind == "auth" {
         // 401：刷新一次仅重试失败分支（禁止二次刷新，F-09）
@@ -403,7 +490,9 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
         }
     }
     // 获得积分兜底（F-17）：接口未返回奖励数额时用签到前后余额差值；
-    // 仅差值>0 才采信（防并发扣减/查询时点差造成负值误报）
+    // 仅差值>0 才采信（防并发扣减/查询时点差造成负值误报）。
+    // 两级数据源：①billing meter（通用积分）②WB credits（WorkBuddy 积分——
+    // 签到奖励入 WB 积分账本，billing 差值恒 0 时用 credits 差值）
     if kind == "success" && reward.is_none() {
         if let Some(pre) = pre_balance {
             if let Some(post) = fetch_balance(agent, &headers, base) {
@@ -411,6 +500,21 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                     reward = Some(((post - pre) * 100.0).round() / 100.0);
                 }
             }
+        }
+    }
+    if kind == "success" && reward.is_none() {
+        if let Some(pre) = pre_wb_credits {
+            if let Some(post) = fetch_wb_credits_balance(state, &aid) {
+                if post > pre {
+                    reward = Some(((post - pre) * 100.0).round() / 100.0);
+                }
+            }
+        } else {
+            // 两级数据源均未取到签到前余额：记录诊断（便于校准奖励键/余额端点）
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("wb 签到成功但奖励数额未确定（接口无回显且余额差值数据源不可用）: {aid}"),
+            );
         }
     }
     let status_txt = match kind.as_str() {
