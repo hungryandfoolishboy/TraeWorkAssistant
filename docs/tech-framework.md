@@ -187,7 +187,7 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 ### 6.3 请求体加密结论（重要）
 
 - TTNet/aha 传输层存在 `@aha-kit` 加密（`x-bridge-transport: aha` 下 body 加密，走 TTNet 隧道）；真实客户端对话为**直连 HTTPS POST + aha 加密体**。
-- `llm_utils_chat` 端点**明文 JSON 可行**（已验证），`create_agent_task`（Work 积分 209）为 ~123KB 富上下文加密体，**外部无法复刻**（真实身份复刻仍 4001）——Work 积分接入只能走多活会话编排，见 [backlog.md](backlog.md) W-01。
+- `llm_utils_chat` 端点**明文 JSON 可行**（已验证），`create_agent_task`（Work 积分 209）为 ~123KB 富上下文加密体，**外部无法复刻**（真实身份复刻仍 4001）——Work 积分接入只能走多活会话编排，见 [backlog.md](backlog.md) W-01（**2026-09-15 已排除**：Trae 积分签到调整，前提与收益不成立，专题转技术留档）。
 
 ### 6.4 SOLO SSE 自定义事件
 
@@ -332,7 +332,7 @@ node scripts/package_portable.mjs  # 便携版 zip
 | Jackchaos2025/Doubao-Image-Proxy | 生图 SSE 解析 + message_node_info 兜底 + image_ori 优先级 |
 | laojichao/trae-local-api · laojichao/trae-api | tc 加密格式确认 + 四版本（cn/solo/sg/solo-sg）端点路由表；3 级回退 + 5 档竞速调度（F-72） |
 | BlueChonk/trae-credential-reverse-engineering | tc 解密（AES-128-CBC+SHA-512）+ ECDSA P-256 刷新签名 + 98 API 清单（F-70） |
-| xhrxgr/trae-work-cn-account-manager（Tauri 2 同栈） | `--user-data-dir` 多实例并行 + 插件共享实例隔离（F-67/W-01 底座） |
-| Ttungx/trae-solo-local-api · Sliverkiss/traework2api | `llm_utils_chat + function=solo_work_lite` 通道双实现交叉验证（W-01 可抄实现） |
+| xhrxgr/trae-work-cn-account-manager（Tauri 2 同栈） | `--user-data-dir` 多实例并行 + 插件共享实例隔离（F-67 底座；原 W-01 多活会话编排底座，W-01 已排除） |
+| Ttungx/trae-solo-local-api · Sliverkiss/traework2api | `llm_utils_chat + function=solo_work_lite` 通道双实现交叉验证（原 W-01 可抄实现；W-01 已排除，通道情报仍有留档价值） |
 | wicm84266964/Buddy2api · mtfly/trae-switch | 多通道网关统一接入方向验证；hosts 劫持 + 本地 443 反代（F-73） |
 | jlcodes99/cockpit-tools · dingminhua/dsh-connect-trae | TRAE 多实例思路（F-67）；DSH 桥装即用（F-38 主参照） |

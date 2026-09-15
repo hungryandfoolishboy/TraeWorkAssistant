@@ -4,6 +4,25 @@
 
 ---
 
+## [未发布] · F-68 / F-74 落地 + W-01 排除
+
+### 新增
+
+- **F-68 Trae 项目列表/最近打开跨账号保留**：新增 `src-tauri/src/switcher/vscdb.rs`——切换恢复快照**前**抽出 `state.vscdb` 的两个全局键（`solo-lite.local-project-folders` 项目列表、`history.recentlyOpenedPathsList` 最近打开），恢复**后**按条目合并回写（快照内已有以快照为准，仅补入切换前多出的条目；数组按 id、entries 按 folderUri 去重，快照项在前；非 JSON 结构保守不改）；写前 `state.vscdb.f68.bak` 单代备份，失败自动回滚。`switcher/mod.rs::restore_profile` 仅在 icube 布局（TraeWork/Trae）且恢复成功时调用，进度流输出「项目列表/最近打开已跨账号保留（项目列表 +N / 最近打开 +N）」，合并失败仅 warn 不阻断切换。**账号分区键（`solo-lite:content-map:<uid>` 等）零改动**（跨账号合并会产生服务端归属校验失败的"幽灵会话"）。
+- **F-74 Buddy 切换时自动迁移会话（B2 会话域扩展）**：`commands/workbuddy/chatdata.rs` 新增 `BuddyApp{WorkBuddy,CodeBuddy}`——数据目录参数化为 `~/.workbuddy` / `~/.codebuddy`，备份根分离为 `data/workbuddy_chats` / `data/codebuddy_chats`（WorkBuddy 沿用原名，存量备份零迁移）；`chatdata_backup/restore/info/copy` 四命令新增可选 `app` 参数（空/未知回落 WorkBuddy＝旧行为）；核心逻辑抽出为与 Tauri 无关的 `backup_chats`/`restore_chats`/`copy_chats` 纯函数；前端账号管理页新增「WB 会话 / CB 会话」会话域切换（切换即按域重取「已备份」徽标）。
+- **F-74 Buddy 切换时自动迁移会话（B1 切换编排）**：新增设置项 `buddy_switch_migrate_chats`（**默认关**，设置页 Buddy 区「切换账号时自动迁移会话」卡片，勾选即存、失败原地回滚）。开启后 `switch_account` 的 WorkBuddy/CodeBuddy 分支会在桥的 **Stop→Restore→Start 之前**完成全部动作：① 判定当前账号（WorkBuddy 走共享 auth 文件反查，CodeBuddy 走桥 `current_account.txt` 标记优先——auth 文件会被 WorkBuddy 覆盖）→ 与目标相同或判定失败则跳过；② 备份当前账号三件套（失败仅告警并跳过迁移，**不阻断切换**）；③ `copy_chats(当前 → 目标)` 新 id 复制 + 云端映射注册。全程以 `switch-progress` 的 `stage=migrate` 行输出进度。
+
+### 变更
+
+- `run_in_background` 新增 `pre` 前置作业参数（其余调用点传 `None`，行为不变）；切换守卫 `expected_uid` 语义未改动。
+- `docs/backlog.md` v2.7：**W-01（Work 积分 209 接入 API 网关）标记 ❌ 已排除**——Trae 积分签到调整，前提与收益均不成立；条目与 §三 专题保留作技术留档，§四新增排除行、§五排序移除。F-68 / F-74 标记已完成。
+
+### 测试
+
+- cargo 单测 389 → **396**（新增 `switcher::vscdb` 7 条：TEXT/BLOB 两种存储读取、快照缺键整体补入、数组按 id 去重且快照项在前、`entries` 对象按 folderUri 去重、完全一致零写入且不产生备份文件、非 JSON 保守不改、文件缺失安全跳过；`chatdata::f74_app_tests` 2 条：应用域解析宽容回落、两域目录与备份根互不干扰）；vitest 26/26、`tsc --noEmit` 全绿。
+
+---
+
 ## [3.4.5] · feature/buddy 批次 5（生态吸收与网关增强，T5.2~T5.6/T5.8）
 
 ### 新增

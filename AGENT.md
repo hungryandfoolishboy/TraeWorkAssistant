@@ -85,6 +85,7 @@ ai-work-assistant/
 │           ├── proc.rs          # 三级关闭（WM_CLOSE→强杀→等待）+ 启动（可选 --proxy-server）
 │           ├── machine.rs       # 6 层设备标识重置 + MachineGuid
 │           ├── copy.rs          # 快照复制原语 + .bak 单代轮转
+│           ├── vscdb.rs         # F-68 state.vscdb 全局键合并（项目列表/最近打开跨账号保留）
 │           └── icube / chromium / authfile.rs  # 三布局快照管线
 ```
 
@@ -175,7 +176,7 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/wb_credits.rs`：积分三件套 + 旧接口回退 + 容量字段链解析 + ≥10min 缓存；成功回写账号池余额缓存 |
 | WorkBuddy | `workbuddy_settings_get / workbuddy_settings_set(patch)` | data/workbuddy_settings.json：auto_checkin（启动补签）/ keepalive_days / lazy_refresh_hours / growth_* 开关 |
 | WorkBuddy | `workbuddy_cli_status / _bridge_set(userId) / _rotate_run / _rotate_logs(limit?)` | CLI 切号桥（F-06/F-59，批次3）：桥接状态（含 environment_override 警告）/ 写 `~/.codebuddy/settings.json` env 直桥 / 手动触发五重防护轮换 / 轮换日志（cap 50）；后台轮换线程 `start_cli_rotate_thread()` 按 settings.cli_* 配置独立运行（`workbuddy_cli.rs` 决策纯函数 `decide_target` 13 单测） |
-| WorkBuddy | `workbuddy_chatdata_backup/restore/info(userId)` / `_copy(source,target)` | 会话三件套（F-44/F-45，批次3）：正文 projects/ + workbuddy.db + edge-sync-mapping-v2.db → `data/workbuddy_chats/<uid>/`（restore 前 .bak 单代保护 + 完整性校验回滚）；copy = jsonl 逐行 sessionId 换新 UUID（pseudo_uuid_v4 纯函数）+ sessions 整行克隆 + edge 映射 convmsg 替换（`.pre-copy.bak` 预备份） |
+| WorkBuddy | `workbuddy_chatdata_backup/restore/info(userId, app?)` / `_copy(source,target,app?)` | 会话三件套（F-44/F-45，批次3）：正文 projects/ + workbuddy.db + edge-sync-mapping-v2.db → `data/<app>_chats/<uid>/`（restore 前 .bak 单代保护 + 完整性校验回滚）；copy = jsonl 逐行 sessionId 换新 UUID（pseudo_uuid_v4 纯函数）+ sessions 整行克隆 + edge 映射 convmsg 替换（`.pre-copy.bak` 预备份）。**F-74**：`app` = `"WorkBuddy"`（默认）/ `"CodeBuddy"`——数据目录 `~/.workbuddy` / `~/.codebuddy` 与备份根 `data/workbuddy_chats` / `data/codebuddy_chats` 双域隔离；空/未知回落 WorkBuddy（旧行为） |
 | WorkBuddy | `workbuddy_accounts_export(includeCredentials?) / _import(payload)` | 账号库导入导出（F-46 扩展，批次3）：kind 标记 `aiwork-workbuddy-pool`、按 id 去重、含凭证导出时回写 token store；凭证是否随行由用户勾选 |
 | WorkBuddy | `workbuddy_oauth_login()` | OAuth 扫码登录（F-50，批次3）：`POST /v2/plugin/auth/state?platform=CLI` → 系统浏览器打开 authUrl → 轮询 `GET /v2/plugin/auth/token?state=`（≤300s/3s）→ `GET /v2/plugin/login/account?state=` 取 uid/nickname → 自动入池 + 凭证回写 token store；每流程独立 cookie jar（Set-Cookie 手工捕获，零新依赖）；事件 wb-oauth-progress / wb-oauth-done |
 | WorkBuddy | `workbuddy_env_reset_items()` / `_env_reset(items, keycloakLogout)` | 环境重置（F-14，批次3）：16 项认证残留清理清单（对齐 oss-research 17 物理位置，勾选预览 + 存在性标注）+ Keycloak SSO 注销（JWT iss → 浏览器 logout，先于清理执行）；执行前自动关闭 WorkBuddy，单项失败不中断 |
@@ -251,6 +252,7 @@ ai-work-assistant/
 │   │                             #   doubao_health_events / wb_credits_history(365天) / usage_history_*(365天) / sticky_bindings
 │   ├── backup/                   # 首启迁移时移入的旧 JSON（含 migration_manifest.json / corrupt/）
 │   ├── workbuddy_chats/          # WorkBuddy 会话三件套备份（<uid>/projects/ + 双 db + chat_backup_meta.json）
+│   ├── codebuddy_chats/          # CodeBuddy 会话三件套备份（F-74，同上结构，源 ~/.codebuddy）
 │   ├── doubao_chats/             # 豆包对话数据备份（<uid>/，按 profile 分层）
 │   ├── exports/                  # 导出产物（doubao_chats_<uid>_<ts>.md/.json 等）
 │   ├── certs/                    # 自签 CA（ca.cer / ca.crt / ca.key）
@@ -281,6 +283,8 @@ ai-work-assistant/
 - **单代回滚保护（chromium 布局）**：`Backup-ChromiumProfile` 覆盖已有槽位前把旧快照整体 `Move-Item` 到 `<slot>.bak`（旧 .bak 淘汰）；`Restore-ChromiumProfile` 主槽缺失时回退用 .bak，Switch 预检查同样放行 .bak。背景：Switch 的"备份当前到来源槽"依赖 current_account.txt 与客户端实际登录一致，不一致时会把错误状态反复刷进该槽且不可恢复（实测把 B 快照覆盖成混乱状态）。`Copy-SnapshotItem` 文件分支先删旧目标再拷贝——文件被锁拷贝失败时不会留下旧文件冒充成功；`Copy-SnapshotItem`/`Test-SnapshotIntegrity` 的参数为最终路径（`-Path`），由调用方解析主槽或 .bak。豆包优雅关闭等待 `GracefulWaitSecs=8`（chromium 落盘慢，3 秒强杀会导致文件锁/未落盘）。
 - **防误覆盖守卫（ExpectedCurrentUid，chromium 布局）**：桌面端 Switch 前用 `detect_guard_uid_strict`（Local Storage/抓包新鲜度链检测 uid + **Live Cookies 登录会话验证**）取当前登录，经 `-ExpectedCurrentUid` 传给桥；桥仅在它与 current_account.txt **一致**时才把"当前态"回写进来源账号槽，否则只备份 last 槽并 warn（客户端手动重登/未登录/检测失败时保护账号快照不被错误状态覆盖）。`doubao_open_as_account` 与 `switch_account`（豆包路径）均接入。.bak/last 槽不在账号列表展示（`doubao_accounts_list` 过滤 `*.bak`）。
 - **登录会话 Cookie 检测（原 doubao_chats.py `--check-login-cookie`，Rust `tasks/doubao_chats.rs`）**：Chromium Cookies 库的 cookie **名**为明文（值加密不影响），sqlite 判定 `host_key like %doubao.com` 且 name∈(sessionid,sid_guard) 是否存在；客户端运行中先复制 Cookies* 到临时目录再读。返回 `{ok, doubao_cookies, has_session}`。用途①`save_current_login` 保存前预检 Live profile（无登录会话 → 拒绝保存，防止未登录态入槽）；用途②`doubao_open_as_account` 目标槽预检（快照无登录会话 → 拦截并提示重存）；用途③切换守卫严格版（uid 检测可能被快照 localStorage 残留骗过——实测未登录客户端仍报旧 uid 导致守卫误放行，Cookie 存在性无法伪造）。Rust 侧 `check_profile_login_cookie` 返回 None（读库失败）时一律不阻断，保持可用性。
+- **F-68 项目列表/最近打开跨账号保留（icube 布局）**：`state.vscdb` 的两个**全局单键**——`solo-lite.local-project-folders`（项目列表）与 `history.recentlyOpenedPathsList`（最近打开）——不随账号分区，恢复快照后只剩目标账号自己的那一份。`vscdb.rs` 在 `restore_profile`（仅 icube 布局、恢复成功后）先抽键、再按条目合并回写（快照内已有以快照为准，仅补入切换前多出项；数组按 id、entries 按 folderUri 去重，非 JSON 保守不改），写前 `state.vscdb.f68.bak` 单代备份 + 失败回滚，失败仅 warn。**账号分区键（`solo-lite:content-map:<uid>` 等）红线：零改动**。
+- **F-74 切换时自动迁移会话（WorkBuddy/CodeBuddy）**：`settings.buddy_switch_migrate_chats`（默认关）。开启后 `switch_account` 在 `run_action`（桥 Stop→Restore→Start）**之前**执行前置作业：当前账号判定（WorkBuddy = `pool_account_id_by_auth_uid` 优先 + 桥标记兜底；CodeBuddy = 桥 `profiles_codebuddy/current_account.txt` 标记优先，因共享 auth 文件会被 WorkBuddy 覆盖）→ 与目标相同或判定失败则跳过 → `backup_chats` 备份当前三件套（失败仅告警并跳过迁移、不阻断切换）→ `copy_chats(当前→目标)`；进度以 `switch-progress` 的 `stage=migrate` 行下发。
 - **authfile 布局（WorkBuddy，批次1）**：`Backup-AuthFileProfile` / `Restore-AuthFileProfile`——L1 必选 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`；L2 体验 `~\.workbuddy\storage\user-<uid>*` 目录；槽位元数据 `meta.json`（schemaVersion=1 / uid / savedAt）。单代回滚保护对齐豆包（覆盖前挪 `<slot>.bak`）；恢复前校验 auth 文件存在（缺失即中止）；Switch 后 `Confirm-AuthFileSwitch` 轮询 `~/.workbuddy/storage/skeleton/account-snapshot.json` uid（30s 超时，fail-open 仅 warn）。客户端历史快照 `workbuddy-desktop.<ts>.<pid>.<uuid>.info` 不入快照槽。
 
 ## 9. Rust 后台任务与代理约定
