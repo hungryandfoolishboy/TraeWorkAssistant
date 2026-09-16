@@ -144,26 +144,30 @@ pub struct WbCatalogFile {
 /// 缺失或为空时落盘内置表并返回内置表。
 /// SQLite 化（P2）：原 data/wb_model_catalog.json → kv 键（热路径单行读取替代解析缓存）。
 pub fn load(data_dir: &Path) -> Vec<WbModel> {
-    if let Some(file) = crate::store::db(data_dir).kv_get_raw("wb_model_catalog")
-        .and_then(|t| serde_json::from_str::<WbCatalogFile>(&t).ok())
-    {
-        if !file.models.is_empty() {
-            // 上游同步结果优先保留；否则旧版本内置表落盘的目录按新内置表重建
-            if file.fetched_at.is_some() || file.builtin_rev >= BUILTIN_REV {
-                return file.models;
+    // 热路径缓存（批次 A）：resolve_target / 目录聚合每请求读取（含缺失时内置表落盘副作用，
+    // 该副作用在缓存未命中时执行一次即被缓存结果覆盖）
+    super::config_cache::get_or_load(data_dir, "wb_model_catalog", || {
+        if let Some(file) = crate::store::db(data_dir).kv_get_raw("wb_model_catalog")
+            .and_then(|t| serde_json::from_str::<WbCatalogFile>(&t).ok())
+        {
+            if !file.models.is_empty() {
+                // 上游同步结果优先保留；否则旧版本内置表落盘的目录按新内置表重建
+                if file.fetched_at.is_some() || file.builtin_rev >= BUILTIN_REV {
+                    return file.models;
+                }
             }
         }
-    }
-    let builtin = builtin();
-    let _ = crate::store::db(data_dir).kv_set(
-        "wb_model_catalog",
-        &WbCatalogFile {
-            models: builtin.clone(),
-            fetched_at: None,
-            builtin_rev: BUILTIN_REV,
-        },
-    );
-    builtin
+        let builtin = builtin();
+        let _ = crate::store::db(data_dir).kv_set(
+            "wb_model_catalog",
+            &WbCatalogFile {
+                models: builtin.clone(),
+                fetched_at: None,
+                builtin_rev: BUILTIN_REV,
+            },
+        );
+        builtin
+    })
 }
 
 /// 大小写不敏感查找
@@ -286,12 +290,23 @@ pub fn fetch_and_replace(
     }
     let body: Value = match req.call() {
         Ok(r) => r.into_json().map_err(|e| format!("目录响应解析失败: {e}"))?,
-        Err(ureq::Error::Status(code, _)) => return Err(format!("目录接口 HTTP {code}")),
+        Err(ureq::Error::Status(code, r)) => {
+            // 诊断增强：附响应体摘要，区分 401/403 鉴权拒绝与端点变更
+            let text = r.into_string().unwrap_or_default();
+            let excerpt: String = text.chars().take(200).collect();
+            return Err(format!("目录接口 HTTP {code}: body 摘要: {excerpt}"));
+        }
         Err(e) => return Err(format!("目录请求失败: {e}")),
     };
     let models = parse_upstream_catalog(&body);
     if models.is_empty() {
-        return Err("上游目录解析产出 0 个模型（响应结构与预期不符），本地目录保持不变".into());
+        // 诊断增强：附响应体摘要（截 200 字符），定位 200 状态下「结构不符」的
+        // 真实形态（200 错误信封 / 多层嵌套 / 端点变更），避免只有 0 模型无从下手
+        let text = serde_json::to_string(&body).unwrap_or_else(|_| format!("{body:?}"));
+        let excerpt: String = text.chars().take(200).collect();
+        return Err(format!(
+            "上游目录解析产出 0 个模型（响应结构与预期不符，body 摘要: {excerpt}），本地目录保持不变"
+        ));
     }
     let count = models.len();
     crate::store::db(data_dir)
@@ -309,6 +324,8 @@ pub fn fetch_and_replace(
             },
         )
         .map_err(|e| format!("写目录失败: {e}"))?;
+    // 写路径显式失效（批次 A）：目录替换即时生效
+    super::config_cache::invalidate(data_dir, "wb_model_catalog");
     Ok(count)
 }
 
