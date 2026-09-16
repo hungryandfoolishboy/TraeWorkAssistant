@@ -23,7 +23,7 @@
 | F-68 ✅ | Trae 项目列表/最近打开跨账号保留 | Trae 生态 | **P1** | 1~2 天 | 已完成（2026-09-15） |
 | F-74 ✅ | Buddy 切换时自动迁移会话到目标账号 | Buddy 生态 | **P2** | 2~3 天（含实测） | 已完成（2026-09-15，含 B2 CodeBuddy 会话域扩展） |
 | F-78 ✅ | Trae OAuth 授权闭环补全（回环监听 + 代理豁免 + code 交换） | Trae 生态 | **P1** | 1~2 天（批次1）/ 3~4 天（全链路） | 已完成（2026-09-14） |
-| F-24-余 ✅ | 豆包会员额度端点抓包固化 | 豆包 | **P1** | 0.5~1 天（含抓包） | 已完成（2026-09-15：端点经代理实测固化 quota/summary，doubao.com 已入抓包域名；剩真机复验） |
+| F-24-余 ✅ | 豆包会员额度端点抓包固化 | 豆包 | **P1** | 0.5~1 天（含抓包） | 已完成（2026-09-16 真机复验通过：概述页额度卡出数，正式闭环） |
 | F-38 | Trae → DSH 引导（不自研） | Trae 生态 | **P1** | ≈0（装即用） | 待开发 |
 | E-01 | 豆包对话网关（OpenAI 兼容 doubao provider） | 豆包/网关 | **P2** | 8~12 天（含 E-02） | 待开发（方案 B 已论证，含探测实验前置） |
 | E-02 | 豆包指纹嗅探持久化 + a_bogus 纯算法生成器 | 豆包 | **P2** | 并入 E-01 批次 | 待开发（E-01 前置） |
@@ -135,7 +135,7 @@
 
 - **需求概述**：豆包会员额度（套餐/到期/赠送额度）展示框架已就绪，仅剩把会员额度 XHR 端点经 MITM 抓包固化。
 - **实现路径**：`device_proxy.py` 开启 + `open_doubao_app(proxyPort)` 注入 `--proxy-server` 拉起豆包客户端 → 会员页触发额度请求 → 抓包关键词 `membership|entitlement|quota|remaining|benefit` 定位端点 → 填入 `settings.doubao_quota_url` 即用。
-- **落地落点（2026-09-15 收尾确认）**：端点已固化 `POST https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/`（`models.rs::default_doubao_quota_url`，代理日志实测确认；`doubao_session.rs::DEFAULT_PROBE_URL` 同源复用）；`tasks/doubao_quota.rs::parse_quota` 精确解析 2026-09 实测结构（`current_subscription` 套餐/到期/赠送 + `window_limit_section` 时段/近7天窗口百分比与重置时间）+ 宽容 dig 回退，5 条单测含实测样本；`doubao.com` 已入 `DEFAULT_TARGETS` 与 settings 默认抓包域名（旧默认自动迁移）。剩余仅真机复验：概述页额度卡/单账号查询出数即为闭环。
+- **落地落点（2026-09-15 收尾确认）**：端点已固化 `POST https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/`（`models.rs::default_doubao_quota_url`，代理日志实测确认；`doubao_session.rs::DEFAULT_PROBE_URL` 同源复用）；`tasks/doubao_quota.rs::parse_quota` 精确解析 2026-09 实测结构（`current_subscription` 套餐/到期/赠送 + `window_limit_section` 时段/近7天窗口百分比与重置时间）+ 宽容 dig 回退，5 条单测含实测样本；`doubao.com` 已入 `DEFAULT_TARGETS` 与 settings 默认抓包域名（旧默认自动迁移）。真机复验通过（2026-09-16）：概述页额度卡出数（会员档/到期/时段与近7天窗口百分比+重置时间），正式闭环。
 - **参考开源项目**：无（端点为豆包私有；抓包链路复用本项目 MITM 基建）。
 
 ### F-38 Trae → DSH 引导（P1，不自研）

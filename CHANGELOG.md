@@ -4,6 +4,43 @@
 
 ---
 
+## [3.5.3] · 2026-09-16 · OAuth 登录真实协议闭环（F-78 批次 3）+ 代理稳定性与网关白名单修复
+
+> 范围：自 [3.5.2] 打包（commit 33a5a06）以来的全部变更。
+
+### 新增
+
+- **F-78 批次 3 OAuth 交换真实协议闭环（本版主线，9 个提交）**：以 Trae CN main.js 逆向实锤为最终裁决重写 AuthCode 交换链路——
+  - **抓包固化基建**：登录参数对齐真实客户端 `native_ide` 形态；回调解析 `authCodeInfo`（JSON 形态，兼容旧 `refreshToken`/`code` 直传）+ PKCE（RFC 7636，S256 code_challenge，verifier 随登录生成随交换提交）；新增 `AIWORK_OAUTH_DEBUG_PROXY` 环境变量抓包调试路由（设为本软件 MITM 端口时 ExchangeToken/GetUserInfo 经代理并信任本地 CA，默认不设＝直连不变）；交换请求/响应全量脱敏打印 app.log（排查期）。
+  - **设备凭证与签名（F-70 情报落地）**：新增 `icube_auth.rs`——icube tc 信封解密提取设备 P-256 私钥（签名私钥与 icube-dc 同源，device_id 首选 icube 凭证），ECDSA P-256 生成 DeviceProof（20405 实测要求 PascalCase 字段）。
+  - **协议对齐实锤**：AuthCode 交换**不发 DeviceProof**（其属 refreshToken 刷新场景），主变体改发 `DeviceInfo{DeviceID,MachineID,PlatformCode,DevicePublicKey(SPKI PEM),...}` + IDEVersion；端点修正 `${host}/trae/api/v3/oauth/ExchangeToken`（host 取授权页回调参数）；DeviceCredential 补提 telemetry.machineId 与安装目录 version；Timestamp 必须为 JSON int（字符串被 schema 拒绝）；实测确认 AuthCode 一次业务级失败即失效（探测链仅首个变体有效），无 proof 变体自动回落兜底。
+  - **探测链与诊断加固**：AuthCode/Code × ExchangeToken/GetToken 变体自动探测；响应解析对齐火山信封（ResponseMetadata.Error / Result）；token 提取全树深挖兜底 + 未知形态键路径诊断；4xx 响应体捕获 + x-device-id/x-app-id 设备头；调试代理 CA 缺失时降级直连不阻断登录闭环。
+- **auth_saved_at 凭证落盘时间字段**：RawAccount/AccountView 补字段（OAuth 登录/导入/手动添加/刷新成功四处写入），前端徽标展示，对齐 Buddy 侧先例；`access_token_expires_at` 经评估不落盘（jwt_exp_timestamp 已实时解析）。
+
+### 修复
+
+- **[P1] 豆包客户端白屏/超时/退出卡死（代理稳定性，对齐 Python thread-per-connection 阻塞隔离语义）**：根因为凭证捕获/JWT 写库（SQLite + vault DPAPI）同步阻塞 tokio worker → 整个代理冻结（白屏 / forward 30s 超时 / 15 在途）。修复：写库移 `spawn_blocking` + ProxyLog/RequestLogger 改专用落盘线程；并发上限 128→512 + overload 日志 5s 节流（启动风暴拒绝→客户端重试恶性循环）；共享上游 hyper Client（跨连接复用连接池）；移除 ALPN 广播（对齐 Python ssl 默认）；退出 RunEvent::Exit 清理后 2s 强制退出（WebView2/runtime 析构挂死兜底）。
+- **[P1] MITM 叶子证书独立 RSA 密钥**：原复用 CA 密钥被 ttnet 严格校验拒绝 → 每叶子证书独立密钥（对齐 Python 每证书独立密钥）；握手连续 3 次中止自适应锁定降级透明直通；OAuth 证书兼容。
+- **[P1] 自适应锁定降级改失败率判定**：豆包预连接风暴（大量并发握手在途）被误判「锁定」降级 → Cookie 捕获停摆，改按失败率判定。
+- **[P1] WB 池入池白名单独立化（Buddy 源恒 503 no_healthy_account 根因）**：wb_pool 误用 Trae 共享白名单（enabled_uids）过滤 wb- 账号且 UI 只能勾选 Trae 账号 → WB 池恒空，「API 使用帮助」运行时派生 buddy_ok=false 全部「未启用」。新增 `wb_enabled_uids` 独立白名单（空 = 全部含凭证账号自动入池 fail-open）；旧数据混存 wb- 条目保存时自动迁移归位；修复前端白名单值域错位（勾选/保存误用 a.uid 真实 uuid 而非 a.id 池键，显式名单永不匹配堵死 fail-open）与 inflight 显示同域错位；Buddy 页账号池卡升级为可勾选白名单（全选/清空/已选计数）。
+- **[P1] 老版 Python CA（PKCS#1 RSA）加载全链路修复**：rcgen 默认 ring 后端 KeyPair 只认 PKCS#8，老版 Python CA 私钥报「Could not parse key pair」→ 启用 aws_lc_rs feature 支撑 PKCS#1/SEC1 解析；`load_issuer` 按 PEM 标签解析为原始格式 PrivateKeyDer 原样传 rustls（serialize_der 对非 PKCS#8 进出同格式，硬包 PrivatePkcs8KeyDer 会在 ServerConfig 构建时报错）。
+- **[P1] CodeBuddy 切换假成功（会话回退旧账号）**：vscdb mtime 只证明「客户端动过登录库」，防不了启动后会话回退旧账号（实测恢复后 verify OK，45s 后 live 身份仍是旧账号）——确认收尾补信号④ `confirm_ok`：轮询 live storage.json genie.userId（3 次 × 2s），非目标非空 uid 判 Reverted 并如实告知；仅当槽位快照含 storage.json 才启用复核（槽位缺该文件时 live 是旧账号残留，判 Reverted 即假阳性）。
+- **[P2] 证书提权安装被拒降级当前用户直装（issue #12）**：杀软/企业组策略/VPN 客户端锁 HKLM 根存储时 certutil 提权仍报 0x80070005——提权失败（非用户取消 UAC）降级 `certutil -user -addstore` 写 HKCU Root（无需管理员，Chrome/Edge 信任），两条路径都失败才报错，降级成败由根存储复查统一判定；`cert_status` HKLM/HKCU 任一命中即已安装；0x80070005 文案如实列出文件权限/杀软/策略/VPN 锁存储等根因。
+- **[P2] WB 签到「获取积分」列修复**：双余额差值恒执行（不因单项缺失跳过）+ 已签状态回填今日奖励；奖励提取递归深挖奖励键 + WB credits 余额差值兜底。
+- 豆包 check-login Cookies 锁占用重试 2 次后明确跳过（原静默无语义）。
+
+### 变更
+
+- **账号管理页**：账号池「保存」按钮移至卡片头部操作区（仅池非空时显示，长列表免滚动到底）；Trae 端入口 TRAE SOLO CN 调至首位。
+- **WB 签到**：签到/成长轮次后端互斥（WB_ROUND_LOCK 共享一轮）+ 前端同步互斥禁用与 title 提示（防请求被后端拒绝的按钮闪烁）。
+- `docs/backlog.md`：F-24-余（豆包会员额度端点）真机复验通过正式闭环（2026-09-16）；F-78 批次 3 收尾记录对齐。
+
+### 测试
+
+- cargo 单测 398 → **412** 全绿（本周期新增：PKCS#1 CA 加载→签发叶子→ServerConfig 全链路回归、WB 白名单 3 组、CodeBuddy 切换复核等）；vitest 26/26、`tsc --noEmit` 全绿。
+
+---
+
 ## [3.5.2] · 2026-09-15 · 切换链路实测根因修复（端隔离 F2-4 / 守卫 F2-5 / 混合推导 F2-6）
 
 > 范围：切换器全链路实测问题修复——「切换不生效 / 切 CodeBuddy 连带切 WorkBuddy / 切换后账号不变 / 徽标不更新」。
