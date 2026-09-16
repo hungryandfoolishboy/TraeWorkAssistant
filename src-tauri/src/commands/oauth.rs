@@ -512,32 +512,66 @@ pub fn oauth_parse_callback(
 
 /// 用 AuthCode 交换 token（抓包固化 2026-09-16：授权页 GetPCAuthCode 签发的
 /// AuthCode 绑定 PKCE challenge，交换请求须带对应 CodeVerifier）。
-/// 交换端点/响应结构未抓到（IDE 原生进程发起，浏览器 DevTools 抓不到）：
-/// 请求体对齐 GetPCAuthCode 的 PascalCase 形态（ClientID/Code/CodeVerifier/
-/// DeviceID/PlatformCode）；响应同时含 access_token 与 refresh_token 才算成功，
-/// 失败时输出响应键路径（脱敏，不含值）供下一步校准。
+/// 交换协议排查期：ExchangeToken{Code,CodeVerifier,ClientSecret,UserID} 形态实测
+/// 报 10101「无效参数」（040004）→ 请求体存在服务端不认可的字段。改为变体自动探测链：
+/// 一次登录轮内依次尝试 4 种最可能形态（字段名 AuthCode/Code × 端点 ExchangeToken/
+/// GetToken，均对齐 GetPCAuthCode 实证请求形态——无 ClientSecret/UserID），任一成功
+/// 即止；全部失败时每个变体的错误码都记入 app.log。协议固化后收敛为单形态。
 fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: &std::path::Path) -> Result<(String, String), String> {
-    // 交换协议排查期全量打印（脱敏：token/secret/authcode 类字段值打码，其余完整）；
-    // 协议固化后移除
-    let req_payload = ureq::json!({
-        "ClientID": oauth_client().client_id,
-        "Code": code,
-        "CodeVerifier": verifier.unwrap_or(""),
-        "ClientSecret": oauth_client().client_secret,
-        "DeviceID": device_id,
-        "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
-        "UserID": ""
-    });
+    let client_id = oauth_client().client_id.clone();
+    let code_v = code.to_string();
+    let verifier_v = verifier.unwrap_or("").to_string();
+    let device_v = device_id.to_string();
+    let gettoken_url = oauth_client().exchange_url.replace("ExchangeToken", "GetToken");
+    let mk = |tag: &'static str, auth_key: &'static str, url: String| {
+        (
+            tag,
+            url,
+            ureq::json!({
+                "ClientID": client_id,
+                auth_key: code_v,
+                "CodeVerifier": verifier_v,
+                "DeviceID": device_v,
+                "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
+            }),
+        )
+    };
+    let variants: Vec<(&str, String, serde_json::Value)> = vec![
+        mk("ExchangeToken/AuthCode", "AuthCode", oauth_client().exchange_url.clone()),
+        mk("ExchangeToken/Code", "Code", oauth_client().exchange_url.clone()),
+        mk("GetToken/AuthCode", "AuthCode", gettoken_url.clone()),
+        mk("GetToken/Code", "Code", gettoken_url),
+    ];
+
+    let mut errs: Vec<String> = Vec::new();
+    for (tag, url, payload) in &variants {
+        match try_exchange_variant(tag, url, payload.clone(), device_id, data_dir) {
+            Ok(t) => {
+                fs_utils::app_log(data_dir, &format!("[OAuth交换] 变体 {tag} 成功（协议固化前保留探测链）"));
+                return Ok(t);
+            }
+            Err(e) => errs.push(format!("{tag}: {e}")),
+        }
+    }
+    Err(format!("全部交换变体失败 → {}", errs.join(" | ")))
+}
+
+/// 单个交换变体尝试：脱敏日志（请求+响应全量）→ 设备头请求 → 火山信封错误解析 →
+/// token 三级提取（容器精确键 → 全树深挖 → 键路径诊断）
+fn try_exchange_variant(
+    tag: &str,
+    url: &str,
+    payload: serde_json::Value,
+    device_id: &str,
+    data_dir: &std::path::Path,
+) -> Result<(String, String), String> {
     {
-        let mut masked = req_payload.clone();
+        let mut masked = payload.clone();
         mask_sensitive(&mut masked);
-        fs_utils::app_log(
-            data_dir,
-            &format!("[OAuth交换-请求] {masked}"),
-        );
+        fs_utils::app_log(data_dir, &format!("[OAuth交换-请求:{tag}] {masked}"));
     }
     let resp = match exchange_agent()?
-        .post(&oauth_client().exchange_url)
+        .post(url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
         // 设备头（F-70 情报：ExchangeToken 专属错误码 20403=Device not match /
@@ -545,13 +579,12 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
         .set("x-device-id", device_id)
         .set("x-app-id", OAUTH_APP_ID)
         .set("x-platform-code", OAUTH_PAGE_PLATFORM_CODE)
-        .send_json(req_payload)
+        .send_json(payload)
     {
         Ok(r) => r,
         // 4xx/5xx：ureq 返回 Error::Status 且响应体仍可读——保留用于诊断
-        //（2026-09-16 实测 400：此前 Err 分支丢弃 body，导致拿不到拒绝原因）
         Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => return Err(format!("ExchangeToken 请求失败: {e}")),
+        Err(e) => return Err(format!("请求失败: {e}")),
     };
 
     let body: serde_json::Value = match resp.into_json() {
@@ -561,12 +594,11 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
     {
         let mut masked = body.clone();
         mask_sensitive(&mut masked);
-        fs_utils::app_log(data_dir, &format!("[OAuth交换-响应] {masked}"));
+        fs_utils::app_log(data_dir, &format!("[OAuth交换-响应:{tag}] {masked}"));
     }
 
-    // 响应形态（2026-09-16 实测键路径固化）：火山引擎标准信封——
-    // 错误：ResponseMetadata.Error.{Code,Message,StandardCode,Data}；
-    // 成功：ResponseMetadata + Result.{...}（对照 GetPCAuthCode 的 Result.AuthCode 形态）
+    // 火山引擎标准信封（2026-09-16 实测）：错误 ResponseMetadata.Error.{Code,Message,
+    // StandardCode}；成功 ResponseMetadata + Result.{...}（对照 GetPCAuthCode 形态）
     let err_code = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "Code"])
         .map(|v| {
             v.as_i64()
@@ -575,82 +607,59 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
                 .unwrap_or_default()
         })
         .unwrap_or_default();
-    let err_msg = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "Message"])
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let std_code = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "StandardCode"])
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
     if !err_code.is_empty() && err_code != "0" {
-        // 诊断：错误码/消息为非敏感值，可入日志；键路径保留校准兜底
-        let mut paths = Vec::new();
-        collect_key_paths_public(&body, &mut paths);
-        fs_utils::app_log(
-            data_dir,
-            &format!(
-                "OAuth AuthCode 交换失败: Error.Code={err_code} StandardCode={std_code} Message={err_msg} 响应键路径: {}",
-                paths.join(" | ")
-            ),
-        );
-        return Err(format!(
-            "ExchangeToken 失败 (code={err_code}{}): {}",
-            if std_code.is_empty() { String::new() } else { format!("/{std_code}") },
-            if err_msg.is_empty() { "未知错误" } else { &err_msg }
-        ));
+        let err_msg = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "Message"])
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let std_code = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "StandardCode"])
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Err(format!("code={err_code}/{}: {}", std_code, if err_msg.is_empty() { "未知错误" } else { &err_msg }));
     }
-    // 兼容旧解析（顶层 code/message 形态）
     // 兼容旧解析（顶层 code/message 形态）
     let code_val = body.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
     if code_val != 0 {
         let msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("未知错误");
-        return Err(format!("ExchangeToken 失败 (code={code_val}): {msg}"));
+        return Err(format!("code={code_val}: {msg}"));
     }
 
     // token 提取三级：Result/data/Data 容器精确键 → 全树深挖（键名变体大小写不敏感）→
-    // 失败记键路径（脱敏不含值）。2026-09-16 实测出现过「无 Error 无 Result」的未知
-    // 形态——全树深挖 + 键路径日志保证一次往返即可锁定真实结构
+    // 失败记键路径（脱敏不含值）
     const ACCESS_KEYS: &[&str] = &["AccessToken", "access_token", "token", "Jwt", "JWT"];
     const REFRESH_KEYS: &[&str] = &["RefreshToken", "refresh_token"];
-    let (access_token, refresh_token) = {
-        let container = body
-            .get("Result")
-            .or_else(|| body.get("data"))
-            .or_else(|| body.get("Data"));
-        let from_container = container.and_then(|d| {
-            let a = find_token_value(d, ACCESS_KEYS);
-            let r = find_token_value(d, REFRESH_KEYS);
-            match (a, r) {
-                (Some(a), Some(r)) if !a.is_empty() && !r.is_empty() => Some((a, r)),
-                _ => None,
+    let container = body
+        .get("Result")
+        .or_else(|| body.get("data"))
+        .or_else(|| body.get("Data"));
+    if let Some(d) = container {
+        let a = find_token_value(d, ACCESS_KEYS);
+        let r = find_token_value(d, REFRESH_KEYS);
+        if let (Some(a), Some(r)) = (a, r) {
+            if !a.is_empty() && !r.is_empty() {
+                return Ok((a, r));
             }
-        });
-        match from_container {
-            Some(t) => t,
-            None => match (
-                find_token_value(&body, ACCESS_KEYS),
-                find_token_value(&body, REFRESH_KEYS),
-            ) {
-                (Some(a), Some(r)) if !a.is_empty() && !r.is_empty() => (a, r),
-                _ => {
-                    let mut paths = Vec::new();
-                    collect_key_paths_public(&body, &mut paths);
-                    fs_utils::app_log(
-                        data_dir,
-                        &format!(
-                            "OAuth AuthCode 交换响应未找到 Token 字段（无 Error 信封），响应键路径: {}",
-                            paths.join(" | ")
-                        ),
-                    );
-                    return Err("响应中未找到 AccessToken/RefreshToken 字段（键路径已记入 app.log，反馈该行即可校准）".to_string());
-                }
-            },
         }
-    };
-
-    Ok((access_token, refresh_token))
+    }
+    match (
+        find_token_value(&body, ACCESS_KEYS),
+        find_token_value(&body, REFRESH_KEYS),
+    ) {
+        (Some(a), Some(r)) if !a.is_empty() && !r.is_empty() => Ok((a, r)),
+        _ => {
+            let mut paths = Vec::new();
+            collect_key_paths_public(&body, &mut paths);
+            fs_utils::app_log(
+                data_dir,
+                &format!(
+                    "[OAuth交换:{tag}] 响应未找到 Token 字段（无 Error 信封），响应键路径: {}",
+                    paths.join(" | ")
+                ),
+            );
+            Err("响应中未找到 AccessToken/RefreshToken 字段（键路径已记入 app.log）".to_string())
+        }
+    }
 }
 
 /// 脱敏红线（仅打码值不删结构）：键名含 token/jwt/secret/password/authcode/code/credential
