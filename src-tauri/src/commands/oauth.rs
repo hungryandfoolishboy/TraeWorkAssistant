@@ -592,25 +592,81 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
         return Err(format!("ExchangeToken 失败 (code={code_val}): {msg}"));
     }
 
-    let data = body
-        .get("Result")
-        .or_else(|| body.get("data"))
-        .ok_or("响应中缺少 Result/data 字段")?;
-    let access_token = data
-        .get("AccessToken")
-        .or_else(|| data.get("access_token"))
-        .or_else(|| data.get("token"))
-        .and_then(|v| v.as_str())
-        .ok_or("响应中缺少 AccessToken")?
-        .to_string();
-    let refresh_token = data
-        .get("RefreshToken")
-        .or_else(|| data.get("refresh_token"))
-        .and_then(|v| v.as_str())
-        .ok_or("响应中缺少 RefreshToken")?
-        .to_string();
+    // token 提取三级：Result/data/Data 容器精确键 → 全树深挖（键名变体大小写不敏感）→
+    // 失败记键路径（脱敏不含值）。2026-09-16 实测出现过「无 Error 无 Result」的未知
+    // 形态——全树深挖 + 键路径日志保证一次往返即可锁定真实结构
+    const ACCESS_KEYS: &[&str] = &["AccessToken", "access_token", "token", "Jwt", "JWT"];
+    const REFRESH_KEYS: &[&str] = &["RefreshToken", "refresh_token"];
+    let (access_token, refresh_token) = {
+        let container = body
+            .get("Result")
+            .or_else(|| body.get("data"))
+            .or_else(|| body.get("Data"));
+        let from_container = container.and_then(|d| {
+            let a = find_token_value(d, ACCESS_KEYS);
+            let r = find_token_value(d, REFRESH_KEYS);
+            match (a, r) {
+                (Some(a), Some(r)) if !a.is_empty() && !r.is_empty() => Some((a, r)),
+                _ => None,
+            }
+        });
+        match from_container {
+            Some(t) => t,
+            None => match (
+                find_token_value(&body, ACCESS_KEYS),
+                find_token_value(&body, REFRESH_KEYS),
+            ) {
+                (Some(a), Some(r)) if !a.is_empty() && !r.is_empty() => (a, r),
+                _ => {
+                    let mut paths = Vec::new();
+                    collect_key_paths_public(&body, &mut paths);
+                    fs_utils::app_log(
+                        data_dir,
+                        &format!(
+                            "OAuth AuthCode 交换响应未找到 Token 字段（无 Error 信封），响应键路径: {}",
+                            paths.join(" | ")
+                        ),
+                    );
+                    return Err("响应中未找到 AccessToken/RefreshToken 字段（键路径已记入 app.log，反馈该行即可校准）".to_string());
+                }
+            },
+        }
+    };
 
     Ok((access_token, refresh_token))
+}
+
+/// 在 JSON 树中递归查找指定键（大小写不敏感）的首个非空字符串值（仅取值，不落日志）
+fn find_token_value(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    match v {
+        serde_json::Value::Object(m) => {
+            // 精确匹配优先，其次大小写不敏感
+            for k in keys {
+                if let Some(val) = m.get(*k).and_then(|x| x.as_str()) {
+                    if !val.is_empty() {
+                        return Some(val.to_string());
+                    }
+                }
+            }
+            for (mk, val) in m {
+                if keys.iter().any(|k| k.eq_ignore_ascii_case(mk)) {
+                    if let Some(s) = val.as_str() {
+                        if !s.is_empty() {
+                            return Some(s.to_string());
+                        }
+                    }
+                }
+            }
+            for val in m.values() {
+                if let Some(found) = find_token_value(val, keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(|x| find_token_value(x, keys)),
+        _ => None,
+    }
 }
 
 /// 键路径收集（oauth.rs 本地版，脱敏：仅键名不含值）
