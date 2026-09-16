@@ -791,6 +791,7 @@ mod tests {
             .kv_set("dispatch_policy", &json!({"priority": ["buddy", "trae"],
                    "per_model": {"glm-5.3": ["trae", "buddy"]}, "fallback": true}))
             .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "dispatch_policy");
         let list = unified_models(&f.dir, true, true, true);
         assert_eq!(find(&list, "glm-5.3").rate, Some(0.78));
         // 命中侧未声明倍率（WB rate=0 视为未声明）→ 退另一可用源
@@ -802,6 +803,7 @@ mod tests {
                                "supported_efforts": [], "rate": 0.0}]}),
             )
             .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "wb_model_catalog");
         let list = unified_models(&f.dir, true, true, true);
         assert_eq!(find(&list, "glm-5.3").rate, Some(0.78), "WB 未声明倍率退 Trae 源");
     }
@@ -860,6 +862,7 @@ mod tests {
                 ]),
             )
             .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "api_models");
         let list = unified_models(&f.dir, true, true, true);
         let g = find(&list, "glm-5.3");
         assert_eq!(g.rate, Some(0.42), "L1 人工值保留，不被同步值覆盖");
@@ -890,6 +893,7 @@ mod tests {
                    "per_model": {"kimi-k2.7-code": ["trae", "buddy"]}, "fallback": true}),
             )
             .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "dispatch_policy");
         let list = unified_models(&f.dir, true, true, true);
         let m = find(&list, "kimi-k2.7-code");
         assert_eq!(m.display, "Kimi-K2.7-Code");
@@ -899,6 +903,7 @@ mod tests {
         crate::store::db(&f2.dir)
             .kv_set("dispatch_policy", &json!({"priority": ["trae", "buddy"], "fallback": true}))
             .unwrap();
+        super::super::config_cache::invalidate(&f2.dir, "dispatch_policy");
         let list2 = unified_models(&f2.dir, true, true, true);
         let g = find(&list2, "glm-5.3");
         assert_eq!(g.display, "glm-5.3", "命中 trae → Trae 侧展示名");
@@ -928,6 +933,7 @@ mod tests {
             },
         )
         .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "custom_models");
         let list = unified_models(&f.dir, true, true, true);
         assert_eq!(
             find(&list, "my-vision-model").supports_image,
@@ -950,6 +956,7 @@ mod tests {
             },
         )
         .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "custom_models");
         let list = unified_models(&f.dir, true, true, true);
         assert_eq!(find(&list, "my-vision-model").supports_image, Some(true));
     }
@@ -975,6 +982,7 @@ mod tests {
             },
         )
         .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "custom_models");
         let list = unified_models(&f.dir, true, true, true);
         let m = find(&list, "my-free-model");
         assert_eq!(m.rate, Some(0.0), "rate=0 必须透传为免费（Some(0.0)）");

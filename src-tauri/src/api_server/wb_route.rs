@@ -314,7 +314,8 @@ pub fn wb_stream_chat(
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
-    tokio::task::spawn_blocking(move || {
+    // 批次 D-1 线程隔离：流任务迁入专用阻塞池（见 mod.rs stream_runtime 注释）
+    super::stream_runtime().spawn_blocking(move || {
         // inflight guard 随后台任务存续至流结束（§4.5，客户端断连由 Drop 兜底）；
         // 取号后经 bind_account 维护账号级在途计数（F-77），流结束 Drop 配对释放
         let chat_id = match proto {

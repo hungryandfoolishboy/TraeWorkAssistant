@@ -3,7 +3,11 @@
 //! 数据落盘 `data/api_keys.json`；`daily_limit = 0` 表示不限。
 //! 所有 Key 统一在列表中维护（无主/子之分）；未配置任何启用的 Key 时：
 //! `auth_disabled = true`（显式关闭鉴权）放行并记为 anonymous，否则拒绝请求（默认）。
-//! 每次鉴权命中 Key 即累加当日用量并原子写盘（与 usage.rs 同策略：个人频率低）。
+//!
+//! 记账削峰（网关性能批次 E）：鉴权命中只更新**内存权威副本**并标脏，
+//! SQLite 写事务由 flusher（2s）与 stop 时统一落盘——消除「每请求一次整表替换
+//! 事务」的写放大与 store 层连接锁争抢。UI 编辑走 `save`（持久化 + 缓存同步刷新），
+//! 改动即时生效；进程崩溃最多丢最近 2s 的 used_today 计数（个人场景可接受）。
 //!
 //! F-35 子 Key 体系（对外子 Key 与上游真实凭证分离）：
 //! - `ck_` 前缀子 Key（前端 crypto 随机源生成；旧 `sk-` Key 继续兼容）
@@ -194,48 +198,120 @@ impl ApiKeysFile {
     }
 }
 
-/// 按 Key 条目 id 解析约束快照（WB 路由层每流程调用一次；Key 不存在返回 None）
+/// 按 Key 条目 id 解析约束快照（WB 路由层每流程调用一次；Key 不存在返回 None）。
+/// 锁内直查内存权威副本，仅克隆命中的约束字段（避免整表 clone 的锁持有与内存开销）
 pub fn constraints_for(data_dir: &Path, key_id: &str) -> Option<ResolvedKey> {
-    let f: ApiKeysFile = load(data_dir);
-    f.keys.iter().find(|k| k.id == key_id).map(|e| ResolvedKey {
-        id: e.id.clone(),
-        allowed_accounts: e.allowed_accounts.clone(),
-        schedule_mode: e.schedule_mode().to_string(),
-        dedicated_account: e.dedicated_account.clone(),
+    let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    entry_or_load(&mut reg, data_dir)
+        .file
+        .keys
+        .iter()
+        .find(|k| k.id == key_id)
+        .map(|e| ResolvedKey {
+            id: e.id.clone(),
+            allowed_accounts: e.allowed_accounts.clone(),
+            schedule_mode: e.schedule_mode().to_string(),
+            dedicated_account: e.dedicated_account.clone(),
+        })
+}
+
+/// 进程级状态锁 + 内存权威副本（批次 E）：api_keys 的「读-改-写」（verify 记账 +
+/// save + flush）全部在同一把锁内完成，保证并发请求计数原子，且替代原
+/// 「每请求 load 全表 + 整表替换事务落盘」的写放大（P1-2 / 批次 E）。
+static KEYS_STATE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, KeysEntry>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 单个 data_dir 的缓存条目：内存权威副本 + 待落盘脏标记
+struct KeysEntry {
+    file: ApiKeysFile,
+    dirty: bool,
+}
+
+/// 锁内取条目：缓存未命中时从 SQLite 加载并插入（首读即缓存）
+fn entry_or_load<'a>(
+    reg: &'a mut std::collections::HashMap<std::path::PathBuf, KeysEntry>,
+    data_dir: &'a Path,
+) -> &'a mut KeysEntry {
+    reg.entry(data_dir.to_path_buf()).or_insert_with(|| KeysEntry {
+        file: crate::store::docs::api_keys_load(&crate::store::db(data_dir)),
+        dirty: false,
     })
 }
 
-/// 读盘（SQLite 化 P3：api_keys 表 + kv `api_keys_auth_disabled`）
+/// 读（缓存优先；命令层展示与 constraints_for 均走此处，不再每调用一次 SQLite 读）
 pub fn load(data_dir: &Path) -> ApiKeysFile {
-    crate::store::docs::api_keys_load(&crate::store::db(data_dir))
+    let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    entry_or_load(&mut reg, data_dir).file.clone()
 }
 
-/// 原子写盘（事务内整表替换）
+/// 持久化并同步刷新内存权威副本（UI 编辑路径：改动即时生效）。
+/// 计数字段（used_today/used_date/daily_stats）以内存权威副本为准合并——前端快照
+/// 常携带打开设置页时的旧计数，直接覆盖会系统性回退当日记账（R2；同时消除
+/// save 与 flusher 锁外写库交错的窄竞态）。合并后标脏，flusher 兜底再落一次盘
+/// 收敛交错窗口；落盘失败保留脏标记由 flusher 重试（不静默丢编辑）。
 pub fn save(data_dir: &Path, f: &ApiKeysFile) {
-    let _ = crate::store::docs::api_keys_save(&crate::store::db(data_dir), f);
+    let merged = {
+        let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = entry_or_load(&mut reg, data_dir);
+        let mut nf = f.clone();
+        for k in &mut nf.keys {
+            if let Some(cur) = entry.file.keys.iter().find(|c| c.id == k.id) {
+                k.used_today = cur.used_today;
+                k.used_date = cur.used_date.clone();
+                k.daily_stats = cur.daily_stats.clone();
+            }
+        }
+        entry.file = nf.clone();
+        entry.dirty = true;
+        nf
+    };
+    if crate::store::docs::api_keys_save(&crate::store::db(data_dir), &merged).is_err() {
+        eprintln!("[api_keys] save 落盘失败（内存已生效，flusher 将重试）: {}", data_dir.display());
+    }
 }
 
-/// 进程级写锁（审查 P1-2）：api_keys.json 的「读-改-写」（verify 记账 + save）必须
-/// 原子完成，否则并发请求互相覆盖 used_today/daily_stats——配额可被穿透、统计少记。
-static KEYS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// 序列化对比：verify 后文件是否发生变化（P1 修复5a）。
-/// 无变化（Invalid 等只读路径）跳过写盘，消除鉴权热路径的无效磁盘写
-fn keys_file_changed(before: &[u8], f: &ApiKeysFile) -> bool {
-    serde_json::to_vec(f).map(|b| b != before).unwrap_or(true)
-}
-
-/// 鉴权记账原子操作：锁内 load → verify_and_consume → 有变化才 save。
-/// auth 中间件每请求调用本函数，禁止绕开锁直接 load+save。
+/// 鉴权记账原子操作：锁内 verify_and_consume（内存副本），命中即标脏；
+/// SQLite 落盘由 flusher（2s）/ stop 时 flush_dirty 统一执行。
+/// auth 中间件每请求调用本函数，禁止绕开 KEYS_STATE 直接 load+save。
 pub fn verify_and_consume_locked(data_dir: &Path, presented: &str, today: &str) -> KeyCheck {
-    let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut f = load(data_dir);
-    let before = serde_json::to_vec(&f).unwrap_or_default();
-    let r = f.verify_and_consume(presented, today);
-    if keys_file_changed(&before, &f) {
-        save(data_dir, &f);
+    let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = entry_or_load(&mut reg, data_dir);
+    let r = entry.file.verify_and_consume(presented, today);
+    // 仅记账命中（Ok）产生持久化需求；Invalid / QuotaExceeded（提前返回不改计数）无写盘
+    if matches!(r, KeyCheck::Ok(_)) {
+        entry.dirty = true;
     }
     r
+}
+
+/// 落盘脏副本（flusher 线程 2s 一次 + stop / 退出时调用）；成功落盘返回 true，
+/// 无脏副本或落盘失败返回 false。锁内只取快照，SQLite 写事务在锁外执行；
+/// 写失败恢复脏标记由 flusher 下轮重试（R3，不静默丢当批计数）
+pub fn flush_dirty(data_dir: &Path) -> bool {
+    let snapshot = {
+        let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        match reg.get_mut(&data_dir.to_path_buf()) {
+            Some(e) if e.dirty => {
+                e.dirty = false;
+                Some(e.file.clone())
+            }
+            _ => None,
+        }
+    };
+    match snapshot {
+        Some(f) => {
+            let ok = crate::store::docs::api_keys_save(&crate::store::db(data_dir), &f).is_ok();
+            if !ok {
+                let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(e) = reg.get_mut(&data_dir.to_path_buf()) {
+                    e.dirty = true;
+                }
+                eprintln!("[api_keys] flush 落盘失败（已恢复脏标记待重试）: {}", data_dir.display());
+            }
+            ok
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -344,43 +420,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ==================== P1 修复5a：无变化跳过写盘 ====================
+    // ==================== 批次 E：内存权威副本 + 延迟落盘 ====================
 
     #[test]
-    fn changed_detects_consume_but_not_invalid() {
-        let mut f = ApiKeysFile {
-            keys: vec![entry("k1", "ck-a", true, 0)],
-            auth_disabled: false,
-        };
-        let before = serde_json::to_vec(&f).unwrap();
-        assert!(!keys_file_changed(&before, &f), "未变更不应触发写盘");
-        let _ = f.verify_and_consume("ck-a", "d1");
-        assert!(keys_file_changed(&before, &f), "记账后应触发写盘");
-    }
-
-    #[test]
-    fn locked_verify_skips_write_when_unchanged() {
-        // Invalid 路径不改写存储；命中记账路径正常落库（SQLite 化 P3：对比 kv 内容）
-        let dir = std::env::temp_dir().join(format!("twa_keys_locked_{}", std::process::id()));
+    fn flush_persists_only_after_consume() {
+        // Invalid 路径不标脏；命中记账标脏，flush_dirty 落库后存储可见
+        let dir = std::env::temp_dir().join(format!("twa_keys_flush_{}", std::process::id()));
         let f = ApiKeysFile {
             keys: vec![entry("k1", "ck-a", true, 0)],
             auth_disabled: false,
         };
         save(&dir, &f);
-        let before = crate::store::db(&dir).kv_get_raw("api_keys");
+        // R2：save 合并后标脏，由 flusher 兜底收敛一次
+        assert!(flush_dirty(&dir), "save 标脏由 flusher 收敛");
+        assert!(!flush_dirty(&dir), "收敛后无脏标记不应落盘");
         assert!(matches!(
             verify_and_consume_locked(&dir, "ck-wrong", "d1"),
             KeyCheck::Invalid
         ));
-        let after = crate::store::db(&dir).kv_get_raw("api_keys");
-        assert_eq!(before, after, "Invalid 路径不应改写存储");
-        // 命中记账：文件应更新
+        assert!(!flush_dirty(&dir), "Invalid 路径不应标脏");
         assert!(matches!(
             verify_and_consume_locked(&dir, "ck-a", "d1"),
             KeyCheck::Ok(_)
         ));
-        let updated = load(&dir);
-        assert_eq!(updated.keys[0].used_today, 1);
+        // 落盘前存储仍是旧值、内存副本已是新值（缓存权威语义）
+        // 注意 store 用 rows_replace 写 SQLite，不能用 kv_get_raw 验证；
+        // 直接调 api_keys_load（从 rows 读）验证存储层是否可见
+        let mid_store = crate::store::docs::api_keys_load(&crate::store::db(&dir));
+        assert_eq!(mid_store.keys[0].used_today, 0, "flush 前不应写库");
+        assert_eq!(load(&dir).keys[0].used_today, 1, "内存副本已记账");
+        // flush 后存储与内存一致
+        assert!(flush_dirty(&dir), "记账后应标脏并落盘");
+        let updated = crate::store::docs::api_keys_load(&crate::store::db(&dir));
+        assert_eq!(updated.keys[0].used_today, 1, "flush 后应写库");
+        assert!(!flush_dirty(&dir), "flush 后脏标记清除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_refreshes_cache_immediately() {
+        // UI 编辑路径：save 持久化 + 缓存同步刷新，load 立即读到新值
+        let dir = std::env::temp_dir().join(format!("twa_keys_save_cache_{}", std::process::id()));
+        let mut f = ApiKeysFile {
+            keys: vec![entry("k1", "ck-a", true, 0)],
+            auth_disabled: false,
+        };
+        save(&dir, &f);
+        assert_eq!(load(&dir).keys.len(), 1);
+        // R2 计数合并：save 携带旧快照（used_today=0）不得回退内存已记账的计数
+        let _ = verify_and_consume_locked(&dir, "ck-a", "d1");
+        f.keys[0].name = "renamed".into();
+        save(&dir, &f);
+        let loaded = load(&dir);
+        assert_eq!(loaded.keys[0].name, "renamed", "编辑字段生效");
+        assert_eq!(loaded.keys[0].used_today, 1, "旧快照不得回退内存计数");
+        assert_eq!(loaded.keys[0].used_date, "d1");
+        // save 合并后标脏 → flusher 兜底落一次盘收敛（再 flush 应无脏）
+        assert!(flush_dirty(&dir), "save 后应标脏由 flusher 收敛");
+        let stored = crate::store::docs::api_keys_load(&crate::store::db(&dir));
+        assert_eq!(stored.keys[0].name, "renamed");
+        assert_eq!(stored.keys[0].used_today, 1, "落盘含合并后的计数");
+        assert!(!flush_dirty(&dir), "收敛后脏标记清除");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

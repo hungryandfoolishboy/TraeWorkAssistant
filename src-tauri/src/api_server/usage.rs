@@ -188,7 +188,7 @@ impl DayStats {
 
 /// 用量分桶（资源池维度分账）：Trae = Trae 模型请求；Wb = WB 上游请求；
 /// Custom = 自定义模型（custom_models.json 命中直达）请求
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UsageBucket {
     Trae,
     Wb,
@@ -350,19 +350,20 @@ pub fn load(data_dir: &Path) -> UsageFile {
     f
 }
 
-/// 持久化当日单行（每请求记账热路径：单行 UPSERT 替代原整表 DELETE+重插）。
+/// 持久化当日单行（flusher 记账削峰路径：单行 UPSERT 替代原整表 DELETE+重插）。
 /// 内存 `UsageFile`（RuntimeState.usage）为权威态，启动时由 load 全量回读。
-pub fn save_day(data_dir: &Path, bucket: UsageBucket, day: &str, stats: &DayStats) {
+/// 返回落盘是否成功（失败由调用方恢复脏标记重试，R3）
+pub fn save_day(data_dir: &Path, bucket: UsageBucket, day: &str, stats: &DayStats) -> bool {
     let text = match serde_json::to_string(stats) {
         Ok(t) => t,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let b = match bucket {
         UsageBucket::Trae => "trae",
         UsageBucket::Wb => "wb",
         UsageBucket::Custom => "custom",
     };
-    let _ = crate::store::docs::api_usage_upsert_day(&crate::store::db(data_dir), b, day, &text);
+    crate::store::docs::api_usage_upsert_day(&crate::store::db(data_dir), b, day, &text).is_ok()
 }
 
 // ==================== 命令返回结构 ====================

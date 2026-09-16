@@ -248,6 +248,7 @@ pub async fn do_start(
         logger: ApiLogger::new(state.logs_dir()),
         debug_enabled: std::sync::atomic::AtomicBool::new(false),
         usage: Mutex::new(crate::api_server::usage::load(&state.data_dir)),
+        usage_dirty: Mutex::new(Vec::new()),
         wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
         wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
     });
@@ -317,6 +318,8 @@ pub async fn do_stop(
     let mut guard = safe_lock(runtime);
     if let Some(mut rt) = guard.take() {
         rt.handle.stop();
+        // 批次 C/E：停止前排空用量脏队列、api_keys 计数与日志队列（flusher 已停）
+        rt.shared.flush_pending_writes();
         fs_utils::app_log(&state.data_dir, "API 服务已停止");
         drop(guard);
         sync_tray_api_text(app, false);

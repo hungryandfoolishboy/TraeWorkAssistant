@@ -92,6 +92,13 @@ pub fn function_for_model(model_lower: &str) -> &'static str {
 /// SQLite 化（P2）：data/api_models.json → kv `api_models`（热路径单行 SELECT+解析，
 /// 替代原 mtime 解析缓存；旧根路径兼容迁移由启动迁移器完成）。
 pub fn load_models(data_dir: &Path) -> Vec<ModelOption> {
+    // 热路径缓存（批次 A）：resolve_target / 目录聚合每请求读取
+    super::config_cache::get_or_load(data_dir, "api_models", || {
+        load_models_uncached(data_dir)
+    })
+}
+
+fn load_models_uncached(data_dir: &Path) -> Vec<ModelOption> {
     let list: Vec<ModelOption> = crate::store::db(data_dir).kv_get("api_models");
     if !list.is_empty() {
         return list;
@@ -271,6 +278,8 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
 
     let list = normalize_order(fetched);
     crate::store::db(data_dir).kv_set("api_models", &list)?;
+    // 写路径显式失效（批次 A）：官网同步结果即时生效
+    super::config_cache::invalidate(data_dir, "api_models");
     fs_utils::app_log(
         data_dir,
         &format!("官网模型列表同步成功: {} 个模型", list.len()),

@@ -115,6 +115,11 @@ impl Default for DispatchPolicy {
 /// 读取调度策略：缺失/损坏回退默认（不落盘——首次 set 时才写，保持数据干净）。
 /// SQLite 化（P2）：kv 文档直读（单行 SELECT+解析 µs 级，替代原 mtime 解析缓存）。
 pub fn load_policy(data_dir: &Path) -> DispatchPolicy {
+    // 热路径缓存（批次 A）：resolve_target 每请求读取；写路径 save_policy 显式失效
+    super::config_cache::get_or_load(data_dir, "dispatch_policy", || load_policy_uncached(data_dir))
+}
+
+fn load_policy_uncached(data_dir: &Path) -> DispatchPolicy {
     let mut p: DispatchPolicy = crate::store::db(data_dir).kv_get("dispatch_policy");
     // 防御：优先级数组非法值过滤 + 空数组回退默认
     let valid: Vec<String> = p
@@ -144,7 +149,10 @@ pub fn save_policy(data_dir: &Path, policy: &DispatchPolicy) -> Result<(), Strin
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    crate::store::db(data_dir).kv_set("dispatch_policy", &p)
+    crate::store::db(data_dir).kv_set("dispatch_policy", &p)?;
+    // 写路径显式失效（批次 A）：策略改动即时生效
+    super::config_cache::invalidate(data_dir, "dispatch_policy");
+    Ok(())
 }
 
 // ==================== 选池决策（§4.3/§4.4） ====================
@@ -626,6 +634,7 @@ mod tests {
             logger: super::super::ApiLogger::new(dir.join("logs")),
             debug_enabled: AtomicBool::new(false),
             usage: std::sync::Mutex::new(super::super::usage::UsageFile::default()),
+            usage_dirty: std::sync::Mutex::new(Vec::new()),
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
         });
@@ -892,6 +901,8 @@ mod tests {
         // 策略热改为 trae 优先
         p.priority = vec!["trae".into(), "buddy".into()];
         crate::store::db(&f.dir).kv_set("dispatch_policy", &p).unwrap();
+        // 批次 A：绕过 save_policy 的 kv 直写需手动失效缓存（与生产写路径语义对齐）
+        super::super::config_cache::invalidate(&f.dir, "dispatch_policy");
         // 同一会话（消息指纹相同）→ 沿用 Buddy
         assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
     }
@@ -931,6 +942,8 @@ mod tests {
         p.strategy = DispatchStrategy::Priority;
         p.priority = vec!["trae".into(), "buddy".into()];
         crate::store::db(&f.dir).kv_set("dispatch_policy", &p).unwrap();
+        // 批次 A：kv 直写后失效策略缓存（见 t17 注释）
+        super::super::config_cache::invalidate(&f.dir, "dispatch_policy");
         let b = resolve_target(
             &f.state,
             "glm-5.3",
@@ -975,6 +988,8 @@ mod tests {
         crate::store::db(&dir)
             .kv_set("dispatch_policy", &json!({"priority": ["wb", "", "trae"], "fallback": false}))
             .unwrap();
+        // 批次 A：kv 直写后失效缓存（生产路径经 save_policy 自动失效）
+        super::super::config_cache::invalidate(&dir, "dispatch_policy");
         let p = load_policy(&dir);
         assert_eq!(p.priority, vec!["trae".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);

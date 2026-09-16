@@ -1,7 +1,8 @@
 # 产品优化需求清单（全应用统一待办）
 
-> **文档版本**: v2.8 · 2026-09-16
+> **文档版本**: v2.9 · 2026-09-16
 > **定位**: 全项目**唯一待办依据**——所有未实施的优化与需求项均在此登记，每条含需求概述 / 实现路径 / 参考开源项目。
+> **v2.9 变更**（2026-09-16，网关请求链路堵塞分析批次落地）：① 新增 **F-79 网关流式上游异步化**（reqwest + async SSE，原「D-2 二期」）——同批已落地的过渡方案：调度配置内存缓存（A）+ API 日志异步写入（B）+ 用量/Key 记账削峰落盘（C/E）+ 流式专用阻塞池线程隔离（D-1），P0 级堵塞（spawn_blocking 池耗尽、async worker 同步 SQLite）已消除，F-79 为彻底形态；② 其余待办项状态复核无变化。
 > **v2.8 变更**（2026-09-16，对照 CHANGELOG 3.5.3 + 全仓代码检索完成度核查）：① **F-78 全链路完成**——批次 3 真实协议闭环（PKCE + authCodeInfo 回调 + DeviceInfo 主变体 + 端点修正 + 变体探测链，v3.5.3 九提交），原「待抓包验证项」经协议实测全部裁定；② **F-70 部分落地**——`icube_auth.rs`（tc 信封解密 + ECDSA P-256 DeviceProof）随 F-78 批次 3 交付，条目改「部分完成」，剩余账号发现直读下调至 1~2 天；③ §五排序刷新（已完成项退出）；④ 其余待办项（F-38/F-69/F-67/F-07/F-41/F-42/F-66/E-01~E-03 及远期项）经代码检索确认均未实现，状态属实。
 > **v2.7 变更**: ① **W-01（Work 积分接入网关）标记 ❌ 已排除**——Trae 积分签到调整，前提与收益均不成立；条目与 §三 专题保留作技术留档，§四新增排除行、§五排序移除；② **F-68 已完成**（`switcher/vscdb.rs` 全局键合并，恢复前抽键 → 恢复后按条目合并回写）；③ **F-74 已完成**（chatdata 三命令 `app` 参数化 + CodeBuddy 会话域 + `buddy_switch_migrate_chats` 切换编排）。
 > **v2.6 变更**: F-75 macOS 支持依赖盘点全面复审——Python/PS 全量 Rust 化、存储 SQLite 化、定时任务 Rust 原生调度器（`tasks/scheduler.rs`）落地后，原三大依赖项（PS 切换桥主工程、Python 路径中立化 M2、Job Object）整体消失，预估 6~8 周 → 3~4 周；剩余 Windows 依赖收敛为 13 个明确模块点（vault DPAPI / switcher 三模块 / 系统代理 / 证书 / MITM 绑定 / 豆包 cookie 解密 / schtasks 注册面等），详见 F-75 条目。
@@ -31,6 +32,7 @@
 | W-01 ❌ | Work 积分（209）接入 API 网关（多活会话编排） | Trae/网关 | — | — | 已排除（2026-09-15）：Trae 积分签到调整，前提与收益均不成立，见 §三/§四 |
 | F-70 | Trae tc 凭证直读 + ECDSA P-256 刷新情报核对 | Trae 生态 | **P2** | 1~2 天（余量） | **部分完成**（解密算法 + DeviceProof 已落地 2026-09-16；剩余账号发现直读接入） |
 | F-69 | Trae 会话导出存档（Markdown + 存档浏览器） | Trae 生态 | **P3** | 2~3 天 | 待开发 |
+| F-79 | 网关流式上游异步化（reqwest + async SSE 迁移） | 网关 | **P3** | 2~3 天 | 待开发（过渡方案 D-1/A/B/C/E 已落地 2026-09-16） |
 | E-03 | 豆包多模态端点（生图/生视频/音乐/文件中转站） | 豆包/网关 | **P3** | 3~4 天 | 待开发（依赖 E-01） |
 | F-67 | TRAE 多实例并行（原 F-44 改号） | Trae 生态 | P3 | 未定（调研先行） | 待调研（issue #9） |
 | F-07 | 豆包 cookie 级热切换（方案 B） | 豆包 | P3 | 1~2 天 | 待验证后开发 |
@@ -190,6 +192,18 @@
   2. Rust 导出命令 `tasks/trae_chats.rs`（复用 `tasks/doubao_chats.rs` 的分页拉取 → Markdown + JSON 双格式模式，落 `data/exports/trae_chats_<uid>_<ts>`）；
   3. 前端存档浏览器（复用豆包对话导出的交互形态）。
 - **参考开源项目**：本项目 `doubao_export_chats`（同族先例，交互与导出格式直接复用）；`wangchuxiaoji-oss/doubao2api`（分页 anchor 游标模式参照）。
+
+### F-79 网关流式上游异步化——reqwest + async SSE 迁移（P3，二期彻底形态）
+
+- **需求概述**：当前网关上游 IO 为 ureq 同步栈，每条流式请求（solo `stream_chat` / WB `wb_stream_chat` / custom `custom_stream_chat`）独占一个阻塞线程直至流结束（读空闲上限 300s）。2026-09-16 已落地过渡方案（本条「背景」）：流任务迁入**独立阻塞池**（`stream_runtime`，上限 256，D-1 线程隔离）+ 调度配置内存缓存（A）+ API 日志异步写入（B）+ 用量/Key 记账削峰（C/E）——P0 级堵塞（并发流耗尽 spawn_blocking 池导致鉴权/短 IO 级联卡死；async worker 同步 SQLite）已消除。本条为二期彻底形态：上游请求迁移 `reqwest` 异步栈，流转发原生 async，不再占用任何阻塞线程。
+- **实现路径**：
+  1. **上游层替换**：`wb_upstream.rs` / solo 上游（`mod.rs streaming_agent`）/ custom 上游（`custom_route.rs make_custom_request`）三处 ureq Agent 迁移 reqwest Client（rustls 已是依赖栈，hyper 复用 axum 同版本）；首字超时（F-34 语义 10s）→ `tokio::time::timeout` 首帧等待；
+  2. **流转发异步化**：`wb_sse::stream_forward` / `lines_with_first_byte_timeout` / `lines_with_first_byte_hedged`（F-76 对冲竞速）改为 async 迭代器（`futures::Stream`）+ `tokio::select!` 竞速；对冲第二请求与 relay 线程（现 `std::thread::spawn` relay_lines）随迁移消失；
+  3. **行为不变量**：InflightGuard RAII 语义（guard 移入 async 任务）、账号级并发计数、粘性 TTL、错误分类与冷却矩阵全部保持；`DoneSignal` keep-alive ticker 与流任务同 runtime；
+  4. **移除 D-1 专用池**：流任务回到主 runtime（`tokio::spawn`），`stream_runtime()` 与 `max_blocking_threads` 隔离层退役。
+- **边界与风险**：① reqwest 引入为新增依赖（与 axum/hyper 版本矩阵需对齐，Tauri 主进程内已间接存在）；② SSE 解析层（`wb_sse`）协议转换逻辑可整体复用，仅行源从同步迭代器换 async stream——改动集中在上游层与行读取层；③ 生图（`wb_images`）与探活等短请求可分批迁移，不必一次到位。
+- **参考开源项目**：`antonputra/tutorials`（reqwest + async SSE 流转发范式）；本项目 axum/`Body::from_stream`（响应侧已 async，仅上游侧未对齐）；`Softcreatr/json-sse`（SSE→JSON 事件桥接参照）。
+- **验收**：并发 100 条长流时鉴权与 `/v1/models` 延迟无劣化（D-1 已保证，迁移后不劣化）；阻塞线程占用从「每流 1 线程」降为 ~0；TTFT/总耗时与迁移前持平（±5%）；对冲竞速与首字超时语义回归全绿。
 
 ### E-03 豆包多模态端点（P3，依赖 E-01）
 

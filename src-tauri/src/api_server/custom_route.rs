@@ -137,7 +137,8 @@ pub fn custom_stream_chat(
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
-    tokio::task::spawn_blocking(move || {
+    // 批次 D-1 线程隔离：流任务迁入专用阻塞池（见 mod.rs stream_runtime 注释）
+    super::stream_runtime().spawn_blocking(move || {
         let _inflight = guard; // 随后台任务存续至流结束（§4.5）
         let chat_id = chat_id_for(proto);
 

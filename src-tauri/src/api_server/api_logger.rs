@@ -1,26 +1,61 @@
-use std::fs::{self, OpenOptions};
+use std::collections::VecDeque;
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Local};
 
 /// API 请求日志记录器：按日期分文件，直接存储在 logs/ 目录下（文件名 api_YYYY-MM-DD.log）
+///
+/// 写入异步化（网关性能批次 B）：`log_request` / `log_sched_event` / `log_debug`
+/// 仅将格式化后的行推入内存队列（µs 级、零磁盘 IO），由专用写入线程
+/// 每 100ms（或被唤醒时）批量落盘。读路径（read_log/search_log/list_dates）
+/// 先同步排空队列再读文件，保证「写后读」一致（测试与 UI 依赖此语义）。
 pub struct ApiLogger {
     dir: PathBuf,
-    writer: Mutex<Option<std::fs::File>>,
-    max_size: u64,
+    /// 队列 + 文件句柄同锁互斥（写入线程与读路径排空共用一把锁，保证一致）
+    state: Arc<Mutex<LoggerState>>,
+    cv: Arc<Condvar>,
+    /// 写入线程启动失败时降级为同步直写（极端场景兜底）
+    sync_mode: bool,
+}
+
+struct LoggerState {
+    /// 待落盘日志行（FIFO）
+    queue: VecDeque<String>,
+    /// 当前打开的日志文件句柄（None = 待打开）
+    file: Option<std::fs::File>,
+    /// 句柄对应日期（与今日不同则滚动换文件）
+    date: String,
+}
+
+impl LoggerState {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            file: None,
+            date: String::new(),
+        }
+    }
 }
 
 impl ApiLogger {
     pub fn new(dir: PathBuf) -> Self {
         fs::create_dir_all(&dir).ok();
-        Self {
-            dir,
-            writer: Mutex::new(None),
-            max_size: 50 * 1024 * 1024, // 50MB 滚动
-        }
+        let state = Arc::new(Mutex::new(LoggerState::new()));
+        let cv = Arc::new(Condvar::new());
+        let sync_mode = {
+            let state2 = state.clone();
+            let cv2 = cv.clone();
+            let dir2 = dir.clone();
+            std::thread::Builder::new()
+                .name("api-logger".into())
+                .spawn(move || flusher_loop(state2, cv2, dir2))
+                .is_err()
+        };
+        Self { dir, state, cv, sync_mode }
     }
 
     fn today_filename() -> String {
@@ -29,32 +64,34 @@ impl ApiLogger {
         format!("api_{:04}-{:02}-{:02}.log", now.year(), now.month(), now.day())
     }
 
-    /// 获取或创建今日日志文件句柄
-    pub fn get_writer(&self) -> Option<std::fs::File> {
-        let today = Self::today_filename();
-        let path = self.dir.join(&today);
-
-        // 检查当前 writer 是否仍然有效（文件名相同且未超大小）
-        let mut guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref f) = *guard {
-            if let Ok(meta) = f.metadata() {
-                if meta.len() < self.max_size {
-                    // 当前文件可用，返回 clone
-                    if let Ok(clone) = f.try_clone() {
-                        return Some(clone);
-                    }
-                }
-            }
+    /// 入队一条日志（异步化热路径：仅内存操作，磁盘 IO 由写入线程承担）
+    fn enqueue(&self, line: String) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.queue.push_back(line);
+        if self.sync_mode {
+            // 写入线程不可用：持锁直写（与读路径同锁，语义一致）
+            write_locked(&mut st, &self.dir);
+        } else {
+            self.cv.notify_one();
         }
+    }
 
-        // 需要新建文件
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .ok()?;
-        *guard = Some(file.try_clone().ok()?);
-        Some(file)
+    /// 读路径前同步排空队列（保证 read_log / search_log / list_dates 看到最新内容）
+    fn flush_pending(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        write_locked(&mut st, &self.dir);
+    }
+
+    /// 公开排空（服务 stop / 应用退出时调用）：把队列中未落盘的行写盘
+    pub fn flush(&self) {
+        self.flush_pending();
+    }
+
+    /// 直写一行诊断日志（[DEBUG] 前缀诊断行）：走同一异步队列，
+    /// 行尾无换行时自动补 `\n`（替代旧 get_writer 直写句柄方案）
+    pub fn log_debug_line(&self, line: String) {
+        let line = if line.ends_with('\n') { line } else { format!("{line}\n") };
+        self.enqueue(line);
     }
 
     /// 记录一条 API 请求日志
@@ -130,9 +167,7 @@ impl ApiLogger {
             method, path, pool, model, stream, status, uid_short, duration_ms, ttfb_part, err_part,
         );
 
-        if let Some(mut f) = self.get_writer() {
-            let _ = f.write_all(line.as_bytes());
-        }
+        self.enqueue(line);
     }
 
     /// 记录调度事件日志（F-77）：sticky_yield 让位 / busy 降级取号 / 对冲接管等，
@@ -147,9 +182,7 @@ impl ApiLogger {
         let m = (local_ts % 3600) / 60;
         let s = local_ts % 60;
         let line = format!("[{:02}:{:02}:{:02}] [SCHED] {}\n", h, m, s, event);
-        if let Some(mut f) = self.get_writer() {
-            let _ = f.write_all(line.as_bytes());
-        }
+        self.enqueue(line);
     }
 
     /// 记录 Debug 级别的完整请求/响应日志
@@ -205,14 +238,13 @@ impl ApiLogger {
 
         lines.push(String::new()); // 空行分隔
 
-        if let Some(mut f) = self.get_writer() {
-            let data = lines.join("\n");
-            let _ = f.write_all(data.as_bytes());
-        }
+        let data = lines.join("\n");
+        self.enqueue(data);
     }
 
     /// 读取指定日期的日志文件内容（按时间倒序排列）
     pub fn read_log(&self, date: &str) -> Option<String> {
+        self.flush_pending();
         // date 格式: "2026-08-14"
         let path = self.dir.join(format!("api_{}.log", date));
         match fs::read(&path) {
@@ -330,6 +362,7 @@ impl ApiLogger {
 
     /// 列出所有可用日志日期（最近 N 天）
     pub fn list_dates(&self, max: usize) -> Vec<String> {
+        self.flush_pending();
         let mut dates: Vec<String> = Vec::new();
         if let Ok(entries) = fs::read_dir(&self.dir) {
             for entry in entries.flatten() {
@@ -345,6 +378,59 @@ impl ApiLogger {
         dates.reverse();
         dates.truncate(max);
         dates
+    }
+}
+
+// ==================== 写入线程与批量落盘 ====================
+
+/// 写入线程主循环：队列空则等条件变量（100ms 超时兜底），非空则持锁批量落盘。
+/// 批量写期间日志入队方会短暂等锁（一批几行的 write_all，µs~ms 级），
+/// 相比旧实现每次调用 metadata + try_clone + write 三次系统调用大幅缩短临界区。
+fn flusher_loop(state: Arc<Mutex<LoggerState>>, cv: Arc<Condvar>, dir: PathBuf) {
+    loop {
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.queue.is_empty() {
+            let (guard, _) = cv
+                .wait_timeout(st, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner());
+            st = guard;
+        }
+        // 持锁批量写（与入队/读路径同锁；锁内不等待，仅执行 write_all）
+        write_locked(&mut st, &dir);
+    }
+}
+
+/// 持锁落盘：排空队列并写入当前日期文件（句柄跨调用缓存，日期滚动才重开）。
+/// 写失败（句柄失效等）置 None，下次调用重开新句柄。
+fn write_locked(st: &mut LoggerState, dir: &PathBuf) {
+    if st.queue.is_empty() {
+        return;
+    }
+    let today = ApiLogger::today_filename();
+    if st.file.is_none() || st.date != today {
+        let path = dir.join(&today);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => {
+                st.file = Some(f);
+                st.date = today;
+            }
+            // 打开失败：丢弃本批（与旧实现 write 失败静默语义一致），保留队列外后续行
+            Err(_) => {
+                st.queue.clear();
+                st.date = today;
+                return;
+            }
+        }
+    }
+    let Some(f) = st.file.as_mut() else { return };
+    while let Some(line) = st.queue.pop_front() {
+        if f.write_all(line.as_bytes()).is_err() {
+            st.file = None; // 句柄失效，下次重开
+            return;
+        }
     }
 }
 

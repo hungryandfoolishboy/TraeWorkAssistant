@@ -87,7 +87,10 @@ pub struct CustomModelsFile {
 
 /// 读取列表（SQLite 化 P3：custom_models 表；热路径单行组读取替代解析缓存）
 pub fn load(data_dir: &Path) -> Vec<CustomModel> {
-    crate::store::docs::custom_models_load(&crate::store::db(data_dir)).models
+    // 热路径缓存（批次 A）：dispatch / 端点每请求读取，SQLite 读改为内存缓存命中
+    super::config_cache::get_or_load(data_dir, "custom_models", || {
+        crate::store::docs::custom_models_load(&crate::store::db(data_dir)).models
+    })
 }
 
 /// 整表保存（调用方负责校验后的最终形态落盘）
@@ -99,10 +102,15 @@ pub fn save_list(data_dir: &Path, models: Vec<CustomModel>) -> Result<(), String
             m.updated_at = now;
         }
     }
-    crate::store::docs::custom_models_save(
+    let r = crate::store::docs::custom_models_save(
         &crate::store::db(data_dir),
         &CustomModelsFile { models: list, updated_at: now },
-    )
+    );
+    if r.is_ok() {
+        // 写路径显式失效（批次 A）：配置改动即时生效
+        super::config_cache::invalidate(data_dir, "custom_models");
+    }
+    r
 }
 
 /// upsert 单条：id 为空或不存在则新增（生成 cm-<12hex> id），存在则整条覆盖。

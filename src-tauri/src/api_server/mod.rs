@@ -1,6 +1,7 @@
 pub mod api_keys;
 pub mod api_logger;
 pub mod auth;
+pub mod config_cache;
 pub mod custom_models;
 pub mod custom_route;
 pub mod dispatch;
@@ -90,8 +91,11 @@ pub struct ApiSharedState {
     pub logger: ApiLogger,
     /// Debug 模式：开启后记录完整请求/响应到 API 日志
     pub debug_enabled: std::sync::atomic::AtomicBool,
-    /// 用量统计（内存累积，每次请求后落盘）
+    /// 用量统计（内存累积；落盘由持久化 flusher 削峰，网关性能批次 C）
     pub usage: Mutex<usage::UsageFile>,
+    /// 用量待落盘脏队列（批次 C）：记账只记内存 + 标记 (桶, 日)，
+    /// 后台 flusher（2s）与 stop 时统一落盘，消除每请求一次 SQLite 写事务
+    pub usage_dirty: Mutex<Vec<(usage::UsageBucket, String)>>,
     /// WB 上游健康探针（F-34 ④/§2.2 频控）：最近探测 Unix 毫秒；-1 = 尚未探测
     pub wb_probe_ts_ms: std::sync::atomic::AtomicI64,
     /// WB 上游健康探针结果：-1 未探测 / 0 不可达 / 1 在线
@@ -150,12 +154,14 @@ impl ApiSharedState {
             is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
             completion_tokens, ttfb_ms,
         );
-        // P7：仅持久化被写入的当日一行（原整表重写，写放大随历史天数线性增长）
+        // 批次 C 削峰：只记内存 + 标脏，SQLite 落盘由 flusher（2s）/stop 时统一执行
         let bucket = if is_wb { usage::UsageBucket::Wb } else { usage::UsageBucket::Trae };
         let day = usage::today_key();
-        if let Some(stats) = guard.day_stats(bucket, &day) {
-            usage::save_day(&self.data_dir, bucket, &day, stats);
-        }
+        drop(guard);
+        self.usage_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((bucket, day));
     }
 
     /// 记录一次自定义模型请求用量（独立 custom_days 桶，与 Trae/WB 侧分账）；
@@ -179,11 +185,63 @@ impl ApiSharedState {
             usage::UsageBucket::Custom,
             model, "custom", key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
         );
-        // P7：仅持久化被写入的当日一行
+        // 批次 C 削峰：同 record_usage_ttfb，仅标脏不落盘
         let day = usage::today_key();
-        if let Some(stats) = guard.day_stats(usage::UsageBucket::Custom, &day) {
-            usage::save_day(&self.data_dir, usage::UsageBucket::Custom, &day, stats);
+        drop(guard);
+        self.usage_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((usage::UsageBucket::Custom, day));
+    }
+
+    /// 排空用量脏队列并落盘（flusher 线程 2s 一次 + stop 时调用）。
+    /// 按 (bucket, day) 去重后每桶只写一次 SQLite 事务；锁内只克隆快照，
+    /// SQLite 写在锁外执行，避免拖住记账路径
+    pub fn flush_usage_dirty(&self) {
+        let dirty: std::collections::HashSet<(usage::UsageBucket, String)> = {
+            let mut q = self
+                .usage_dirty
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *q).into_iter().collect()
+        };
+        if dirty.is_empty() {
+            return;
         }
+        let snap: Vec<(usage::UsageBucket, String, usage::DayStats)> = {
+            let guard = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+            dirty
+                .into_iter()
+                .map(|(b, d)| {
+                    let stats = guard.day_stats(b, &d).cloned().unwrap_or_default();
+                    (b, d, stats)
+                })
+                .collect()
+        };
+        let mut failed: Vec<(usage::UsageBucket, String)> = Vec::new();
+        for (bucket, day, stats) in snap {
+            if !usage::save_day(&self.data_dir, bucket, &day, &stats) {
+                failed.push((bucket, day));
+            }
+        }
+        if !failed.is_empty() {
+            // 落盘失败：恢复脏标记由 flusher 下轮重试（R3），不静默丢当批数据
+            self.usage_dirty
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(failed);
+            self.logger.log_debug_line(
+                "[WARN] 用量落盘失败（已恢复脏标记待重试）".to_string(),
+            );
+        }
+    }
+
+    /// 全量持久化收尾（服务 stop / 应用退出时调用）：
+    /// 用量脏队列 + api_keys 计数 + API 日志队列一次性排空
+    pub fn flush_pending_writes(&self) {
+        self.flush_usage_dirty();
+        api_keys::flush_dirty(&self.data_dir);
+        self.logger.flush();
     }
 }
 
@@ -380,6 +438,26 @@ pub fn streaming_agent() -> ureq::Agent {
         .build()
 }
 
+/// 流式转发专用阻塞线程池（网关性能批次 D-1，线程隔离）：
+/// 每条流（含 F-76 对冲请求）独占一个阻塞线程直至流结束（读空闲上限 300s）。
+/// 若与鉴权中间件 / 短 IO 共用主 runtime 的 spawn_blocking 池（默认上限 512），
+/// 并发流可将其耗尽，导致鉴权排队、整个网关级联卡死。
+///
+/// 本池独立于 Tauri 主 runtime：长流占满本池（上限 256）时，主池的
+/// 鉴权 / /v1/models / 用量快照等短阻塞任务不受影响。池内闭包中的
+/// `tokio::spawn`（keep-alive tick 等）调度到本 runtime 的 async worker。
+pub fn stream_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(256)
+            .enable_all()
+            .build()
+            .expect("stream runtime 初始化失败")
+    })
+}
+
 #[cfg(test)]
 mod inflight_tests {
     use super::*;
@@ -441,6 +519,7 @@ mod inflight_tests {
             logger: ApiLogger::new(dir.join("logs")),
             debug_enabled: std::sync::atomic::AtomicBool::new(false),
             usage: Mutex::new(usage::UsageFile::default()),
+            usage_dirty: Mutex::new(Vec::new()),
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
         };

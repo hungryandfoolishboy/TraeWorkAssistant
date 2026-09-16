@@ -37,7 +37,12 @@ fn route_config_get_at(data_dir: &std::path::Path) -> Result<Value, String> {
 fn route_config_set_at(data_dir: &std::path::Path, config: &Value) -> Result<(), String> {
     validate_route_config(config)?;
     // SQLite 化（P2）：data/wb_model_route.json → kv `wb_model_route`（写后网关热路径立即生效）
-    crate::store::db(data_dir).kv_set("wb_model_route", config)
+    let r = crate::store::db(data_dir).kv_set("wb_model_route", config);
+    if r.is_ok() {
+        // 写路径显式失效（批次 A）：路由配置改动即时生效
+        crate::api_server::config_cache::invalidate(data_dir, "wb_model_route");
+    }
+    r
 }
 
 /// 结构校验：形状必须与 wb_model_route::load_config 的反序列化（WbRouteFile）

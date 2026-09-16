@@ -984,7 +984,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         });
     }
 
-    tokio::task::spawn_blocking(move || {
+    // 批次 D-1 线程隔离：流任务迁入专用阻塞池，长流不再占用主 runtime 的
+    // spawn_blocking 池（鉴权/短 IO 依赖它），防并发流耗尽池导致网关级联卡死
+    super::stream_runtime().spawn_blocking(move || {
         // inflight guard 随后台任务存续至流结束（§4.5：客户端断连/流终止由
         // 任务结束 Drop 兜底释放）；F-77 取号后绑定账号级计数
         let mut guard = guard;
@@ -1199,10 +1201,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 "NO_HEALTHY_ACCOUNT [{:02}:{:02}:{:02}] tried={} pool={} reasons=[{}]",
                 h, m, s, tried.len(), diag.len(), diag_summary.join(", "),
             );
-            if let Some(mut f) = state.logger.get_writer() {
-                use std::io::Write;
-                let _ = writeln!(f, "[DEBUG] {}", diag_line);
-            }
+            state.logger.log_debug_line(format!("[DEBUG] {diag_line}"));
         }
         match proto {
             Protocol::OpenAi | Protocol::OpenAiText => {
@@ -1419,14 +1418,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         );
         // 写入诊断日志
         {
-            if let Some(mut f) = state.logger.get_writer() {
-                use std::io::Write;
-                let _ = writeln!(
-                    f,
-                    "[DEBUG] NO_HEALTHY_ACCOUNT(non-stream) tried={} pool={} reasons=[{}]",
-                    tried.len(), diag.len(), diag_summary.join(", "),
-                );
-            }
+            state.logger.log_debug_line(format!(
+                "[DEBUG] NO_HEALTHY_ACCOUNT(non-stream) tried={} pool={} reasons=[{}]",
+                tried.len(), diag.len(), diag_summary.join(", "),
+            ));
         }
         Err(AggregateFail::NoHealthy("no healthy account available".to_string()))
     })

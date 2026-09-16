@@ -71,7 +71,10 @@ impl RouteResult {
 /// SQLite 化（P2）：data/wb_model_route.json → kv `wb_model_route`（热路径单行读取）；
 /// 旧根路径兼容由启动迁移器完成。
 pub fn load_config(data_dir: &Path) -> WbRouteFile {
-    crate::store::db(data_dir).kv_get("wb_model_route")
+    // 热路径缓存（批次 A）：resolve_target 每请求读取
+    super::config_cache::get_or_load(data_dir, "wb_model_route", || {
+        crate::store::db(data_dir).kv_get("wb_model_route")
+    })
 }
 
 /// 内置系列通配（③）：知名闭源模型族 → 目录代表模型。
@@ -484,12 +487,14 @@ mod tests {
         crate::store::db(&dir)
             .kv_set("wb_model_route", &json!({"aliases": {"gpt-4o": "glm-5.3"}}))
             .unwrap();
+        super::super::config_cache::invalidate(&dir, "wb_model_route");
         let cfg = load_config(&dir);
         assert_eq!(cfg.aliases.get("gpt-4o").map(String::as_str), Some("glm-5.3"));
         // 覆盖写入生效
         crate::store::db(&dir)
             .kv_set("wb_model_route", &json!({"aliases": {"claude-x": "hy4"}}))
             .unwrap();
+        super::super::config_cache::invalidate(&dir, "wb_model_route");
         let cfg = load_config(&dir);
         assert!(cfg.aliases.contains_key("claude-x"));
         assert!(!cfg.aliases.contains_key("gpt-4o"));

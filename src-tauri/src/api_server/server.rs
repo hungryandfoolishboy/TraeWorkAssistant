@@ -68,6 +68,7 @@ pub async fn start_api_server(
 
     let app = build_router(state.clone());
     spawn_wb_health_probe(state.clone());
+    spawn_persistence_flusher(state.clone());
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -84,6 +85,24 @@ pub async fn start_api_server(
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join_handle),
     })
+}
+
+/// 持久化 flusher（网关性能批次 C/E）：每 2s 排空用量脏队列与 api_keys 计数脏副本。
+/// 持 Weak 引用：服务停止、共享状态被释放后线程自动退出（重启服务重建新线程），
+/// 避免重启循环泄漏线程。stop / 应用退出时另有一次性 flush_pending_writes 兜底。
+fn spawn_persistence_flusher(state: Arc<ApiSharedState>) {
+    let weak = Arc::downgrade(&state);
+    drop(state);
+    let _ = std::thread::Builder::new()
+        .name("api-persist-flush".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let Some(state) = weak.upgrade() else {
+                return; // ApiSharedState 已释放（服务停止且运行时句柄移除）
+            };
+            state.flush_usage_dirty();
+            crate::api_server::api_keys::flush_dirty(&state.data_dir);
+        });
 }
 
 fn build_router(state: Arc<ApiSharedState>) -> Router {

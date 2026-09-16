@@ -583,6 +583,8 @@ fn main() {
                 let state = app_handle.state::<AppState>();
                 fs_utils::app_log(&state.data_dir, "应用退出：正在停止 API 服务");
                 rt.handle.stop();
+                // 批次 C/E：退出前排空用量脏队列、api_keys 计数与日志队列
+                rt.shared.flush_pending_writes();
             }
             // 还原系统代理（#14）：仅当「我们曾接管系统代理」时才还原——
             // 有用户 VPN 原值则原样还原（原 clear_win_proxy 会把用户梯子一并清掉）；
