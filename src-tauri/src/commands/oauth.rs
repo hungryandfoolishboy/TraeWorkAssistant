@@ -517,6 +517,25 @@ pub fn oauth_parse_callback(
 /// DeviceID/PlatformCode）；响应同时含 access_token 与 refresh_token 才算成功，
 /// 失败时输出响应键路径（脱敏，不含值）供下一步校准。
 fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: &std::path::Path) -> Result<(String, String), String> {
+    // 交换协议排查期全量打印（脱敏：token/secret/authcode 类字段值打码，其余完整）；
+    // 协议固化后移除
+    let req_payload = ureq::json!({
+        "ClientID": oauth_client().client_id,
+        "Code": code,
+        "CodeVerifier": verifier.unwrap_or(""),
+        "ClientSecret": oauth_client().client_secret,
+        "DeviceID": device_id,
+        "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
+        "UserID": ""
+    });
+    {
+        let mut masked = req_payload.clone();
+        mask_sensitive(&mut masked);
+        fs_utils::app_log(
+            data_dir,
+            &format!("[OAuth交换-请求] {masked}"),
+        );
+    }
     let resp = match exchange_agent()?
         .post(&oauth_client().exchange_url)
         .set("content-type", "application/json")
@@ -526,15 +545,7 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
         .set("x-device-id", device_id)
         .set("x-app-id", OAUTH_APP_ID)
         .set("x-platform-code", OAUTH_PAGE_PLATFORM_CODE)
-        .send_json(ureq::json!({
-            "ClientID": oauth_client().client_id,
-            "Code": code,
-            "CodeVerifier": verifier.unwrap_or(""),
-            "ClientSecret": oauth_client().client_secret,
-            "DeviceID": device_id,
-            "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
-            "UserID": ""
-        }))
+        .send_json(req_payload)
     {
         Ok(r) => r,
         // 4xx/5xx：ureq 返回 Error::Status 且响应体仍可读——保留用于诊断
@@ -547,6 +558,11 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
         Ok(v) => v,
         Err(e) => return Err(format!("解析响应失败: {e}")),
     };
+    {
+        let mut masked = body.clone();
+        mask_sensitive(&mut masked);
+        fs_utils::app_log(data_dir, &format!("[OAuth交换-响应] {masked}"));
+    }
 
     // 响应形态（2026-09-16 实测键路径固化）：火山引擎标准信封——
     // 错误：ResponseMetadata.Error.{Code,Message,StandardCode,Data}；
@@ -585,6 +601,7 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
             if err_msg.is_empty() { "未知错误" } else { &err_msg }
         ));
     }
+    // 兼容旧解析（顶层 code/message 形态）
     // 兼容旧解析（顶层 code/message 形态）
     let code_val = body.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
     if code_val != 0 {
@@ -636,9 +653,48 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
     Ok((access_token, refresh_token))
 }
 
-/// 在 JSON 树中递归查找指定键（大小写不敏感）的首个非空字符串值（仅取值，不落日志）
-fn find_token_value(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+/// 脱敏红线（仅打码值不删结构）：键名含 token/jwt/secret/password/authcode/code/credential
+/// 的字符串值替换为「前6位…(长度N)」——错误码为数字不受影响，诊断信息完整保留
+fn mask_sensitive(v: &mut serde_json::Value) {
+    const SENSITIVE: &[&str] = &[
+        "token", "jwt", "secret", "password", "authcode", "credential", "verifier", "code",
+    ];
+    fn is_sensitive_key(k: &str) -> bool {
+        let kl = k.to_ascii_lowercase();
+        SENSITIVE.iter().any(|s| kl.contains(s))
+    }
+    fn mask_str(s: &str) -> String {
+        let head: String = s.chars().take(6).collect();
+        format!("{head}…(len={})", s.chars().count())
+    }
     match v {
+        serde_json::Value::Object(m) => {
+            for (k, val) in m.iter_mut() {
+                if is_sensitive_key(k) {
+                    if let Some(s) = val.as_str() {
+                        if !s.is_empty() {
+                            *val = serde_json::Value::String(mask_str(s));
+                            continue;
+                        }
+                    }
+                    if val.is_object() || val.is_array() {
+                        continue; // Error.Code 等嵌套结构另走递归（数字 code 不打码）
+                    }
+                }
+                mask_sensitive(val);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for x in a.iter_mut() {
+                mask_sensitive(x);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 在 JSON 树中递归查找指定键（大小写不敏感）的首个非空字符串值（仅取值，不落日志）
+fn find_token_value(v: &serde_json::Value, keys: &[&str]) -> Option<String> {    match v {
         serde_json::Value::Object(m) => {
             // 精确匹配优先，其次大小写不敏感
             for k in keys {
