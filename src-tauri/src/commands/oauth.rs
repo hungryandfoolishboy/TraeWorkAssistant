@@ -21,6 +21,8 @@ static LAST_OAUTH_STATE: Mutex<Option<PendingLogin>> = Mutex::new(None);
 /// 停留在 billing status 后无后续，不回跳）。conf/oauth_client.json 可覆盖。
 const OAUTH_CLIENT_ID: &str = "ono9krqynydwx5";
 const OAUTH_CLIENT_SECRET: &str = "-";
+/// 客户端应用 id（tech-framework §6.2：云 IDE API 附带 X-App-Id 头；旧登录 URL 曾用）
+const OAUTH_APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
 /// 真实 IDE 页面参数快照（抓包 2026-09-16）：授权页据此进入 native_ide 原生授权
 /// 流程（前端调 GetPCAuthCode 后 302 回 auth_callback_url）
 const OAUTH_PAGE_PLUGIN_VERSION: &str = "2.3.83560";
@@ -515,10 +517,15 @@ pub fn oauth_parse_callback(
 /// DeviceID/PlatformCode）；响应同时含 access_token 与 refresh_token 才算成功，
 /// 失败时输出响应键路径（脱敏，不含值）供下一步校准。
 fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: &std::path::Path) -> Result<(String, String), String> {
-    let resp = exchange_agent()?
+    let resp = match exchange_agent()?
         .post(&oauth_client().exchange_url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
+        // 设备头（F-70 情报：ExchangeToken 专属错误码 20403=Device not match /
+        // 20405=Device proof required → 交换与设备绑定强相关，请求须携带设备标识）
+        .set("x-device-id", device_id)
+        .set("x-app-id", OAUTH_APP_ID)
+        .set("x-platform-code", OAUTH_PAGE_PLATFORM_CODE)
         .send_json(ureq::json!({
             "ClientID": oauth_client().client_id,
             "Code": code,
@@ -528,27 +535,35 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
             "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
             "UserID": ""
         }))
-        .map_err(|e| format!("ExchangeToken 请求失败: {}", e))?;
+    {
+        Ok(r) => r,
+        // 4xx/5xx：ureq 返回 Error::Status 且响应体仍可读——保留用于诊断
+        //（2026-09-16 实测 400：此前 Err 分支丢弃 body，导致拿不到拒绝原因）
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => return Err(format!("ExchangeToken 请求失败: {e}")),
+    };
 
-    let body: serde_json::Value =
-        resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
+    let body: serde_json::Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(e) => return Err(format!("解析响应失败: {e}")),
+    };
 
     let code_val = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code_val != 0 {
-        // 诊断（脱敏）：输出响应键路径，便于校准交换端点的真实响应结构
+        // 诊断（脱敏）：输出响应键路径 + 服务端 message，便于校准交换请求形态
         let mut paths = Vec::new();
         collect_key_paths_public(&body, &mut paths);
-        fs_utils::app_log(
-            data_dir,
-            &format!(
-                "OAuth AuthCode 交换失败 (code={code_val}): 响应键路径: {}",
-                paths.join(" | ")
-            ),
-        );
         let msg = body
             .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("未知错误");
+        fs_utils::app_log(
+            data_dir,
+            &format!(
+                "OAuth AuthCode 交换失败 (code={code_val}): message={msg} 响应键路径: {}",
+                paths.join(" | ")
+            ),
+        );
         return Err(format!("ExchangeToken 失败 (code={}): {}", code_val, msg));
     }
 
