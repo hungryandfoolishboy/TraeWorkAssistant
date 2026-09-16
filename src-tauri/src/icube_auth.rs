@@ -6,9 +6,10 @@
 //! 交叉验证）：tc 信封的 pepper 是随安装包分发的公开常量表（混淆非加密），
 //! 解密属读本机自有凭证，符合零凭证外泄红线——私钥只在内存流转，不落盘不进日志。
 //!
-//! DeviceProof（ExchangeToken 20405 实测要求）：ECDSA P-256 + SHA-256，DER 编码
-//! base64，签名原文 5 个 `\n` 连接：`POST\n<path>\n<ClientID>\n<AuthCode>\n<Ts>\n<Nonce>`，
-//! 字段必须 PascalCase（Signature/Timestamp/Nonce）。
+//! DeviceProof（ExchangeToken 20405 实测要求）：ECDSA P-256 + SHA-256，签名原文
+//! 5 个 `\n` 连接：`POST\n<path>\n<ClientID>\n<AuthCode>\n<Ts>\n<Nonce>`，
+//! 字段必须 PascalCase（Signature/Timestamp/Nonce），Timestamp 必须为 JSON int；
+//! 签名编码 P1363 r||s 64B（WebCrypto 标准输出）优先，DER 实测被拒保留对照。
 
 use base64::Engine as _;
 use sha2::Digest as _;
@@ -95,10 +96,14 @@ pub fn tc_decrypt(b64: &str, private_mode: bool) -> Result<String, String> {
 }
 
 /// 设备凭证：deviceId（数字串，与 storage.json 键内嵌一致）+ EC P-256 私钥 PEM
+/// + machineId（同 storage.json telemetry.machineId，DeviceInfo 构造用）
+/// + appVersion（安装目录 package.json version，DeviceInfo.ClientVersion 用）
 #[derive(Clone, Debug)]
 pub struct DeviceCredential {
     pub device_id: String,
     pub private_key_pem: String,
+    pub machine_id: String,
+    pub app_version: String,
     /// 来源客户端（Trae CN / TRAE SOLO CN 等），诊断日志用
     #[allow(dead_code)]
     pub source_app: String,
@@ -108,6 +113,9 @@ pub struct DeviceCredential {
 /// 找不到/解密失败返回空表——DeviceProof 不可用时调用方回落无 proof 变体。
 pub fn extract_device_credentials() -> Vec<DeviceCredential> {
     let Some(appdata) = std::env::var("APPDATA").ok() else {
+        return Vec::new();
+    };
+    let Some(localappdata) = std::env::var("LOCALAPPDATA").ok() else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -124,6 +132,25 @@ pub fn extract_device_credentials() -> Vec<DeviceCredential> {
             continue;
         };
         let Some(obj) = v.as_object() else { continue };
+        // DeviceInfo.ClientVersion 用：安装目录 package.json 的 version（真实客户端
+        // 上报的是 appVersion，与服务端对设备注册记录的校验相关）
+        let app_version = std::fs::read_to_string(
+            std::path::PathBuf::from(&localappdata)
+                .join("Programs")
+                .join(app)
+                .join("resources")
+                .join("app")
+                .join("package.json"),
+        )
+        .ok()
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+        .and_then(|p| p.get("version").and_then(|x| x.as_str()).map(String::from))
+        .unwrap_or_default();
+        let machine_id = obj
+            .get("telemetry.machineId")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
         for (k, val) in obj {
             let Some(id) = k.strip_prefix("iCubeAuthInfo://icube-dc:") else {
                 continue;
@@ -140,6 +167,8 @@ pub fn extract_device_credentials() -> Vec<DeviceCredential> {
                             out.push(DeviceCredential {
                                 device_id: id.to_string(),
                                 private_key_pem: pem.to_string(),
+                                machine_id: machine_id.clone(),
+                                app_version: app_version.clone(),
                                 source_app: app.to_string(),
                             });
                         }
@@ -152,13 +181,54 @@ pub fn extract_device_credentials() -> Vec<DeviceCredential> {
     out
 }
 
-/// 生成 DeviceProof JSON（PascalCase 字段，20405 实测小写会被拒）：
+/// 从设备私钥推导 SPKI PEM 公钥（DeviceInfo.DevicePublicKey 用，不落盘）
+pub fn device_public_key_pem(cred: &DeviceCredential) -> Result<String, String> {
+    use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
+    let signing = p256::ecdsa::SigningKey::from_pkcs8_pem(&cred.private_key_pem)
+        .map_err(|e| format!("设备私钥解析失败: {e}"))?;
+    let verifying = signing.verifying_key();
+    let pub_der = verifying
+        .to_public_key_der()
+        .map_err(|e| format!("公钥 SPKI 编码失败: {e}"))?;
+    let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(pub_der.as_bytes());
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        pem.push('\n');
+    }
+    pem.push_str("-----END PUBLIC KEY-----");
+    Ok(pem)
+}
+
+/// 生成 DeviceProof JSON（PascalCase 字段，20405 实测小写会被拒；
+/// Timestamp 必须为 JSON int，字符串会被服务端 schema 拒绝）：
 /// 签名原文 = POST\n<path>\n<ClientID>\n<AuthCode>\n<Timestamp>\n<Nonce>
+///
+/// 签名编码格式（2026-09-16 实测排查）：
+/// - P1363：raw r||s 固定 64 字节——WebCrypto（Electron 客户端 JS 侧）标准输出，
+///   ring 参照实现（cockpit-tools）同为此格式，为首选
+/// - Der：ASN.1 SEQUENCE（~70-72B）——早期逆向结论，实测报 20405 被拒，保留作对照探测
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProofSigFormat {
+    P1363,
+    Der,
+}
+
+impl ProofSigFormat {
+    pub fn suffix(self) -> &'static str {
+        match self {
+            ProofSigFormat::P1363 => "/P1363",
+            ProofSigFormat::Der => "/DER",
+        }
+    }
+}
+
 pub fn device_proof(
     cred: &DeviceCredential,
     sign_path: &str,
     client_id: &str,
     auth_code: &str,
+    format: ProofSigFormat,
 ) -> Result<serde_json::Value, String> {
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
@@ -173,10 +243,14 @@ pub fn device_proof(
     let nonce = crate::commands::oauth::random_hex(32);
     let msg = format!("POST\n{sign_path}\n{client_id}\n{auth_code}\n{ts}\n{nonce}");
     let sig: Signature = signing.sign(msg.as_bytes());
-    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_der());
+    let sig_b64 = match format {
+        // r||s 固定 64 字节（P1363/WebCrypto/ring 兼容）
+        ProofSigFormat::P1363 => base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
+        ProofSigFormat::Der => base64::engine::general_purpose::STANDARD.encode(sig.to_der()),
+    };
     Ok(serde_json::json!({
         "Signature": sig_b64,
-        "Timestamp": ts.to_string(),
+        "Timestamp": ts,
         "Nonce": nonce,
     }))
 }

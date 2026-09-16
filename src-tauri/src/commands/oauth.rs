@@ -496,7 +496,12 @@ pub fn oauth_parse_callback(
                 .as_ref()
                 .map(|p| p.pkce_verifier.clone());
             let device_id = load_or_create_oauth_device(&state).device_id;
-            match exchange_code(&code, verifier.as_deref(), &device_id, &state.data_dir) {
+            // host：授权页回传的 API 域（main.js 逆向：交换 URL = ${host}/trae/api/v3/oauth/ExchangeToken）
+            let host = params
+                .get("host")
+                .cloned()
+                .unwrap_or_else(|| "https://api.trae.com.cn".into());
+            match exchange_code(&code, verifier.as_deref(), &device_id, &host, &state.data_dir) {
                 Ok((at, rt)) => {
                     access_token = Some(at);
                     rt
@@ -519,62 +524,94 @@ pub fn oauth_parse_callback(
     })
 }
 
-/// 用 AuthCode 交换 token（抓包固化 2026-09-16：授权页 GetPCAuthCode 签发的
-/// AuthCode 绑定 PKCE challenge，交换请求须带对应 CodeVerifier）。
-/// 交换协议排查期：ExchangeToken{Code,CodeVerifier,ClientSecret,UserID} 形态实测
-/// 报 10101「无效参数」（040004）→ 请求体存在服务端不认可的字段。改为变体自动探测链：
-/// 一次登录轮内依次尝试 4 种最可能形态（字段名 AuthCode/Code × 端点 ExchangeToken/
-/// GetToken，均对齐 GetPCAuthCode 实证请求形态——无 ClientSecret/UserID），任一成功
-/// 即止；全部失败时每个变体的错误码都记入 app.log。协议固化后收敛为单形态。
-fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: &std::path::Path) -> Result<(String, String), String> {
+/// 用 AuthCode 交换 token。
+/// 协议形态（2026-09-16 Trae CN main.js 逆向固化）：
+/// - 端点：`${host}/trae/api/v3/oauth/ExchangeToken`（host 为授权页回传的 API 域）
+/// - 请求体：{ClientID, AuthCode, CodeVerifier, DeviceInfo{...含 DevicePublicKey}, IDEVersion}
+///   ——AuthCode 场景**不发 DeviceProof**（那是 refreshToken 刷新场景专属），
+///   设备身份通过 DeviceInfo（DeviceID+DevicePublicKey）声明
+/// - 请求头：仅 Content-Type + x-cloudide-token: ""（空串；真实客户端 m() 方法原样）
+/// - 响应：Result.Token / Result.RefreshToken
+/// 保留旧形态变体作兜底探测（协议固化验证后移除）。
+fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str, data_dir: &std::path::Path) -> Result<(String, String), String> {
     let client_id = oauth_client().client_id.clone();
     let code_v = code.to_string();
     let verifier_v = verifier.unwrap_or("").to_string();
     let device_v = device_id.to_string();
 
-    // DeviceProof（20405 Device proof required 实测）：优先用本机 Trae 客户端的
-    // EC P-256 设备私钥签名（私钥与 icube-dc deviceId 绑定，DeviceID 一并用它）
-    let mut variants: Vec<(&'static str, String, serde_json::Value, bool)> = Vec::new();
+    let mut variants: Vec<(String, String, serde_json::Value, bool)> = Vec::new();
+
+    // 主变体（真实客户端形态）：DeviceInfo 对象 + IDEVersion，无 DeviceProof
+    if let Some(cred) = icube_device_creds().first() {
+        let pub_pem = crate::icube_auth::device_public_key_pem(cred)
+            .unwrap_or_default();
+        let url = format!("{}/trae/api/v3/oauth/ExchangeToken", host.trim_end_matches('/'));
+        variants.push((
+            "ExchangeToken/DeviceInfo".into(),
+            url,
+            ureq::json!({
+                "ClientID": client_id,
+                "AuthCode": code_v,
+                "CodeVerifier": verifier_v,
+                "DeviceInfo": {
+                    "DeviceID": cred.device_id,
+                    "MachineID": cred.machine_id,
+                    "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
+                    "DeviceType": "PC",
+                    "DeviceName": "",
+                    "DeviceModel": "",
+                    "ClientVersion": cred.app_version,
+                    "DevicePublicKey": pub_pem,
+                    "DeviceBrand": "",
+                    "DeviceCPU": "",
+                    "OSInfo": "",
+                    "OSVersion": "",
+                },
+                "IDEVersion": cred.app_version,
+            }),
+            // 真实客户端 m("") 头形态：x-cloudide-token 必须带空串（F-70 实测缺失报 20403）
+            true,
+        ));
+    }
+
+    // 兜底：旧形态探测变体（DeviceProof 是 refreshToken 刷新场景的结构，AuthCode
+    // 场景按逆向结论不应携带；保留以验证逆向结论，全部失败时错误码进 app.log）
     if let Some(cred) = icube_device_creds().first() {
         let proof_path_com = "/cloudide/api/v3/trae/oauth/ExchangeToken";
-        let proof_path_cn = "/trae/api/v3/oauth/ExchangeToken";
-        if let Ok(proof) = crate::icube_auth::device_proof(cred, proof_path_com, &client_id, code) {
-            variants.push((
+        for (fmt, tag_base, url) in [
+            (
+                crate::icube_auth::ProofSigFormat::P1363,
                 "ExchangeToken/AuthCode+Proof",
                 oauth_client().exchange_url.clone(),
-                ureq::json!({
-                    "ClientID": client_id,
-                    "AuthCode": code_v,
-                    "CodeVerifier": verifier_v,
-                    "DeviceID": cred.device_id,
-                    "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
-                    "DeviceProof": proof,
-                }),
-                true,
-            ));
-        }
-        if let Ok(proof) = crate::icube_auth::device_proof(cred, proof_path_cn, &client_id, code) {
-            variants.push((
-                "TraeCnExchangeToken/AuthCode+Proof",
-                "https://api.trae.cn/trae/api/v3/oauth/ExchangeToken".into(),
-                ureq::json!({
-                    "ClientID": client_id,
-                    "AuthCode": code_v,
-                    "CodeVerifier": verifier_v,
-                    "DeviceID": cred.device_id,
-                    "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
-                    "DeviceProof": proof,
-                }),
-                true,
-            ));
+            ),
+            (
+                crate::icube_auth::ProofSigFormat::Der,
+                "ExchangeToken/AuthCode+Proof",
+                oauth_client().exchange_url.clone(),
+            ),
+        ] {
+            if let Ok(proof) = crate::icube_auth::device_proof(cred, proof_path_com, &client_id, code, fmt) {
+                variants.push((
+                    format!("{}{}", tag_base, fmt.suffix()),
+                    url.clone(),
+                    ureq::json!({
+                        "ClientID": client_id,
+                        "AuthCode": code_v,
+                        "CodeVerifier": verifier_v,
+                        "DeviceID": cred.device_id,
+                        "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
+                        "DeviceProof": proof,
+                    }),
+                    true,
+                ));
+            }
         }
     }
 
-    // 无 proof 兜底变体（2026-09-16 实测：AuthCode 形态报 20405 → 有 proof 后预期命中；
-    // Code 形态报 10101 无效参数保留作对照）
-    let mk = |tag: &'static str, auth_key: &'static str, url: String| {
+    // 无 proof 兜底变体（旧形态对照）
+    let mk = |tag: &str, auth_key: &str, url: String| {
         (
-            tag,
+            tag.to_string(),
             url,
             ureq::json!({
                 "ClientID": client_id,
