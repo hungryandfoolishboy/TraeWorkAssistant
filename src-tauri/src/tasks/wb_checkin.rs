@@ -264,11 +264,14 @@ fn checkin_status(
 }
 
 /// 执行签到。返回 (kind, message, reward)：success / already / fail（auth 由调用方刷新重试）
+/// 签到执行。返回 (kind, message, reward, dbg_keys)：
+/// success / already / fail（auth 由调用方刷新重试）；dbg_keys = 成功但奖励未识别时
+/// 的响应键路径（仅键名不含值，供 app.log 诊断校准，见 process_account）
 fn checkin_do(
     agent: &ureq::Agent,
     headers: &[(String, String)],
     urls: &Urls,
-) -> (String, String, Option<f64>) {
+) -> (String, String, Option<f64>, Option<String>) {
     let (mut status, mut body, mut raw) =
         wb_common::post_json_raw(agent, &urls.checkin_do, headers, &json!({}));
     if status == 0 {
@@ -282,7 +285,7 @@ fn checkin_do(
         }
     }
     if status == 401 {
-        return ("auth".into(), "登录态失效（401）".into(), None);
+        return ("auth".into(), "登录态失效（401）".into(), None, None);
     }
     let code: Option<i64> = body
         .as_ref()
@@ -295,7 +298,7 @@ fn checkin_do(
         .map(|v| s_of(Some(v)));
     if status == 0 {
         let head: String = raw.chars().take(120).collect();
-        return ("fail".into(), format!("网络不可达: {head}"), None);
+        return ("fail".into(), format!("网络不可达: {head}"), None, None);
     }
     if (200..=201).contains(&status) || code.is_some_and(|c| c == 0 || c == 200) {
         // 奖励数额以接口返回为准，不硬编码（F-17）；精确键未命中走递归深挖，
@@ -310,14 +313,24 @@ fn checkin_do(
             ))
             .or_else(|| deep_reward_dig(b, 0))
         });
-        return ("success".into(), "签到成功".into(), reward);
+        // 奖励未识别时收集响应键路径（不含值）供诊断校准
+        let dbg_keys = if reward.is_none() {
+            body.as_ref().map(|b| {
+                let mut paths = Vec::new();
+                collect_key_paths(b, "", 0, &mut paths);
+                paths.join(" | ")
+            })
+        } else {
+            None
+        };
+        return ("success".into(), "签到成功".into(), reward, dbg_keys);
     }
     // 已签容错（F-15）：code:10001 / message 含「已签到」/「repeat」
     let msg_low = message.as_deref().unwrap_or("").to_ascii_lowercase();
     if code == Some(10001)
         || ["已签到", "repeat", "already"].iter().any(|k| msg_low.contains(k))
     {
-        return ("already".into(), "今日已签到".into(), None);
+        return ("already".into(), "今日已签到".into(), None, None);
     }
     let head: String = raw.chars().take(120).collect();
     let shown = message
@@ -327,7 +340,30 @@ fn checkin_do(
         "fail".into(),
         format!("{shown}（code={}）", code.map(|c| c.to_string()).unwrap_or_else(|| "None".into())),
         None,
+        None,
     )
+}
+
+/// 收集 JSON 键路径（深度/数量受限；只采集键名不采集值——诊断用，避免敏感信息入日志）
+fn collect_key_paths(v: &Value, prefix: &str, depth: usize, out: &mut Vec<String>) {
+    if depth > 6 || out.len() >= 40 {
+        return;
+    }
+    match v {
+        Value::Object(m) => {
+            for (k, val) in m {
+                let p = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                out.push(p.clone());
+                collect_key_paths(val, &p, depth + 1, out);
+            }
+        }
+        Value::Array(a) => {
+            for (i, x) in a.iter().enumerate().take(3) {
+                collect_key_paths(x, &format!("{prefix}[{i}]"), depth + 1, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 查询当前通用积分余额（get-user-resource-summary，与积分页同口径）。
@@ -461,15 +497,13 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     if ok && checked == Some(true) {
         return json!({ "user_id": aid, "name": base_ev["name"], "status": "already", "message": "今日已签到" });
     }
-    // 签到前余额（获得积分差值兜底数据源；两级：①billing meter 通用积分
-    // ②WB credits 域 WorkBuddy 积分——查询失败不阻塞签到）
+    // 签到前余额（获得积分差值兜底数据源；两级恒取：①billing meter 通用积分
+    // ②WB credits 域 WorkBuddy 积分——查询失败不阻塞签到。恒取两级的原因：
+    // billing 前值可能成功但余额恰好不变（签到加的是 WB 积分账本），差值恒 0 时
+    // 仍需 WB credits 差值兜底）
     let pre_balance = fetch_balance(agent, &headers, base);
-    let pre_wb_credits = if pre_balance.is_none() {
-        fetch_wb_credits_balance(state, &aid)
-    } else {
-        None
-    };
-    let (mut kind, mut message, mut reward) = checkin_do(agent, &headers, &urls);
+    let pre_wb_credits = fetch_wb_credits_balance(state, &aid);
+    let (mut kind, mut message, mut reward, mut dbg_keys) = checkin_do(agent, &headers, &urls);
     if kind == "auth" {
         // 401：刷新一次仅重试失败分支（禁止二次刷新，F-09）
         match wb_common::refresh_token_once(agent, &creds) {
@@ -481,6 +515,7 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                 kind = r.0;
                 message = r.1;
                 reward = r.2;
+                dbg_keys = r.3;
             }
             None => {
                 kind = "fail".into();
@@ -491,8 +526,7 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     }
     // 获得积分兜底（F-17）：接口未返回奖励数额时用签到前后余额差值；
     // 仅差值>0 才采信（防并发扣减/查询时点差造成负值误报）。
-    // 两级数据源：①billing meter（通用积分）②WB credits（WorkBuddy 积分——
-    // 签到奖励入 WB 积分账本，billing 差值恒 0 时用 credits 差值）
+    // 两级数据源都尝试：①billing meter（通用积分）②WB credits（WorkBuddy 积分）
     if kind == "success" && reward.is_none() {
         if let Some(pre) = pre_balance {
             if let Some(post) = fetch_balance(agent, &headers, base) {
@@ -501,20 +535,14 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                 }
             }
         }
-    }
-    if kind == "success" && reward.is_none() {
-        if let Some(pre) = pre_wb_credits {
-            if let Some(post) = fetch_wb_credits_balance(state, &aid) {
-                if post > pre {
-                    reward = Some(((post - pre) * 100.0).round() / 100.0);
+        if reward.is_none() {
+            if let Some(pre) = pre_wb_credits {
+                if let Some(post) = fetch_wb_credits_balance(state, &aid) {
+                    if post > pre {
+                        reward = Some(((post - pre) * 100.0).round() / 100.0);
+                    }
                 }
             }
-        } else {
-            // 两级数据源均未取到签到前余额：记录诊断（便于校准奖励键/余额端点）
-            fs_utils::app_log(
-                &state.data_dir,
-                &format!("wb 签到成功但奖励数额未确定（接口无回显且余额差值数据源不可用）: {aid}"),
-            );
         }
     }
     let status_txt = match kind.as_str() {
@@ -522,6 +550,37 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
         "already" => "already",
         _ => "fail",
     };
+    // 「已签」回填：签到奖励当日只发一次，今日早前成功记录若已捕获奖励则同步展示
+    //（用户语义：无论成功还是已签，获取积分列都应显示当日所得）
+    if status_txt == "already" && reward.is_none() {
+        let results: Value = crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        reward = results
+            .get("results")
+            .and_then(Value::as_array)
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|r| {
+                        r.get("date").and_then(Value::as_str) == Some(today.as_str())
+                            && r.get("user_id").and_then(Value::as_str) == Some(aid.as_str())
+                            && r.get("status").and_then(Value::as_str) == Some("success")
+                            && r.get("reward").and_then(Value::as_f64).is_some()
+                    })
+                    .and_then(|r| r.get("reward"))
+                    .and_then(Value::as_f64)
+            });
+    }
+    // 诊断（脱敏红线：只输出键路径不含值）：成功但三层提取（精确键/深挖/双差值）
+    // 均未命中时记录响应键路径，便于按真实结构校准奖励键
+    if kind == "success" && reward.is_none() {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "wb 签到成功但奖励数额未识别（接口回显/递归深挖/双余额差值均未命中）: {aid}，响应键路径: {}",
+                dbg_keys.as_deref().unwrap_or("（响应非 JSON）")
+            ),
+        );
+    }
     let mut ev = json!({ "user_id": aid, "name": base_ev["name"], "status": status_txt, "message": message });
     if let Some(r) = reward {
         ev["reward"] = json!(r);
