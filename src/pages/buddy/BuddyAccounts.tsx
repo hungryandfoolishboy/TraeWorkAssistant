@@ -28,6 +28,7 @@ import { listen } from '@tauri-apps/api/event';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
+import { copyText } from '../../lib/clipboard';
 import type {
   BuddyChatApp,
   ProfileInfo,
@@ -327,10 +328,9 @@ export default function BuddyAccounts() {
   // 复制 OAuth 登录链接：浏览器未自动打开 / 提示链接不完整时的手动兜底
   const copyOauthUrl = async () => {
     if (!oauthAuthUrl) return;
-    try {
-      await navigator.clipboard.writeText(oauthAuthUrl);
+    if (await copyText(oauthAuthUrl)) {
       pushToast('success', '登录链接已复制到剪贴板');
-    } catch {
+    } else {
       pushToast('error', '复制登录链接失败：请手动选中链接复制');
     }
   };

@@ -10,6 +10,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { CircleHelp, Copy, Search } from 'lucide-react';
 import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
+import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
 import type { GatewaySettings, UnifiedModel } from '../../types';
 
@@ -75,8 +76,8 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
   }'`;
     setCopied(true);
     try {
-      await navigator.clipboard.writeText(example);
-      toast('success', 'cURL 示例已复制到剪贴板');
+      if (await copyText(example)) toast('success', 'cURL 示例已复制到剪贴板');
+      else toast('error', '复制失败');
     } catch {
       toast('error', '复制失败');
     } finally {

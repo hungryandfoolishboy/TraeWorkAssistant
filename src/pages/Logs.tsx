@@ -5,6 +5,7 @@ import { EmptyState, Modal } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
+import { copyText } from '../lib/clipboard';
 import type { ProxyLogEntry } from '../types';
 
 const TYPES = [
@@ -64,10 +65,9 @@ function SystemLogsTab() {
       toast('error', '暂无代理日志可复制');
       return;
     }
-    try {
-      await navigator.clipboard.writeText(proxyLog.join('\n'));
+    if (await copyText(proxyLog.join('\n'))) {
       toast('success', '代理日志已复制');
-    } catch {
+    } else {
       toast('error', '复制失败');
     }
   };
@@ -78,10 +78,9 @@ function SystemLogsTab() {
       return;
     }
     const text = logs.map((l) => `[${l.time}] [${l.log_type}] ${l.message}`).join('\n');
-    try {
-      await navigator.clipboard.writeText(text);
+    if (await copyText(text)) {
       toast('success', '日志已复制');
-    } catch {
+    } else {
       toast('error', '复制失败');
     }
   };
@@ -275,10 +274,9 @@ function ProxyLogsTab() {
 
   const copyDetail = async () => {
     if (!detail) return;
-    try {
-      await navigator.clipboard.writeText(detail);
+    if (await copyText(detail)) {
       toast('success', '已复制到剪贴板');
-    } catch {
+    } else {
       toast('error', '复制失败');
     }
   };

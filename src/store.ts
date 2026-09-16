@@ -511,6 +511,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   refreshSettings: async () => {
     try {
       const settings = await api.misc.settingsGet();
+      // notify 归一化：旧版本/数据迁移可能存入非枚举脏值（如空串），统一收敛为
+      // 合法值，保证设置页下拉正确回显、pushToast 不再走兼容分支
+      const validNotify = ['toast', 'system', 'both', 'none'];
+      if (!validNotify.includes(settings.notify)) settings.notify = 'toast';
       set({ settings });
     } catch {
       set({ settings: defaultSettings() });
@@ -882,13 +886,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   pushToast: (kind, msg) => {
+    // 通知方式兼容：仅 'none'/'system' 有特殊语义，其余值（含历史脏数据如中文标签）
+    // 一律按应用内 toast 处理，避免非枚举值把提示静默吞掉（表现为「点了没任何反应」）
     const mode = get().settings?.notify ?? 'toast';
-    if (mode === 'none') {
-      console.debug('[notify] 已跳过（mode=none）:', kind, msg);
-      return;
-    }
-
-    if (mode === 'toast' || mode === 'both') {
+    if (mode !== 'none' && mode !== 'system') {
+      if (mode !== 'toast' && mode !== 'both') {
+        console.info('[notify] 未知通知方式，已按 toast 处理:', mode);
+      }
       const id = ++toastSeq;
       set((s) => ({ toasts: [...s.toasts, { id, kind, msg }] }));
       setTimeout(() => get().dismissToast(id), 4200);
@@ -898,7 +902,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // sendNotification v2 返回 void（fire-and-forget），用 try-catch 防御同步异常
       try {
         sendNotification({ title: APP_NAME, body: msg });
-        console.debug('[notify] 系统通知已发送:', msg);
+        console.info('[notify] 系统通知已发送:', msg);
       } catch (e) {
         console.warn('[notify] sendNotification 异常:', e);
       }

@@ -29,6 +29,7 @@ import { open, save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
+import { copyText } from '../lib/clipboard';
 import type { AccountView, DiscoveredAccount, ImportPreview } from '../types';
 import { AddAccountModal } from './accounts/AddAccountModal';
 import { CooldownBadge } from './accounts/CooldownBadge';
@@ -205,10 +206,9 @@ export default function Accounts() {
   };
 
   const copyJwt = async (jwt: string) => {
-    try {
-      await navigator.clipboard.writeText(jwt);
+    if (await copyText(jwt)) {
       toast('success', 'JWT 已复制到剪贴板');
-    } catch {
+    } else {
       toast('error', '复制失败，请手动选择文本复制');
     }
   };

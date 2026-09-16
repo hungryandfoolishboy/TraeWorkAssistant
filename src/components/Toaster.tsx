@@ -1,4 +1,4 @@
-﻿import { CheckCircle2, Info, AlertTriangle, XCircle, X } from 'lucide-react';
+import { CheckCircle2, Info, AlertTriangle, XCircle, X } from 'lucide-react';
 import { useAppStore, type ToastKind } from '../store';
 import { cn } from '../lib/cn';
 
@@ -23,7 +23,11 @@ export default function Toaster() {
   const dismiss = useAppStore((s) => s.dismissToast);
 
   return (
-    <div className="pointer-events-none fixed bottom-4 right-4 z-[60] flex w-80 flex-col gap-2">
+    <div
+      className="pointer-events-none fixed bottom-4 right-4 z-[60] flex w-80 flex-col gap-2"
+      // 内联 z-index 兜底：任意值类 z-[60] 一旦未生成，toast 会被弹窗遮罩（z-50）盖住
+      style={{ zIndex: 60 }}
+    >
       {toasts.map((t) => {
         const Icon = iconMap[t.kind];
         return (

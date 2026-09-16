@@ -7,6 +7,7 @@ import { useEffect, useState } from 'react';
 import { Copy, Globe, Save } from 'lucide-react';
 import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
+import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
 import type { GatewaySettings, UnifiedModel } from '../../types';
 
@@ -88,7 +89,7 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
   }'`;
     setCopying(true);
     try {
-      await withMinDelay(navigator.clipboard.writeText(example));
+      await withMinDelay(Promise.resolve(copyText(example)));
       toast('success', '配置示例已复制到剪贴板');
     } catch {
       toast('error', '复制失败');

@@ -6,9 +6,10 @@
  * 在子弹框打开期间屏蔽 ESC 双关（主弹窗 onClose 先于子弹框触发）。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { BarChart3, Copy, KeyRound, Plus, Power, RefreshCw, Trash2 } from 'lucide-react';
+import { BarChart3, Check, Copy, KeyRound, Plus, Power, RefreshCw, Trash2 } from 'lucide-react';
 import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
+import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
 import { maskApiKey, fmtTokens } from '../../lib/format';
 import type { ApiKeyEntry, PoolStatus, UsageDayView } from '../../types';
@@ -167,11 +168,16 @@ export default function ApiKeysManager({
     void saveKeys(apiKeys.map((k) => (k.id === id ? { ...k, daily_limit: v } : k)), '限额已更新');
   };
 
+  // 复制成功按钮级反馈（不依赖 toast，通知方式设为 none/system 时也可见）
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+
   const copyKeyValue = async (k: ApiKeyEntry) => {
-    try {
-      await navigator.clipboard.writeText(k.key);
+    const ok = await copyText(k.key);
+    if (ok) {
+      setCopiedId(k.id);
+      setTimeout(() => setCopiedId((cur) => (cur === k.id ? null : cur)), 1500);
       toast('success', 'Key 已复制到剪贴板');
-    } catch {
+    } else {
       toast('error', '复制失败');
     }
   };
@@ -389,10 +395,14 @@ export default function ApiKeysManager({
                         </button>
                         <button
                           className="btn-ghost !p-1.5"
-                          title="复制完整 Key"
+                          title={copiedId === k.id ? '已复制' : '复制完整 Key'}
                           onClick={() => void copyKeyValue(k)}
                         >
-                          <Copy size={14} />
+                          {copiedId === k.id ? (
+                            <Check size={14} className="text-emerald-500" />
+                          ) : (
+                            <Copy size={14} />
+                          )}
                         </button>
                         <button
                           className="btn-ghost !p-1.5"
