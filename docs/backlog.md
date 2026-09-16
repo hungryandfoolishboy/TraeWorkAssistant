@@ -1,7 +1,8 @@
 # 产品优化需求清单（全应用统一待办）
 
-> **文档版本**: v2.7 · 2026-09-15
+> **文档版本**: v2.8 · 2026-09-16
 > **定位**: 全项目**唯一待办依据**——所有未实施的优化与需求项均在此登记，每条含需求概述 / 实现路径 / 参考开源项目。
+> **v2.8 变更**（2026-09-16，对照 CHANGELOG 3.5.3 + 全仓代码检索完成度核查）：① **F-78 全链路完成**——批次 3 真实协议闭环（PKCE + authCodeInfo 回调 + DeviceInfo 主变体 + 端点修正 + 变体探测链，v3.5.3 九提交），原「待抓包验证项」经协议实测全部裁定；② **F-70 部分落地**——`icube_auth.rs`（tc 信封解密 + ECDSA P-256 DeviceProof）随 F-78 批次 3 交付，条目改「部分完成」，剩余账号发现直读下调至 1~2 天；③ §五排序刷新（已完成项退出）；④ 其余待办项（F-38/F-69/F-67/F-07/F-41/F-42/F-66/E-01~E-03 及远期项）经代码检索确认均未实现，状态属实。
 > **v2.7 变更**: ① **W-01（Work 积分接入网关）标记 ❌ 已排除**——Trae 积分签到调整，前提与收益均不成立；条目与 §三 专题保留作技术留档，§四新增排除行、§五排序移除；② **F-68 已完成**（`switcher/vscdb.rs` 全局键合并，恢复前抽键 → 恢复后按条目合并回写）；③ **F-74 已完成**（chatdata 三命令 `app` 参数化 + CodeBuddy 会话域 + `buddy_switch_migrate_chats` 切换编排）。
 > **v2.6 变更**: F-75 macOS 支持依赖盘点全面复审——Python/PS 全量 Rust 化、存储 SQLite 化、定时任务 Rust 原生调度器（`tasks/scheduler.rs`）落地后，原三大依赖项（PS 切换桥主工程、Python 路径中立化 M2、Job Object）整体消失，预估 6~8 周 → 3~4 周；剩余 Windows 依赖收敛为 13 个明确模块点（vault DPAPI / switcher 三模块 / 系统代理 / 证书 / MITM 绑定 / 豆包 cookie 解密 / schtasks 注册面等），详见 F-75 条目。
 > **v2.5 变更**: 文件由 `product-optimization-backlog.md` 重命名为 `backlog.md`（全仓引用同步更新）；完成度核查（对照代码实测）：F-76/F-77/F-78 已实现标记属实（hedge 竞速 / `account_concurrency_limit`+per-account inflight / `oauth_loopback`），其余待办项经代码检索确认均未实现，状态不变。
@@ -22,13 +23,13 @@
 | F-77 ✅ | 账号级并发感知调度（busy 让位 idle） | 网关 | **P1** | 2~3 天 | 已完成（2026-09-14） |
 | F-68 ✅ | Trae 项目列表/最近打开跨账号保留 | Trae 生态 | **P1** | 1~2 天 | 已完成（2026-09-15） |
 | F-74 ✅ | Buddy 切换时自动迁移会话到目标账号 | Buddy 生态 | **P2** | 2~3 天（含实测） | 已完成（2026-09-15，含 B2 CodeBuddy 会话域扩展） |
-| F-78 ✅ | Trae OAuth 授权闭环补全（回环监听 + 代理豁免 + code 交换） | Trae 生态 | **P1** | 1~2 天（批次1）/ 3~4 天（全链路） | 已完成（2026-09-14） |
+| F-78 ✅ | Trae OAuth 授权闭环补全（回环监听 + 代理豁免 + code 交换） | Trae 生态 | **P1** | 1~2 天（批次1）/ 3~4 天（全链路） | 已完成（批次 1+2 2026-09-14 / 批次 3 真实协议闭环 2026-09-16，v3.5.3） |
 | F-24-余 ✅ | 豆包会员额度端点抓包固化 | 豆包 | **P1** | 0.5~1 天（含抓包） | 已完成（2026-09-16 真机复验通过：概述页额度卡出数，正式闭环） |
 | F-38 | Trae → DSH 引导（不自研） | Trae 生态 | **P1** | ≈0（装即用） | 待开发 |
 | E-01 | 豆包对话网关（OpenAI 兼容 doubao provider） | 豆包/网关 | **P2** | 8~12 天（含 E-02） | 待开发（方案 B 已论证，含探测实验前置） |
 | E-02 | 豆包指纹嗅探持久化 + a_bogus 纯算法生成器 | 豆包 | **P2** | 并入 E-01 批次 | 待开发（E-01 前置） |
 | W-01 ❌ | Work 积分（209）接入 API 网关（多活会话编排） | Trae/网关 | — | — | 已排除（2026-09-15）：Trae 积分签到调整，前提与收益均不成立，见 §三/§四 |
-| F-70 | Trae tc 凭证直读 + ECDSA P-256 刷新情报核对 | Trae 生态 | **P2** | 2~3 天 | 待开发（情报已确认） |
+| F-70 | Trae tc 凭证直读 + ECDSA P-256 刷新情报核对 | Trae 生态 | **P2** | 1~2 天（余量） | **部分完成**（解密算法 + DeviceProof 已落地 2026-09-16；剩余账号发现直读接入） |
 | F-69 | Trae 会话导出存档（Markdown + 存档浏览器） | Trae 生态 | **P3** | 2~3 天 | 待开发 |
 | E-03 | 豆包多模态端点（生图/生视频/音乐/文件中转站） | 豆包/网关 | **P3** | 3~4 天 | 待开发（依赖 E-01） |
 | F-67 | TRAE 多实例并行（原 F-44 改号） | Trae 生态 | P3 | 未定（调研先行） | 待调研（issue #9） |
@@ -129,7 +130,8 @@
   3. **批次 3（1 天，健壮性）**：`oauth_parse_callback` 增加 `code` → token 交换分支；MITM 抓包固化 ExchangeToken 真实参数（client_secret 校验行为、refresh_token 轮换语义）；machine_id/device_id 改为从 `device_map.json` 按账号稳定读取；refresh_token 生命周期字段对齐 Buddy 侧（expires_at / 失败计数 / 失效标记）。
 - **参考开源项目**：`dingminhua/dsh-connect-trae`（loopback shim 接收回调的成熟形态，F-38 已引）；本项目 Buddy 侧 `workbuddy_oauth_login`（后端开浏览器 + 轮询 + 自动入池，直接对照实现）；`BlueChonk/trae-credential-reverse-engineering`（token 刷新签名情报，见 F-70，批次 3 联动核对）。
 - **验收**：MITM 代理运行中（复现 issue #10 环境）发起 OAuth 登录 → 浏览器完成授权 → 应用自动弹出"账号已添加"，全程无需手动复制 URL；粘贴回调 URL 兜底路径保留可用；登录页不再出现证书告警；OAuth 账号的签到/续期与 MITM 捕获账号行为一致。
-- **批次 3 收尾落地（2026-09-15）**：①`auth_saved_at` 凭证落盘时间字段补齐（RawAccount/AccountView + OAuth 登录/导入/手动添加/刷新成功四处写入，前端两处徽标展示，对齐 Buddy auth_saved_at；`access_token_expires_at` 经评估无需落盘——`jwt_exp_timestamp` 已实时解析 JWT exp 并展示）；②新增抓包调试路由 `AIWORK_OAUTH_DEBUG_PROXY` 环境变量（`oauth.rs::exchange_agent`）：设为本软件 MITM 端口时 ExchangeToken/GetUserInfo 改走代理并信任本地 CA，流量落入代理日志供固化 client_secret 校验行为与 refresh_token 轮换语义（默认不设＝直连不变）。**待抓包验证项**：client_secret `"-"` 是否强校验（可用 `conf/oauth_client.json` 覆盖做对照实验）、回调形态（refreshToken vs code，浏览器 DevTools 看 302 Location 即可）、refresh_token 轮换语义（同值二次交换是否失效）。
+- **批次 3 收尾落地（2026-09-15）**：①`auth_saved_at` 凭证落盘时间字段补齐（RawAccount/AccountView + OAuth 登录/导入/手动添加/刷新成功四处写入，前端两处徽标展示，对齐 Buddy auth_saved_at；`access_token_expires_at` 经评估无需落盘——`jwt_exp_timestamp` 已实时解析 JWT exp 并展示）；②新增抓包调试路由 `AIWORK_OAUTH_DEBUG_PROXY` 环境变量（`oauth.rs::exchange_agent`）：设为本软件 MITM 端口时 ExchangeToken/GetUserInfo 改走代理并信任本地 CA，流量落入代理日志供固化 client_secret 校验行为与 refresh_token 轮换语义（默认不设＝直连不变）。
+- **批次 3 真实协议闭环（2026-09-16，v3.5.3 主线 9 提交，全链路完成 ✅）**：以 Trae CN `main.js` 逆向实锤为最终裁决重写 AuthCode 交换链路——回调解析 `authCodeInfo`（JSON 形态，兼容旧 `refreshToken`/`code` 直传）+ PKCE（RFC 7636，S256）；AuthCode 交换**不发 DeviceProof**（其属 refreshToken 刷新场景），主变体改发 `DeviceInfo{DeviceID,MachineID,PlatformCode,DevicePublicKey(SPKI PEM),...}` + IDEVersion；端点修正 `${host}/trae/api/v3/oauth/ExchangeToken`（host 取授权页回调参数）；Timestamp 必须 JSON int；实测 AuthCode 一次业务级失败即失效；AuthCode/Code × ExchangeToken/GetToken 变体自动探测链 + 响应全量脱敏诊断。**原三项「待抓包验证项」经协议对齐实测全部裁定，不再悬置**。设备凭证与签名（F-70 情报落地）经 `icube_auth.rs` 承接：tc 信封解密提取 P-256 私钥 → DeviceProof（刷新场景备用，device_id 首选 icube 凭证，F-78 缺口清单第 5 项「设备标识不一致」同步解决）。
 
 ### F-24-余 豆包会员额度端点抓包固化（P1）✅ 已完成（2026-09-15）
 
@@ -169,7 +171,7 @@
 
 > 原独立设计文档 `work-credit-pool-design.md` 已完整并入本节（2026-09-13）。详见 §三。
 
-### F-70 Trae tc 凭证直读 + ECDSA P-256 刷新情报核对（P2）
+### F-70 Trae tc 凭证直读 + ECDSA P-256 刷新情报核对（P2，部分完成 2026-09-16）
 
 - **需求概述**：① Trae CN 的 `storage.json` 凭证使用自定义 "tc" 加密 = **AES-128-CBC + SHA-512**（SG 版为明文 JSON）——实现直读解密后，本机 Trae 凭证发现不再依赖 MITM 抓包；② `BlueChonk/trae-credential-reverse-engineering` 报告 TraeWork CN 凭据 4/4 解密成功 + **98 个 API 发现** + **ECDSA P-256 Token 刷新签名**——是 `refresh_jwt` 续期链路的重要底层情报，需克隆核对。
 - **实现路径**：
@@ -178,6 +180,7 @@
   3. 与现有 MITM 捕获路径并存（解密成功优先，失败回退抓包），`apps_accounts_discover` 账号发现覆盖面扩大。
 - **参考开源项目**：`laojichao/trae-local-api`（tc 加密格式确认 + 四版本端点路由表 + CN/SG SSE 格式差异）；`BlueChonk/trae-credential-reverse-engineering`（ECDSA P-256 + 98 API 清单）；`xhrxgr/trae-work-cn-account-manager`（同栈 Tauri 2 实现，AES-128-CBC + HMAC-SHA512 结论交叉验证）。
 - **风险**：解密实现属逆向范畴，仅读本机自有凭证；接口变更由 dig() 宽容解析兜底。
+- **部分落地（2026-09-16，随 F-78 批次 3 / v3.5.3）**：① 情报核对完成——无需克隆 BlueChonk，直接以 Trae CN `main.js` 逆向实锤（byteCrypto 四常量表为随安装包分发的公开混淆表、tc 信封 magic `[116,99,5,16,0,0]`、SHA-512 双轮派生 AES-128-CBC key/iv），BlueChonk 结论交叉验证；② 新增 `icube_auth.rs`——tc 信封解密提取设备 P-256 私钥（`iCubeAuthInfo://icube-dc:<deviceId>` 键，私钥只在内存流转）+ ECDSA P-256 DeviceProof（P1363 优先，20405 实测要求 PascalCase 字段），由 `commands/oauth.rs` 消费服务 OAuth 链路；③ **剩余范围**：tc 直读尚未接入 `apps_accounts_discover` 账号发现（本机凭证发现仍依赖 MITM 抓包路径），`storage.json` 凭证批量直读与「解密成功优先、失败回退抓包」双路径待做——预估由 2~3 天下调至 1~2 天。
 
 ### F-69 Trae 会话导出存档（P3）
 
@@ -350,15 +353,11 @@
 
 ## 五、建议排序
 
-1. **F-76 网关慢接口优化**（已完成 2026-09-14）
-2. **F-77 账号级并发感知调度**（已完成 2026-09-14）
-3. **F-78 Trae OAuth 授权闭环补全** —— 批次 1+2 已交付（2026-09-14），批次 3 与 F-24-余 抓包同批做
-4. **F-68 项目列表跨账号保留**（已完成 2026-09-15）
-5. **F-74 Buddy 切换自动迁移会话**（已完成 2026-09-15，待真机双账号互切实测）
-6. **F-24-余 豆包额度端点固化** —— 半天抓包点亮已建好的框架
-7. **F-38 DSH 引导页** —— 成本≈0，随手带上
-8. **E-01/E-02 豆包网关**（批次 0 探测先行）—— 8~12 天，豆包积分资产化主路径
-9. **F-70 tc 凭证直读** —— 情报核对 0.5 天先行，解密落地 2~3 天
-10. F-69 / E-03 / F-41 / F-42 / F-66 —— 按需启动
-11. F-52 / F-71 / F-72 / F-73 / F-75 —— 远期留档，随生态演进评估（F-75 侦察可随时低成本启动）
-12. ~~W-01 Work 积分接入~~ —— 已排除（2026-09-15）：Trae 积分签到调整，见 §四
+1. **F-38 DSH 引导页** —— 成本≈0，随手带上（当前唯一未完成的 P1）
+2. **E-01/E-02 豆包网关**（批次 0 探测实验 Gate 先行）—— 8~12 天，豆包积分资产化主路径
+3. **F-70 tc 凭证直读（剩余收尾）** —— 解密算法与 DeviceProof 已落地（`icube_auth.rs`），仅剩账号发现直读接入，1~2 天
+4. F-69 / E-03 / F-41 / F-42 / F-66 —— 按需启动
+5. F-52 / F-71 / F-72 / F-73 / F-75 —— 远期留档，随生态演进评估（F-75 侦察可随时低成本启动）
+6. ~~W-01 Work 积分接入~~ —— 已排除（2026-09-15）：Trae 积分签到调整，见 §四
+
+> 已完成项退出排序：F-76/F-77（2026-09-14）、F-78 全批次（批次 1+2 2026-09-14 / 批次 3 2026-09-16）、F-68/F-74（2026-09-15）、F-24-余（2026-09-16 真机复验闭环）。
