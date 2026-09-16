@@ -7,14 +7,25 @@ use crate::jwt;
 use crate::models::{DeviceMap, RawAccount};
 use crate::state::AppState;
 
-/// 最近签发的 OAuth state（CSRF 防护）：oauth_get_login_url 签发时记录，
-/// oauth_parse_callback 在回调携带 state 且本进程签发过时强校验一致性
-static LAST_OAUTH_STATE: Mutex<Option<String>> = Mutex::new(None);
+/// 最近签发的 OAuth 登录会话（CSRF 防护 + PKCE）：oauth_get_login_url 签发时记录，
+/// oauth_parse_callback 用 loginTraceID 双向绑定校验（抓包实证：login_trace_id 参数
+/// 会被授权页原样回传为回调的 loginTraceID），PKCE verifier 供 AuthCode 交换
+struct PendingLogin {
+    state: String,
+    pkce_verifier: String,
+}
+static LAST_OAUTH_STATE: Mutex<Option<PendingLogin>> = Mutex::new(None);
 
-/// OAuth 常量
-const OAUTH_CLIENT_ID: &str = "en1oxy7wnw8j9n";
+/// OAuth 常量（2026-09-16 抓包固化）：client_id 取真实 Trae IDE 登录 URL 实证值
+/// （授权页 native_ide 流程 GetPCAuthCode 接受；旧值 en1oxy7wnw8j9n 会让页面
+/// 停留在 billing status 后无后续，不回跳）。conf/oauth_client.json 可覆盖。
+const OAUTH_CLIENT_ID: &str = "ono9krqynydwx5";
 const OAUTH_CLIENT_SECRET: &str = "-";
-const OAUTH_APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
+/// 真实 IDE 页面参数快照（抓包 2026-09-16）：授权页据此进入 native_ide 原生授权
+/// 流程（前端调 GetPCAuthCode 后 302 回 auth_callback_url）
+const OAUTH_PAGE_PLUGIN_VERSION: &str = "2.3.83560";
+const OAUTH_PAGE_APP_VERSION: &str = "3.3.100";
+const OAUTH_PAGE_PLATFORM_CODE: &str = "IDE_PC";
 /// 本机回环监听端口（F-78 批次 1：commands/oauth_loopback.rs 在此端口收 OAuth 回调）
 pub(crate) const OAUTH_LOOPBACK_PORT: u16 = 17388;
 pub(crate) const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:17388/authorize";
@@ -265,48 +276,88 @@ fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
     dev
 }
 
-/// 生成 OAuth 登录 URL
+/// 生成 PKCE code_verifier（RFC 7636：43-128 字符非 reserved 字符；hex 64字符合规）
+/// 与 S256 code_challenge（BASE64URL-NOPAD(SHA256(verifier))）
+fn pkce_pair() -> (String, String) {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let verifier = random_hex(64);
+    let digest = Sha256::digest(verifier.as_bytes());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    (verifier, challenge)
+}
+
+/// 生成 OAuth 登录 URL（2026-09-16 抓包固化：对齐真实 Trae IDE 登录页参数形态）。
+/// 旧形态（client_secret/app_id/response_type=code）会让授权页停在
+/// cn_credits_billing_status 后无后续、不回跳；真实流程：
+/// login_channel=native_ide → 页面前端调 GetPCAuthCode（绑定 PKCE challenge）→
+/// 302 回 auth_callback_url，回调参数为 authCodeInfo（JSON）而非 refreshToken/code。
 #[tauri::command]
 pub fn oauth_get_login_url(state: State<AppState>) -> OAuthLoginUrl {
     let state = &*state;
     let dev = load_or_create_oauth_device(state);
     let machine_id = dev.machine_id;
     let device_id = dev.device_id;
-    let state_param = random_hex(32);
+    // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）
+    let trace_id = random_hex(32);
+    let (pkce_verifier, code_challenge) = pkce_pair();
 
+    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".into());
     let url = format!(
         "https://www.trae.cn/authorization?\
-        client_id={client_id}\
-        &client_secret={client_secret}\
-        &app_id={app_id}\
+        login_version=1\
+        &auth_from=trae\
+        &login_channel=native_ide\
+        &plugin_version={plugin_version}\
+        &auth_type=local\
+        &client_id={client_id}\
+        &redirect=0\
+        &login_trace_id={trace_id}\
         &auth_callback_url={redirect_uri}\
-        &state={state}\
         &machine_id={machine_id}\
         &device_id={device_id}\
-        &response_type=code",
+        &x_device_id={device_id}\
+        &x_machine_id={machine_id}\
+        &x_device_brand={hostname}\
+        &x_device_type=windows\
+        &x_os_version={os_version}\
+        &x_env=\
+        &x_app_version={app_version}\
+        &x_app_type=stable\
+        &code_challenge={code_challenge}\
+        &code_challenge_method=S256\
+        &channel_name=common",
+        plugin_version = OAUTH_PAGE_PLUGIN_VERSION,
         client_id = oauth_client().client_id,
-        client_secret = oauth_client().client_secret,
-        app_id = OAUTH_APP_ID,
+        trace_id = trace_id,
         redirect_uri = urlencoding::encode(OAUTH_REDIRECT_URI),
-        state = state_param,
         machine_id = machine_id,
         device_id = device_id,
+        hostname = urlencoding::encode(&hostname),
+        os_version = urlencoding::encode("Windows"),
+        app_version = OAUTH_PAGE_APP_VERSION,
+        code_challenge = code_challenge,
     );
+
+    // 记录本机登录会话（CSRF + PKCE）供回调校验/交换使用
+    {
+        let mut guard = LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(PendingLogin { state: trace_id.clone(), pkce_verifier });
+    }
 
     OAuthLoginUrl {
         url,
-        // 记录最近签发的 state 供回调校验（CSRF）
-        state: {
-            *LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(state_param.clone());
-            state_param
-        },
+        state: trace_id,
         redirect_uri: OAUTH_REDIRECT_URI.to_string(),
     }
 }
 
 /// 解析 OAuth 回调 URL
 #[tauri::command]
-pub fn oauth_parse_callback(callback_url: String) -> Result<OAuthCallbackInfo, String> {
+pub fn oauth_parse_callback(
+    state: State<AppState>,
+    callback_url: String,
+) -> Result<OAuthCallbackInfo, String> {
     // 回调 URL 格式：http://127.0.0.1:port/authorize?refreshToken=xxx&accessToken=xxx&userId=xxx&userName=xxx&avatar=xxx
     // 或可能带 code 参数需要交换
     let query_str = callback_url
@@ -340,16 +391,70 @@ pub fn oauth_parse_callback(callback_url: String) -> Result<OAuthCallbackInfo, S
 
     let avatar = params.get("avatar").cloned();
 
-    // CSRF 校验（审查 P2）：回调携带 state 且本进程签发过 state 时，两者必须一致；
-    // 不一致的回调 URL 可能来自伪造/重放，直接拒绝。回调不带 state（旧流程/第三方拼 URL）
-    // 或本进程从未签发过（如重启后直接粘贴回调）时保持宽容，不阻断正常登录。
-    // 注意：必须在 code 交换（网络请求）之前完成，避免对伪造回调发起无谓交换
-    if let Some(cb_state) = params.get("state") {
-        let issued = LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(expected) = issued {
-            if !expected.is_empty() && cb_state != &expected {
-                return Err("OAuth state 校验失败：回调 URL 与本机发起的登录请求不匹配（可能为伪造或重放），已拒绝".into());
+    // 抓包固化（2026-09-16）主路径：授权页 native_ide 流程 302 回调携带
+    // authCodeInfo=<URL编码JSON>{"AuthCode","ExpireAt","ExpireDuration"} 与
+    // userInfo=<JSON>{"UserID","ScreenName","AvatarUrl",...}、loginTraceID、host、
+    // userRegion——从这两个 JSON 里补全身份信息（免调 GetUserInfo）
+    let mut auth_code: Option<String> = None;
+    if let Some(raw) = params.get("authCodeInfo") {
+        let v: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|e| format!("authCodeInfo 解析失败（{e}）：授权页回调格式异常"))?;
+        let code = v
+            .get("AuthCode")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or("authCodeInfo 中缺少 AuthCode 字段")?
+            .to_string();
+        auth_code = Some(code);
+    }
+    if let Some(raw) = params.get("userInfo") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+            if user_id.is_none() {
+                if let Some(uid) = v.get("UserID").and_then(|x| x.as_str()) {
+                    params.insert("UserID".into(), uid.to_string());
+                }
             }
+            if let Some(name) = v
+                .get("ScreenName")
+                .or_else(|| v.get("NickName"))
+                .and_then(|x| x.as_str())
+            {
+                params.insert("userName".into(), name.to_string());
+            }
+            if let Some(ava) = v.get("AvatarUrl").and_then(|x| x.as_str()) {
+                params.insert("avatar".into(), ava.to_string());
+            }
+        }
+    }
+    // 上面 params 插入后重新取值（保持下游逻辑单一出口）
+    let user_id = params.get("UserID").cloned().or(user_id);
+    let user_name = params.get("userName").cloned().or(user_name);
+    let avatar = params.get("avatar").cloned().or(avatar);
+
+    // CSRF 校验（抓包固化：state 已不适用，native_ide 流程回调不回传 state，改用
+    // loginTraceID 双向绑定——授权页把 login_trace_id 原样回传为 loginTraceID）。
+    // 本进程签发过登录会话且回调携带 loginTraceID 时两者必须一致；回调不带
+    // loginTraceID 或本进程未签发过（重启后粘贴回调）时保持宽容，不阻断正常登录。
+    if let Some(cb_trace) = params.get("loginTraceID").or_else(|| params.get("login_trace_id")) {
+        let issued = LAST_OAUTH_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|p| p.state.clone());
+        if let Some(expected) = issued {
+            if !expected.is_empty() && cb_trace != &expected {
+                return Err("OAuth loginTraceID 校验失败：回调 URL 与本机发起的登录请求不匹配（可能为伪造或重放），已拒绝".into());
+            }
+        }
+    } else if auth_code.is_some() {
+        // 新流程回调必带 loginTraceID：缺失且本机有在途会话时视为不匹配
+        let issued = LAST_OAUTH_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|p| p.state.clone());
+        if issued.is_some() {
+            return Err("OAuth 回调缺少 loginTraceID，无法确认与本机登录请求的对应关系，已拒绝".into());
         }
     }
 
@@ -358,9 +463,8 @@ pub fn oauth_parse_callback(callback_url: String) -> Result<OAuthCallbackInfo, S
         .or_else(|| params.get("access_token"))
         .cloned();
 
-    // 优先从 refreshToken 参数获取；无 refreshToken 但携带 code（标准授权码回调）时，
-    // 尝试用 code 调 ExchangeToken 交换（F-78 批次 3）。授权码语义未经抓包验证：
-    // 响应含 refresh_token 即走后续流程，失败则明确报「暂不支持」引导手动兜底
+    // 主路径（抓包固化）：authCodeInfo.AuthCode → ExchangeToken（带 PKCE verifier）。
+    // 兼容路径：refreshToken 直传（老形态）、code 参数（标准授权码）
     let refresh_token = match params
         .get("refreshToken")
         .or_else(|| params.get("refresh_token"))
@@ -368,18 +472,23 @@ pub fn oauth_parse_callback(callback_url: String) -> Result<OAuthCallbackInfo, S
     {
         Some(t) => t,
         None => {
-            let code = params
-                .get("code")
-                .cloned()
-                .ok_or_else(|| "回调 URL 中缺少 refreshToken 参数".to_string())?;
-            match exchange_code(&code) {
+            let code = auth_code
+                .or_else(|| params.get("code").cloned())
+                .ok_or_else(|| "回调 URL 中缺少 authCodeInfo/refreshToken 参数".to_string())?;
+            let verifier = LAST_OAUTH_STATE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|p| p.pkce_verifier.clone());
+            let device_id = load_or_create_oauth_device(&state).device_id;
+            match exchange_code(&code, verifier.as_deref(), &device_id, &state.data_dir) {
                 Ok((at, rt)) => {
                     access_token = Some(at);
                     rt
                 }
                 Err(e) => {
                     return Err(format!(
-                        "暂不支持 code 授权码回调（{e}），请改用携带 refreshToken 的回调，或复制完整回调 URL 手动重试"
+                        "AuthCode 交换失败（{e}）；可复制完整回调 URL 与 app.log 中的交换诊断反馈排查，或改用手动登录兜底"
                     ));
                 }
             }
@@ -395,10 +504,13 @@ pub fn oauth_parse_callback(callback_url: String) -> Result<OAuthCallbackInfo, S
     })
 }
 
-/// 用授权码 code 尝试交换 token（F-78 批次 3：oauth_parse_callback 的 code 回调分支）。
-/// ExchangeToken 端点按授权码语义（Code 字段）尝试；响应必须同时含 access_token 与
-/// refresh_token 才视为交换成功，否则交由调用方报「暂不支持」。
-fn exchange_code(code: &str) -> Result<(String, String), String> {
+/// 用 AuthCode 交换 token（抓包固化 2026-09-16：授权页 GetPCAuthCode 签发的
+/// AuthCode 绑定 PKCE challenge，交换请求须带对应 CodeVerifier）。
+/// 交换端点/响应结构未抓到（IDE 原生进程发起，浏览器 DevTools 抓不到）：
+/// 请求体对齐 GetPCAuthCode 的 PascalCase 形态（ClientID/Code/CodeVerifier/
+/// DeviceID/PlatformCode）；响应同时含 access_token 与 refresh_token 才算成功，
+/// 失败时输出响应键路径（脱敏，不含值）供下一步校准。
+fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: &std::path::Path) -> Result<(String, String), String> {
     let resp = exchange_agent()?
         .post(&oauth_client().exchange_url)
         .set("content-type", "application/json")
@@ -406,7 +518,10 @@ fn exchange_code(code: &str) -> Result<(String, String), String> {
         .send_json(ureq::json!({
             "ClientID": oauth_client().client_id,
             "Code": code,
+            "CodeVerifier": verifier.unwrap_or(""),
             "ClientSecret": oauth_client().client_secret,
+            "DeviceID": device_id,
+            "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
             "UserID": ""
         }))
         .map_err(|e| format!("ExchangeToken 请求失败: {}", e))?;
@@ -416,6 +531,16 @@ fn exchange_code(code: &str) -> Result<(String, String), String> {
 
     let code_val = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code_val != 0 {
+        // 诊断（脱敏）：输出响应键路径，便于校准交换端点的真实响应结构
+        let mut paths = Vec::new();
+        collect_key_paths_public(&body, &mut paths);
+        fs_utils::app_log(
+            data_dir,
+            &format!(
+                "OAuth AuthCode 交换失败 (code={code_val}): 响应键路径: {}",
+                paths.join(" | ")
+            ),
+        );
         let msg = body
             .get("message")
             .and_then(|v| v.as_str())
@@ -426,17 +551,44 @@ fn exchange_code(code: &str) -> Result<(String, String), String> {
     let data = body.get("data").ok_or("响应中缺少 data 字段")?;
     let access_token = data
         .get("access_token")
+        .or_else(|| data.get("AccessToken"))
         .or_else(|| data.get("token"))
         .and_then(|v| v.as_str())
         .ok_or("响应中缺少 access_token")?
         .to_string();
     let refresh_token = data
         .get("refresh_token")
+        .or_else(|| data.get("RefreshToken"))
         .and_then(|v| v.as_str())
         .ok_or("响应中缺少 refresh_token")?
         .to_string();
 
     Ok((access_token, refresh_token))
+}
+
+/// 键路径收集（oauth.rs 本地版，脱敏：仅键名不含值）
+fn collect_key_paths_public(v: &serde_json::Value, out: &mut Vec<String>) {
+    fn rec(v: &serde_json::Value, prefix: &str, depth: usize, out: &mut Vec<String>) {
+        if depth > 6 || out.len() >= 40 {
+            return;
+        }
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, val) in m {
+                    let p = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                    out.push(p.clone());
+                    rec(val, &p, depth + 1, out);
+                }
+            }
+            serde_json::Value::Array(a) => {
+                for (i, x) in a.iter().enumerate().take(3) {
+                    rec(x, &format!("{prefix}[{i}]"), depth + 1, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    rec(v, "", 0, out)
 }
 
 /// ExchangeToken：用 refresh_token 换取 access_token
@@ -533,7 +685,7 @@ pub fn oauth_login(
     group_id: Option<String>,
 ) -> Result<OAuthLoginResult, String> {
     // 1. 解析回调 URL
-    let callback_info = oauth_parse_callback(callback_url)?;
+    let callback_info = oauth_parse_callback(state.clone(), callback_url)?;
 
     // 2. 如果回调中没有 accessToken，则用 refresh_token 换取
     let (access_token, new_refresh_token) = if let Some(ref at) = callback_info.access_token {
