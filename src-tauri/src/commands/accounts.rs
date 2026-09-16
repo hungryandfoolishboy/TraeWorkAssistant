@@ -1461,6 +1461,13 @@ pub fn refresh_jwt(
     result
 }
 
+/// refresh 失败短冷却（D，60s）：同账号刷新失败后 60s 内直接拒绝重试，
+/// 消除重试风暴与 vault 写放大（app.log 实证 19s 内 4 连败 + 4 次全量加密写盘）。
+/// 进程内态即可：重启清零无害，冷却目的仅是限频。
+static REFRESH_COOLDOWN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const REFRESH_COOLDOWN_SECS: u64 = 60;
+
 /// refresh_jwt 核心逻辑（&AppState，供命令与测试探针共用）
 pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, String> {
     // 并发安全：持锁防止多个并发请求同时 ExchangeToken
@@ -1468,6 +1475,19 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
         .jwt_refresh_lock
         .lock()
         .map_err(|_| "JWT 刷新锁获取失败")?;
+
+    // D 短冷却：失败后 60s 内拒绝重试（持锁检查，防并发穿透）
+    {
+        let cd = REFRESH_COOLDOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(until) = cd.get(user_id) {
+            if until.elapsed() < std::time::Duration::from_secs(REFRESH_COOLDOWN_SECS) {
+                return Err(format!(
+                    "该账号刷新处于冷却期（{}s 内失败过，请稍后重试）",
+                    REFRESH_COOLDOWN_SECS
+                ));
+            }
+        }
+    }
 
     // Double-check：持锁后重新读取文件，防止其他线程已刷新
     let mut accounts = crate::vault::load_accounts(state);
@@ -1477,57 +1497,41 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
         .find(|a| a.user_id.as_deref() == Some(user_id))
         .ok_or("账号不存在")?;
 
+    // C 入口拦截：已判定 refresh_token 失效的账号不再发网络请求
+    // （此前无效标记仅影响调度，手动/自动刷新仍会持续探测——app.log 实证
+    // 「已标记失效」后 19s 内仍 4 连败 + 每次触发 vault 全量加密写盘）
+    if account.refresh_token_invalid {
+        return Err("refresh_token 已失效，需重新 OAuth 登录".to_string());
+    }
+
     let refresh_token = account
         .refresh_token
         .as_ref()
         .filter(|s| !s.is_empty())
-        .ok_or("该账号无 refresh_token，无法自动刷新")?;
+        .ok_or("该账号无 refresh_token，无法自动刷新")?
+        .clone();
 
-    // 调用 ExchangeToken API（凭证与端点来自外置配置，缺失回退内置默认）
-    let client = crate::commands::oauth::oauth_client();
-    let resp = short_agent()
-        .post(&client.exchange_url)
-        .set("content-type", "application/json")
-        .set("accept", "*/*")
-        .send_json(ureq::json!({
-            "ClientID": client.client_id,
-            "RefreshToken": refresh_token,
-            "ClientSecret": client.client_secret,
-            "UserID": ""
-        }))
-        .map_err(|e| {
-            let msg = format!("ExchangeToken 请求失败: {}", e);
-            record_refresh_failure(state, user_id, false, &msg);
-            msg
-        })?;
+    // 调用 ExchangeToken（2026-09-16 协议迁移：固化协议 DeviceProof 主变体 +
+    // 旧协议兜底探测；仅旧形态数字 code != 0 判为服务端明确拒绝——
+    // 旧实现 unwrap_or(-1) 会把无 code 字段的异构响应误判为拒绝，第 1 次即误标失效）
+    let exchange = crate::commands::oauth::exchange_token_refresh(state, &refresh_token);
+    let (new_access_token, new_refresh_token, body) = match exchange {
+        Ok(t) => t,
+        Err(e) => {
+            let err = format!("ExchangeToken 失败: {}", e.msg);
+            // B 判定收窄：仅服务端明确拒绝（数字 code != 0）才立即置 invalid；
+            // 网络/解析/协议级失败走 rejected=false（连续 3 次仍会置 invalid 兜底）
+            record_refresh_failure(state, user_id, e.server_rejected, &err);
+            // D 失败进入冷却
+            REFRESH_COOLDOWN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(user_id.to_string(), std::time::Instant::now());
+            return Err(err);
+        }
+    };
 
-    let body: serde_json::Value = resp.into_json().map_err(|e| {
-        let msg = format!("解析响应失败: {}", e);
-        record_refresh_failure(state, user_id, false, &msg);
-        msg
-    })?;
-
-    let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        let msg = body
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("未知错误");
-        let err = format!("ExchangeToken 失败 (code={}): {}", code, msg);
-        // 服务端明确拒绝（code != 0）：refresh_token 已失效，立即置 invalid（F-78 批次 3）
-        record_refresh_failure(state, user_id, true, &err);
-        return Err(err);
-    }
-
-    // F-49 宽容解析：data 信封内字段直接 dig 查找，兼容嵌套包裹
-    let new_access_token = crate::fs_utils::dig(&body, &["access_token", "token"])
-        .and_then(|v| v.as_str())
-        .ok_or("响应中缺少 access_token")?;
-
-    // 提取新 refresh_token（可能轮换）
-    let new_refresh_token = crate::fs_utils::dig(&body, &["refresh_token"])
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    // 提取新 refresh_token（可能轮换）——已在 exchange_token_refresh 内宽容提取
 
     // 验证新 accessToken 的 user_id 一致
     let new_jwt_full = if new_access_token.starts_with("Cloud-IDE-JWT ") {
@@ -1544,6 +1548,11 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
                 user_id, new_uid
             );
             record_refresh_failure(state, user_id, true, &err);
+            // D：异常 token 同样进入冷却
+            REFRESH_COOLDOWN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(user_id.to_string(), std::time::Instant::now());
             return Err(err);
         }
     }

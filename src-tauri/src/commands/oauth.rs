@@ -853,46 +853,220 @@ fn collect_key_paths_public(v: &serde_json::Value, out: &mut Vec<String>) {
     rec(v, "", 0, out)
 }
 
-/// ExchangeToken：用 refresh_token 换取 access_token
-fn exchange_token(refresh_token: &str) -> Result<(String, Option<String>), String> {
-    let resp = exchange_agent()?
-        .post(&oauth_client().exchange_url)
-        .set("content-type", "application/json")
-        .set("accept", "*/*")
-        .send_json(ureq::json!({
-            "ClientID": oauth_client().client_id,
+/// refresh_token 换取 access_token 的失败详情：
+/// server_rejected=true 表示服务端明确拒绝（旧形态数字 code != 0），refresh_token 已确定失效；
+/// 网络/解析/错误信封等本地与协议级失败为 false，不应误标失效（B 判定收窄，app.log 实证
+/// 旧协议对失效请求返回无 code/message 的异构响应，被 unwrap_or(-1) 误判为「未知错误」拒绝）
+pub(crate) struct RefreshExchangeError {
+    pub msg: String,
+    pub server_rejected: bool,
+}
+
+/// 用 refresh_token 换取 access_token（JWT 刷新路径，2026-09-16 协议迁移）。
+/// 与 OAuth 登录链路同源的固化协议：`${host}/trae/api/v3/oauth/ExchangeToken`
+/// + DeviceProof 签名（签名原文 POST\n<path>\n<ClientID>\n<RefreshToken>\n<ts>\n<nonce>）
+/// + x-cloudide-token: "" 空头，响应 Result.Token/Result.RefreshToken（火山信封）。
+/// 旧协议（cloudide/api/v3/trae 端点 + ClientSecret 体）保留为兜底探测变体。
+/// 成功返回 (access_token, Option<新 refresh_token>（可能轮换）, 原始响应体)
+pub(crate) fn exchange_token_refresh(
+    state: &AppState,
+    refresh_token: &str,
+) -> Result<(String, Option<String>, serde_json::Value), RefreshExchangeError> {
+    let client_id = oauth_client().client_id.clone();
+    let device_id = load_or_create_oauth_device(state).device_id;
+
+    // 变体链（主→兜底）：固化协议 P1363/DER → 旧端点 P1363 → 旧协议（无凭证时唯一路径）
+    let new_url = "https://api.trae.com.cn/trae/api/v3/oauth/ExchangeToken";
+    let mut variants: Vec<(String, String, serde_json::Value, bool)> = Vec::new();
+    if let Some(cred) = icube_device_creds().first() {
+        for (fmt, url, sign_path) in [
+            (
+                crate::icube_auth::ProofSigFormat::P1363,
+                new_url,
+                "/trae/api/v3/oauth/ExchangeToken",
+            ),
+            (
+                crate::icube_auth::ProofSigFormat::Der,
+                new_url,
+                "/trae/api/v3/oauth/ExchangeToken",
+            ),
+            (
+                crate::icube_auth::ProofSigFormat::P1363,
+                OAUTH_EXCHANGE_URL,
+                "/cloudide/api/v3/trae/oauth/ExchangeToken",
+            ),
+        ] {
+            let Ok(proof) =
+                crate::icube_auth::device_proof(cred, sign_path, &client_id, refresh_token, fmt)
+            else {
+                continue;
+            };
+            variants.push((
+                format!("Refresh/Proof{}", fmt.suffix()),
+                url.to_string(),
+                ureq::json!({
+                    "ClientID": client_id,
+                    "RefreshToken": refresh_token,
+                    "DeviceID": cred.device_id,
+                    "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
+                    "DeviceProof": proof,
+                }),
+                true,
+            ));
+        }
+    }
+    // 旧协议兜底（保留至固化协议验证期结束）
+    variants.push((
+        "Refresh/Legacy".into(),
+        oauth_client().exchange_url.clone(),
+        ureq::json!({
+            "ClientID": client_id,
             "RefreshToken": refresh_token,
             "ClientSecret": oauth_client().client_secret,
-            "UserID": ""
-        }))
-        .map_err(|e| format!("ExchangeToken 请求失败: {}", e))?;
+            "UserID": "",
+        }),
+        false,
+    ));
 
-    let body: serde_json::Value =
-        resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
+    let mut last_err: Option<RefreshExchangeError> = None;
+    for (tag, url, payload, with_proof_header) in &variants {
+        match try_refresh_variant(tag, url, payload.clone(), &device_id, *with_proof_header, &state.data_dir) {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                // 旧形态数字 code != 0：服务端明确拒绝，立即采纳不再探测
+                if e.server_rejected {
+                    return Err(e);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or(RefreshExchangeError {
+        msg: "无可用刷新变体（本机未发现 Trae 设备凭证且旧协议未启用）".into(),
+        server_rejected: false,
+    }))
+}
 
-    let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        let msg = body
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("未知错误");
-        return Err(format!("ExchangeToken 失败 (code={}): {}", code, msg));
+/// 单个刷新变体尝试：脱敏日志（请求+响应全量）→ 设备头请求 → 宽容解析。
+/// 与 try_exchange_variant（AuthCode 场景）的差异：
+/// - refresh_token 可能不轮换：响应缺 RefreshToken 视为成功（调用方保留旧值）
+/// - 仅旧形态数字 code != 0 判为「服务端明确拒绝」（server_rejected=true）；
+///   火山错误信封（20403/20405 等设备/协议错误）视为变体失败继续探测
+fn try_refresh_variant(
+    tag: &str,
+    url: &str,
+    payload: serde_json::Value,
+    device_id: &str,
+    with_proof_header: bool,
+    data_dir: &std::path::Path,
+) -> Result<(String, Option<String>, serde_json::Value), RefreshExchangeError> {
+    {
+        let mut masked = payload.clone();
+        mask_sensitive(&mut masked);
+        fs_utils::app_log(data_dir, &format!("[OAuth刷新-请求:{tag}] {masked}"));
+    }
+    let agent = match exchange_agent() {
+        Ok(a) => a,
+        Err(e) => {
+            return Err(RefreshExchangeError {
+                msg: e,
+                server_rejected: false,
+            })
+        }
+    };
+    let mut req = agent
+        .post(url)
+        .set("content-type", "application/json")
+        .set("accept", "*/*")
+        .set("x-device-id", device_id)
+        .set("x-app-id", OAUTH_APP_ID)
+        .set("x-platform-code", OAUTH_PAGE_PLATFORM_CODE);
+    if with_proof_header {
+        // F-70 实测：x-cloudide-token 必须为空字符串
+        req = req.set("x-cloudide-token", "");
+    }
+    let resp = match req.send_json(payload) {
+        Ok(r) => r,
+        // 4xx/5xx：ureq 返回 Error::Status 且响应体仍可读——保留用于诊断
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => {
+            return Err(RefreshExchangeError {
+                msg: format!("请求失败: {e}"),
+                server_rejected: false,
+            })
+        }
+    };
+    let body: serde_json::Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(RefreshExchangeError {
+                msg: format!("解析响应失败: {e}"),
+                server_rejected: false,
+            })
+        }
+    };
+    {
+        let mut masked = body.clone();
+        mask_sensitive(&mut masked);
+        fs_utils::app_log(data_dir, &format!("[OAuth刷新-响应:{tag}] {masked}"));
     }
 
-    let data = body.get("data").ok_or("响应中缺少 data 字段")?;
+    // 火山信封错误：协议级失败（可能是 DeviceProof/设备问题），继续探测下一变体
+    let err_code = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "Code"])
+        .map(|v| {
+            v.as_i64()
+                .map(|n| n.to_string())
+                .or_else(|| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    if !err_code.is_empty() && err_code != "0" {
+        let err_msg = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "Message"])
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        return Err(RefreshExchangeError {
+            msg: format!("code={err_code}: {err_msg}"),
+            server_rejected: false,
+        });
+    }
+    // 旧形态数字 code：唯一可信的「服务端明确拒绝」信号（B 判定收窄——
+    // 无 code 字段的异构响应不再被 unwrap_or(-1) 误判为拒绝）
+    if let Some(c) = body.get("code").and_then(|v| v.as_i64()) {
+        if c != 0 {
+            let msg = body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("未知错误");
+            return Err(RefreshExchangeError {
+                msg: format!("code={c}: {msg}"),
+                server_rejected: true,
+            });
+        }
+    }
 
-    let access_token = data
-        .get("access_token")
-        .or_else(|| data.get("token"))
-        .and_then(|v| v.as_str())
-        .ok_or("响应中缺少 access_token")?;
-
-    let new_refresh_token = data
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    Ok((access_token.to_string(), new_refresh_token))
+    // token 提取：access 必须有（Result/data/Data 容器 → 全树深挖），refresh 可缺省
+    const ACCESS_KEYS: &[&str] = &["AccessToken", "access_token", "token", "Jwt", "JWT"];
+    const REFRESH_KEYS: &[&str] = &["RefreshToken", "refresh_token"];
+    let access = find_token_value(&body, ACCESS_KEYS).filter(|s| !s.is_empty());
+    let refresh = find_token_value(&body, REFRESH_KEYS).filter(|s| !s.is_empty());
+    match access {
+        Some(a) => Ok((a, refresh, body)),
+        None => {
+            let mut paths = Vec::new();
+            collect_key_paths_public(&body, &mut paths);
+            fs_utils::app_log(
+                data_dir,
+                &format!(
+                    "[OAuth刷新:{tag}] 响应未找到 Token 字段（无 Error 信封），响应键路径: {}",
+                    paths.join(" | ")
+                ),
+            );
+            Err(RefreshExchangeError {
+                msg: "响应中未找到 AccessToken 字段（键路径已记入 app.log）".into(),
+                server_rejected: false,
+            })
+        }
+    }
 }
 
 /// GetUserInfo：获取用户信息
@@ -950,11 +1124,18 @@ pub fn oauth_login(
     let callback_info = oauth_parse_callback(state.clone(), callback_url)?;
 
     // 2. 如果回调中没有 accessToken，则用 refresh_token 换取
-    let (access_token, new_refresh_token) = if let Some(ref at) = callback_info.access_token {
-        (at.clone(), None)
+    let new_pair = if let Some(ref at) = callback_info.access_token {
+        Some((at.clone(), None))
     } else {
-        exchange_token(&callback_info.refresh_token)?
+        // 此处 refresh_token 刚从 OAuth 回调取得（非存量失效凭证），
+        // server_rejected 分支仅转为错误信息，不涉及生命周期标记
+        exchange_token_refresh(&state, &callback_info.refresh_token)
+            .map_err(|e| e.msg)
+            .ok()
+            .map(|(a, r, _)| (a, r))
     };
+    let (access_token, new_refresh_token) = new_pair
+        .ok_or_else(|| "refresh_token 交换失败".to_string())?;
 
     // 3. 规范化 JWT 格式
     let jwt = if access_token.starts_with("Cloud-IDE-JWT ") {
