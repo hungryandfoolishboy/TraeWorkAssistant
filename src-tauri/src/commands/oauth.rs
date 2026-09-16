@@ -256,6 +256,15 @@ fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
     // SQLite 化（P2）：oauth_device.json → kv `oauth_device`
     let store = crate::store::db(&state.data_dir);
     let mut dev: OAuthDevice = store.kv_get("oauth_device");
+    // device_id 首选 icube 设备凭证（F-78 DeviceProof）：签名私钥与 icube-dc
+    // deviceId 绑定，登录 URL 的 device_id 必须与之同源，否则服务端 20403/20405；
+    // 恒覆盖旧值（旧值是随机/device_map 对齐的，与私钥不匹配）
+    if let Some(cred) = icube_device_creds().first() {
+        if dev.device_id != cred.device_id {
+            dev.device_id = cred.device_id.clone();
+            let _ = store.kv_set("oauth_device", &dev);
+        }
+    }
     if dev.machine_id.is_empty() || dev.device_id.is_empty() {
         if dev.device_id.is_empty() {
             let map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
@@ -522,7 +531,47 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
     let code_v = code.to_string();
     let verifier_v = verifier.unwrap_or("").to_string();
     let device_v = device_id.to_string();
-    let gettoken_url = oauth_client().exchange_url.replace("ExchangeToken", "GetToken");
+
+    // DeviceProof（20405 Device proof required 实测）：优先用本机 Trae 客户端的
+    // EC P-256 设备私钥签名（私钥与 icube-dc deviceId 绑定，DeviceID 一并用它）
+    let mut variants: Vec<(&'static str, String, serde_json::Value, bool)> = Vec::new();
+    if let Some(cred) = icube_device_creds().first() {
+        let proof_path_com = "/cloudide/api/v3/trae/oauth/ExchangeToken";
+        let proof_path_cn = "/trae/api/v3/oauth/ExchangeToken";
+        if let Ok(proof) = crate::icube_auth::device_proof(cred, proof_path_com, &client_id, code) {
+            variants.push((
+                "ExchangeToken/AuthCode+Proof",
+                oauth_client().exchange_url.clone(),
+                ureq::json!({
+                    "ClientID": client_id,
+                    "AuthCode": code_v,
+                    "CodeVerifier": verifier_v,
+                    "DeviceID": cred.device_id,
+                    "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
+                    "DeviceProof": proof,
+                }),
+                true,
+            ));
+        }
+        if let Ok(proof) = crate::icube_auth::device_proof(cred, proof_path_cn, &client_id, code) {
+            variants.push((
+                "TraeCnExchangeToken/AuthCode+Proof",
+                "https://api.trae.cn/trae/api/v3/oauth/ExchangeToken".into(),
+                ureq::json!({
+                    "ClientID": client_id,
+                    "AuthCode": code_v,
+                    "CodeVerifier": verifier_v,
+                    "DeviceID": cred.device_id,
+                    "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
+                    "DeviceProof": proof,
+                }),
+                true,
+            ));
+        }
+    }
+
+    // 无 proof 兜底变体（2026-09-16 实测：AuthCode 形态报 20405 → 有 proof 后预期命中；
+    // Code 形态报 10101 无效参数保留作对照）
     let mk = |tag: &'static str, auth_key: &'static str, url: String| {
         (
             tag,
@@ -534,18 +583,15 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
                 "DeviceID": device_v,
                 "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
             }),
+            false,
         )
     };
-    let variants: Vec<(&str, String, serde_json::Value)> = vec![
-        mk("ExchangeToken/AuthCode", "AuthCode", oauth_client().exchange_url.clone()),
-        mk("ExchangeToken/Code", "Code", oauth_client().exchange_url.clone()),
-        mk("GetToken/AuthCode", "AuthCode", gettoken_url.clone()),
-        mk("GetToken/Code", "Code", gettoken_url),
-    ];
+    variants.push(mk("ExchangeToken/AuthCode", "AuthCode", oauth_client().exchange_url.clone()));
+    variants.push(mk("ExchangeToken/Code", "Code", oauth_client().exchange_url.clone()));
 
     let mut errs: Vec<String> = Vec::new();
-    for (tag, url, payload) in &variants {
-        match try_exchange_variant(tag, url, payload.clone(), device_id, data_dir) {
+    for (tag, url, payload, with_proof_header) in &variants {
+        match try_exchange_variant(tag, url, payload.clone(), device_id, *with_proof_header, data_dir) {
             Ok(t) => {
                 fs_utils::app_log(data_dir, &format!("[OAuth交换] 变体 {tag} 成功（协议固化前保留探测链）"));
                 return Ok(t);
@@ -556,6 +602,12 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
     Err(format!("全部交换变体失败 → {}", errs.join(" | ")))
 }
 
+/// 本机 Trae 客户端 icube 设备凭证（进程内缓存；首次调用扫描 storage.json）
+fn icube_device_creds() -> &'static [crate::icube_auth::DeviceCredential] {
+    static CREDS: std::sync::OnceLock<Vec<crate::icube_auth::DeviceCredential>> = std::sync::OnceLock::new();
+    CREDS.get_or_init(crate::icube_auth::extract_device_credentials)
+}
+
 /// 单个交换变体尝试：脱敏日志（请求+响应全量）→ 设备头请求 → 火山信封错误解析 →
 /// token 三级提取（容器精确键 → 全树深挖 → 键路径诊断）
 fn try_exchange_variant(
@@ -563,6 +615,7 @@ fn try_exchange_variant(
     url: &str,
     payload: serde_json::Value,
     device_id: &str,
+    with_proof_header: bool,
     data_dir: &std::path::Path,
 ) -> Result<(String, String), String> {
     {
@@ -570,7 +623,7 @@ fn try_exchange_variant(
         mask_sensitive(&mut masked);
         fs_utils::app_log(data_dir, &format!("[OAuth交换-请求:{tag}] {masked}"));
     }
-    let resp = match exchange_agent()?
+    let mut req = exchange_agent()?
         .post(url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
@@ -578,9 +631,13 @@ fn try_exchange_variant(
         // 20405=Device proof required → 交换与设备绑定强相关，请求须携带设备标识）
         .set("x-device-id", device_id)
         .set("x-app-id", OAUTH_APP_ID)
-        .set("x-platform-code", OAUTH_PAGE_PLATFORM_CODE)
-        .send_json(payload)
-    {
+        .set("x-platform-code", OAUTH_PAGE_PLATFORM_CODE);
+    if with_proof_header {
+        // F-70 实测：x-cloudide-token 必须为空字符串——带旧 token 报 20405，
+        // 完全不带该头报 20403
+        req = req.set("x-cloudide-token", "");
+    }
+    let resp = match req.send_json(payload) {
         Ok(r) => r,
         // 4xx/5xx：ureq 返回 Error::Status 且响应体仍可读——保留用于诊断
         Err(ureq::Error::Status(_, r)) => r,

@@ -32,6 +32,11 @@ bytes = "1"
 sha2 = "0.10"
 # 豆包 Chromium cookie v10 解密（AES-256-GCM，doubao_session 诊断/探活兜底）
 aes-gcm = "0.10"
+# F-70/F-78：Trae 客户端 tc 信封解密（AES-128-CBC，提取 OAuth 设备 EC P-256 私钥）
+# + ExchangeToken DeviceProof 签名（ECDSA P-256/SHA-256，服务端 20405 Device proof required）
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 # 读 Trae 应用的 state.vscdb（SQLite）——自动发现当前登录账号的 Cloud-IDE uid
 rusqlite = { version = "0.32", features = ["bundled"] }
 # device_proxy Rust 化（P4）：以 hyper 1.x 协议栈自建 MITM 代理（参考 hudsucker internal.rs，

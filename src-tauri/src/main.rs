@@ -5,6 +5,7 @@ mod commands;
 mod checkin_results;
 mod device_proxy;
 mod fs_utils;
+mod icube_auth;
 mod jwt;
 mod models;
 mod notify;
