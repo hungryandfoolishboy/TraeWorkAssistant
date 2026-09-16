@@ -548,38 +548,66 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, data_dir: 
         Err(e) => return Err(format!("解析响应失败: {e}")),
     };
 
-    let code_val = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-    if code_val != 0 {
-        // 诊断（脱敏）：输出响应键路径 + 服务端 message，便于校准交换请求形态
+    // 响应形态（2026-09-16 实测键路径固化）：火山引擎标准信封——
+    // 错误：ResponseMetadata.Error.{Code,Message,StandardCode,Data}；
+    // 成功：ResponseMetadata + Result.{...}（对照 GetPCAuthCode 的 Result.AuthCode 形态）
+    let err_code = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "Code"])
+        .map(|v| {
+            v.as_i64()
+                .map(|n| n.to_string())
+                .or_else(|| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let err_msg = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "Message"])
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let std_code = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "StandardCode"])
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if !err_code.is_empty() && err_code != "0" {
+        // 诊断：错误码/消息为非敏感值，可入日志；键路径保留校准兜底
         let mut paths = Vec::new();
         collect_key_paths_public(&body, &mut paths);
-        let msg = body
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("未知错误");
         fs_utils::app_log(
             data_dir,
             &format!(
-                "OAuth AuthCode 交换失败 (code={code_val}): message={msg} 响应键路径: {}",
+                "OAuth AuthCode 交换失败: Error.Code={err_code} StandardCode={std_code} Message={err_msg} 响应键路径: {}",
                 paths.join(" | ")
             ),
         );
-        return Err(format!("ExchangeToken 失败 (code={}): {}", code_val, msg));
+        return Err(format!(
+            "ExchangeToken 失败 (code={err_code}{}): {}",
+            if std_code.is_empty() { String::new() } else { format!("/{std_code}") },
+            if err_msg.is_empty() { "未知错误" } else { &err_msg }
+        ));
+    }
+    // 兼容旧解析（顶层 code/message 形态）
+    let code_val = body.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+    if code_val != 0 {
+        let msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("未知错误");
+        return Err(format!("ExchangeToken 失败 (code={code_val}): {msg}"));
     }
 
-    let data = body.get("data").ok_or("响应中缺少 data 字段")?;
+    let data = body
+        .get("Result")
+        .or_else(|| body.get("data"))
+        .ok_or("响应中缺少 Result/data 字段")?;
     let access_token = data
-        .get("access_token")
-        .or_else(|| data.get("AccessToken"))
+        .get("AccessToken")
+        .or_else(|| data.get("access_token"))
         .or_else(|| data.get("token"))
         .and_then(|v| v.as_str())
-        .ok_or("响应中缺少 access_token")?
+        .ok_or("响应中缺少 AccessToken")?
         .to_string();
     let refresh_token = data
-        .get("refresh_token")
-        .or_else(|| data.get("RefreshToken"))
+        .get("RefreshToken")
+        .or_else(|| data.get("refresh_token"))
         .and_then(|v| v.as_str())
-        .ok_or("响应中缺少 refresh_token")?
+        .ok_or("响应中缺少 RefreshToken")?
         .to_string();
 
     Ok((access_token, refresh_token))
