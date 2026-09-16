@@ -4,6 +4,26 @@
 
 ---
 
+## [3.5.4] · 2026-09-16 · API 网关性能优化 + refresh_token 刷新链路修复
+
+> 范围：自 [3.5.3]（commit 663b8a4）以来的全部变更。
+
+### 性能优化（API 网关）
+
+- **[P1] 日志异步化（B）**：api_logger 改内存队列 + 独立写线程（Condvar 唤醒 + Weak 引用防泄漏），请求路径不再同步写 app.log。
+- **[P1] 配置内存缓存（A）**：新增 `config_cache.rs`（5s TTL + 写路径显式失效），dispatch_policy / wb_model_catalog / wb_model_route / api_models / api_gateway_settings / wb_sticky 六热点文件每请求读盘归零。
+- **[P1] 记账削峰（C+E）**：用量与 API Key 状态改内存权威副本 + 脏标记，flusher 每 2s 批量落盘（按 (bucket, day) 去重，SQLite 事务从 O(请求数) → ≤3 次/2s）；Key 保存锁内合并计数（UI 编辑字段优先、记账字段以内存副本为准），消除 UI 保存回退当日计数与 save/flusher 锁外写库竞态；flush 写库失败恢复脏标记重试（替代静默吞错）；constraints_for 锁内直查去整表克隆。
+- **[P1] 流式线程隔离（D-1）**：SSE 流式请求隔离到独立阻塞线程池（stream_runtime），不再耗尽主 worker 池。
+- 测试缓存污染修复：直写 SQLite kv 的测试补 `config_cache::invalidate`。
+
+### 修复
+
+- **[P1] refresh_token 刷新链路（code=-1: 未知错误根因）**：刷新路径迁移固化协议——`exchange_token_refresh` 变体探测链（DeviceProof 签名 `POST\npath\nClientID\nRefreshToken\nts\nnonce` + `x-cloudide-token: ""` 空头 + `Result.Token` 响应），旧协议（cloudide 端点 + ClientSecret 体）降为兜底探测；判定收窄——仅服务端明确返回数字 `code != 0` 才标记 refresh_token 失效，无 code 字段的异构响应不再被 `unwrap_or(-1)` 误判（原实证 19s 内 4 连败 + 每次触发 vault 全量加密写盘）；已判失效账号入口直接拦截（不发网络请求）；失败后同账号 60s 短冷却（进程内 LazyLock，消除重试风暴与写放大）；各变体请求/响应脱敏记 app.log。
+- **[P2] 复制/操作 toast 全线失效**：notify 脏值吞提示 + 剪贴板挂起兜底。
+- **[P2] WB 模型目录拉取失败诊断**：HTTP 状态错误与 0 模型解析失败均附响应体前 200 字符摘要，区分鉴权拒绝与端点结构变更（此前仅报「4 种容器均不匹配」无从排查）。
+
+---
+
 ## [3.5.3] · 2026-09-16 · OAuth 登录真实协议闭环（F-78 批次 3）+ 代理稳定性与网关白名单修复
 
 > 范围：自 [3.5.2] 打包（commit 33a5a06）以来的全部变更。
