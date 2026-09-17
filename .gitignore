@@ -11,6 +11,8 @@ logs/
 # 临时文件
 tmp/
 temp
+scripts/.doubao_sample.local.json
+.tmp_research
 
 # OS / Editor
 .DS_Store
