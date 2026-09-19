@@ -208,10 +208,7 @@ export default function BuddyApiService() {
         }),
         600,
       );
-      pushToast('success', '资源开关与调度参数已保存（调度参数热生效）');
-      if (status?.running) {
-        pushToast('info', '开关类变更需重启 API 服务以应用');
-      }
+      pushToast('success', '资源开关与调度参数已保存（服务运行中即时生效）');
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);
     } finally {
@@ -391,7 +388,7 @@ export default function BuddyApiService() {
             </div>
 
             <p className="mt-3 text-xs text-slate-400 dark:text-zinc-500">
-              保存后需重启 API 服务生效；Trae 池的调度策略与分组筛选在 Trae「资源调度」页配置，本页不改动。
+              保存后即时生效；Trae 池的调度策略与分组筛选在 Trae「资源调度」页配置，本页不改动。
             </p>
           </div>
         </div>
@@ -425,7 +422,7 @@ export default function BuddyApiService() {
             <p className="mb-2 text-xs text-slate-400">
               {credAccounts.length === 0
                 ? '暂无含凭证账号'
-                : `勾选账号参与 WB 上游调度（清空 = 全部含凭证账号自动入池）；成员变更需重启 API 服务生效`}
+                : `勾选账号参与 WB 上游调度（清空 = 全部含凭证账号自动入池）；保存后即时生效`}
             </p>
             {credAccounts.length === 0 ? (
               <p className="py-4 text-center text-xs text-slate-400">
