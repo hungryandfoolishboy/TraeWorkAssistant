@@ -4,6 +4,22 @@
 
 ---
 
+## [3.5.5] · 2026-09-19 · 豆包登录误报修复 + Buddy 模型目录兼容 agents 新容器形态
+
+> 范围：自 [3.5.4]（commit 0215498）以来的全部变更。
+
+### 修复
+
+- **[P1] 豆包「保存登录态失败」误报（Issue #15）**：`check_profile_login_cookie` 活跃 Profile 单一口径改为 `analyze_login_sessions` 多 Profile 聚合判定——任一 Profile 持有非游客登录会话即放行；存在读取失败（Cookies 锁/活跃 Profile 错位）时 fail-open，不再误报「未检测到登录会话」；确认未登录时的报错附带 Profile 扫描诊断；保存预检 / 切换守卫（保持 fail-closed）/ 快照槽恢复预检三个消费方口径统一；新增 6 个回归测试（多 Profile 聚合、锁读失败、游客态边界等）。
+- **[P1] Buddy 模型目录拉取 0 模型（官网 2026-09 新容器形态）**：`wb_catalog` parse_upstream_catalog 重构三层策略——定向容器探测（兼容 `{code:0,data:{agents:[…]}}` 新形态，data 由数组变为对象）→ agent 内嵌 models 展开（无内嵌则 agent 条目本身作为候选）→ 全树深扫兜底（要求非空字符串显式 id），按 id 大小写不敏感去重。
+- **[P2] models_sync 鉴权失败指引增强**：401/code 1001 自动附带凭据修复指引（续期 JWT / 重新 OAuth / 保存当前登录态），避免误判为同步功能故障；Buddy API 服务页卡片文案对齐「同步官网模型」。
+
+### 测试
+
+- cargo 单测 412 → **425** 全绿（本周期新增：豆包登录会话聚合判定 6 项回归、wb_catalog agents 新容器形态解析）；vitest 26/26、`tsc --noEmit` 全绿。
+
+---
+
 ## [3.5.4] · 2026-09-16 · API 网关性能优化 + refresh_token 刷新链路修复
 
 > 范围：自 [3.5.3]（commit 663b8a4）以来的全部变更。
