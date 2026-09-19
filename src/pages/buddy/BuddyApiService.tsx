@@ -461,17 +461,17 @@ export default function BuddyApiService() {
             )}
           </div>
 
-          {/* 模型目录（Buddy）卡（现有目录同步能力保留） */}
+          {/* 同步官网模型（Buddy）卡（现有目录同步能力保留） */}
           <div className="card p-4">
             <div className="mb-3 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Coins size={16} className="text-amber-500" />
-                <span className="text-sm font-medium">模型目录（Buddy）</span>
+                <span className="text-sm font-medium">同步官网模型（Buddy）</span>
                 <span className="text-xs text-slate-400">{catalog.length} 个模型</span>
               </div>
               <button className="btn-outline" onClick={() => void syncCatalog()} disabled={syncing}>
                 <RefreshCw size={14} className={syncing ? 'animate-spin' : ''} />
-                {syncing ? '同步中…' : '同步目录'}
+                {syncing ? '同步中…' : '同步官网模型'}
               </button>
             </div>
             <p className="mb-3 text-xs text-slate-400">

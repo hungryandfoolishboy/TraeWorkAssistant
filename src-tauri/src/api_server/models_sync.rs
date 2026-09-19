@@ -273,7 +273,16 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
     }
 
     let fetched = parsed.ok_or_else(|| {
-        format!("同步失败（已尝试 {} 个账号）: {last_err}", candidates.len())
+        let mut msg = format!("同步失败（已尝试 {} 个账号）: {last_err}", candidates.len());
+        // 401 / code 1001 = JWT 无效（过期或在别处重新登录被服务端吊销）：
+        // 补充可行动指引，避免用户误判为同步功能故障
+        if last_err.contains("401") || last_err.contains("1001") {
+            msg.push_str(
+                "——HTTP 401/code 1001 表示账号 JWT 已失效：请在「账号管理」对该账号执行「续期 JWT」，\
+                 或重新 OAuth 登录 / 在客户端登录后「保存当前登录态」，再重试同步",
+            );
+        }
+        msg
     })?;
 
     let list = normalize_order(fetched);
